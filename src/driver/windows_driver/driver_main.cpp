@@ -1516,6 +1516,12 @@ namespace {
       return {0, 1};
     }
 
+    if (numerator % 29'970 == 0) {
+      // adjust NTSC rates to use the true ratio
+      numerator = (numerator / 29'970) * 30000;
+      denominator = 1001;
+    }
+
     const auto divisor = std::gcd(numerator, static_cast<std::uint64_t>(denominator));
     numerator /= divisor;
     denominator = static_cast<std::uint32_t>(denominator / divisor);
@@ -1557,11 +1563,11 @@ namespace {
     signal.totalSize.cx = (std::max)(shape.total_width, shape.width);
     signal.totalSize.cy = (std::max)(shape.total_height, shape.height);
     signal.vSyncFreq = make_frequency_rational((std::max)(shape.refresh_rate_millihz, 1u), 1000);
-    signal.hSyncFreq = make_frequency_rational(
-      static_cast<std::uint64_t>((std::max)(shape.refresh_rate_millihz, 1u)) *
-        static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u)),
-      1000
+    signal.hSyncFreq.Numerator = clamp_u32(
+      static_cast<std::uint64_t>(signal.vSyncFreq.Numerator) *
+      static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u))
     );
+    signal.hSyncFreq.Denominator = signal.vSyncFreq.Denominator;
     // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY_OTHER is not accepted here; 255 is
     // the documented "not initialized" value Windows itself uses for EDID modes.
     signal.AdditionalSignalInfo.videoStandard = 255;
