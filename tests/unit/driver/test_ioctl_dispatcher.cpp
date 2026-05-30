@@ -46,6 +46,11 @@ namespace {
       return set_permanent_display_count(vdd::permanent_settings_from_display_manifest(manifest));
     }
 
+    vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
+      render_adapter_requests.push_back(request);
+      return vdd::BackendError::None;
+    }
+
     bool fail_arrive {};
     bool fail_depart {};
     std::uint32_t next_target_id {12};
@@ -54,6 +59,7 @@ namespace {
     std::vector<std::uint32_t> permanent_counts {};
     std::vector<vdd::PermanentDisplayCountRequest> permanent_settings {};
     std::vector<vdd::DisplayManifest> manifests {};
+    std::vector<vdd::SetRenderAdapterRequest> render_adapter_requests {};
   };
 
   struct Harness {
@@ -93,6 +99,25 @@ TEST(VirtualDisplayDriverIoctlDispatcher, ReturnsProtocolVersion) {
   EXPECT_EQ(result.status, vdd::IoctlStatus::Success);
   EXPECT_EQ(result.bytes_returned, sizeof(version));
   EXPECT_EQ(version.api_namespace, vdd::kApiNamespaceGuid);
+}
+
+TEST(VirtualDisplayDriverIoctlDispatcher, SetRenderAdapterForwardsPreference) {
+  Harness harness;
+  vdd::SetRenderAdapterRequest request {};
+  request.adapter_luid = {456, 7};
+
+  const auto result = harness.dispatcher.dispatch(
+    vdd::kIoctlSetRenderAdapter,
+    &request,
+    sizeof(request),
+    nullptr,
+    0,
+    std::chrono::steady_clock::now()
+  );
+
+  EXPECT_EQ(result.status, vdd::IoctlStatus::Success);
+  ASSERT_EQ(harness.backend.render_adapter_requests.size(), 1u);
+  EXPECT_EQ(harness.backend.render_adapter_requests[0].adapter_luid, (vdd::AdapterLuid {456, 7}));
 }
 
 TEST(VirtualDisplayDriverIoctlDispatcher, RejectsShortCreateInput) {

@@ -32,7 +32,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 2;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 3;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
 
   inline constexpr std::uint32_t kDisplayNameChars = 32;
@@ -87,6 +87,7 @@ namespace virtual_display::driver {
     QueryDisplayState = 0x908,
     SetDisplayManifest = 0x909,
     QueryDisplayManifest = 0x90a,
+    SetRenderAdapter = 0x90b,
   };
 
   enum class IoctlAccess : std::uint32_t {
@@ -127,6 +128,8 @@ namespace virtual_display::driver {
     ioctl_code(IoctlFunction::SetDisplayManifest, IoctlAccess::ReadWrite);
   inline constexpr std::uint32_t kIoctlQueryDisplayManifest =
     ioctl_code(IoctlFunction::QueryDisplayManifest, IoctlAccess::Read);
+  inline constexpr std::uint32_t kIoctlSetRenderAdapter =
+    ioctl_code(IoctlFunction::SetRenderAdapter, IoctlAccess::Write);
 
   struct ProtocolVersion {
     Guid api_namespace {kApiNamespaceGuid};
@@ -166,6 +169,13 @@ namespace virtual_display::driver {
     std::uint32_t target_id {};
     std::uint32_t connector_index {};
     std::uint32_t effective_timeout_ms {};
+    std::uint32_t reserved {};
+  };
+
+  struct SetRenderAdapterRequest {
+    Guid api_namespace {kApiNamespaceGuid};
+    AdapterLuid adapter_luid {};
+    std::uint32_t flags {};
     std::uint32_t reserved {};
   };
 
@@ -374,6 +384,7 @@ namespace virtual_display::driver {
   static_assert(sizeof(ProtocolVersion) == 24);
   static_assert(sizeof(CreateTemporaryDisplayRequest) == 96);
   static_assert(sizeof(CreateTemporaryDisplayResult) == 56);
+  static_assert(sizeof(SetRenderAdapterRequest) == 32);
   static_assert(sizeof(LeaseDisplayRequest) == 32);
   static_assert(sizeof(LeaseRequest) == 32);
   static_assert(sizeof(QueryLeaseResult) == 40);

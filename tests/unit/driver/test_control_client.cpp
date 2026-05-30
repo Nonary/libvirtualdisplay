@@ -273,6 +273,20 @@ TEST(VirtualDisplayDriverControlClient, DisplayManifestOperationsUseManifestIoct
   EXPECT_EQ(query_result.value.profiles[0].display_id, 0x7000000000000100ull);
 }
 
+TEST(VirtualDisplayDriverControlClient, SetRenderAdapterUsesRenderAdapterIoctl) {
+  FakeTransport transport;
+  vdd::ControlClient client {transport};
+  vdd::SetRenderAdapterRequest request {};
+  request.adapter_luid = {99, 8};
+
+  const auto result = client.set_render_adapter(request);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(transport.calls.size(), 1u);
+  EXPECT_EQ(transport.calls[0].ioctl_code, vdd::kIoctlSetRenderAdapter);
+  EXPECT_EQ(input_as<vdd::SetRenderAdapterRequest>(transport.calls[0]).adapter_luid, (vdd::AdapterLuid {99, 8}));
+}
+
 TEST(VirtualDisplayDriverControlClient, DetectsShortOutput) {
   FakeTransport transport;
   transport.set_output(vdd::ProtocolVersion {});

@@ -180,6 +180,22 @@ namespace virtual_display::driver {
     return from_store_result(store_.apply_display_manifest(canonical));
   }
 
+  ControllerStatus DriverController::set_render_adapter(const SetRenderAdapterRequest &request) {
+    if (!is_valid_api_namespace(request.api_namespace)) {
+      return {StoreError::ValidationFailed, ValidationError::WrongApiNamespace, BackendError::None};
+    }
+    if (request.flags != 0) {
+      return {StoreError::ValidationFailed, ValidationError::InvalidFlags, BackendError::None};
+    }
+
+    if (const auto backend_error = backend_.set_render_adapter(request);
+        backend_error != BackendError::None) {
+      return {StoreError::None, ValidationError::None, backend_error};
+    }
+
+    return {};
+  }
+
   const DisplayManifest &DriverController::query_display_manifest() const {
     return store_.display_manifest();
   }

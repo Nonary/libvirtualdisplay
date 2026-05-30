@@ -43,6 +43,7 @@ namespace virtual_display::driver {
     virtual BackendError depart_temporary_display(std::uint64_t display_id) = 0;
     virtual BackendError set_permanent_display_count(const PermanentDisplayCountRequest &request) = 0;
     virtual BackendError apply_display_manifest(const DisplayManifest &manifest);
+    virtual BackendError set_render_adapter(const SetRenderAdapterRequest &request) = 0;
   };
 
   struct ControllerStatus {
@@ -72,6 +73,7 @@ namespace virtual_display::driver {
     QueryLeaseResult query_lease(std::uint64_t lease_id, std::chrono::steady_clock::time_point now) const;
     ControllerStatus set_permanent_display_count(const PermanentDisplayCountRequest &request);
     ControllerStatus apply_display_manifest(const DisplayManifest &manifest);
+    ControllerStatus set_render_adapter(const SetRenderAdapterRequest &request);
     const DisplayManifest &query_display_manifest() const;
     PermanentDisplayCountResult query_permanent_display_count() const;
     QueryDisplayStateResult query_display_state() const;

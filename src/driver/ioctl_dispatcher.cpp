@@ -219,6 +219,15 @@ namespace virtual_display::driver {
         return {IoctlStatus::Success, bytes_returned, {}};
       }
 
+      case kIoctlSetRenderAdapter: {
+        SetRenderAdapterRequest request {};
+        if (!read_input(input, input_size, request)) {
+          return {IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+
+        return result_from_controller(controller_.set_render_adapter(request));
+      }
+
       default:
         return {IoctlStatus::InvalidIoctl, 0, {}};
     }

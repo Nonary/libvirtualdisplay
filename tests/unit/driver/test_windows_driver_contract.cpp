@@ -427,6 +427,20 @@ TEST(VirtualDisplayWindowsDriverContract, SynchronizesAdapterReadinessPublicatio
   EXPECT_LT(status, ready);
 }
 
+TEST(VirtualDisplayWindowsDriverContract, AppliesPreferredRenderAdapterThroughIddCx) {
+  const auto source = read_windows_driver_source();
+
+  const auto setter = source.find("vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override");
+  ASSERT_NE(setter, std::string::npos);
+  EXPECT_NE(source.find("preferred_render_adapter_luid_ = preferred_render_adapter;", setter), std::string::npos);
+  EXPECT_NE(source.find("IddCxAdapterSetRenderAdapter(adapter, &args);", setter), std::string::npos);
+
+  const auto init_finished = source.find("NTSTATUS adapter_init_finished");
+  ASSERT_NE(init_finished, std::string::npos);
+  EXPECT_NE(source.find("preferred_render_adapter = preferred_render_adapter_luid_;", init_finished), std::string::npos);
+  EXPECT_NE(source.find("IddCxAdapterSetRenderAdapter(adapter, &set_render_adapter);", init_finished), std::string::npos);
+}
+
 TEST(VirtualDisplayWindowsDriverContract, AdapterInitFailureIsNotReportedAsReady) {
   const auto source = read_windows_driver_source();
 

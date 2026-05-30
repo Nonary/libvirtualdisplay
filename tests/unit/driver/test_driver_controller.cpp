@@ -64,7 +64,9 @@ namespace {
     bool fail_depart {};
     bool fail_permanent {};
     bool fail_reserve {};
+    bool fail_render_adapter {};
     vdd::AdapterLuid adapter_luid {44, 2};
+    vdd::SetRenderAdapterRequest render_adapter_request {};
     std::uint32_t next_target_id {7};
     std::vector<vdd::DisplayDescriptor> reserved {};
     std::vector<std::uint64_t> unreserved {};
@@ -74,6 +76,12 @@ namespace {
     std::vector<vdd::PermanentDisplayCountRequest> permanent_settings {};
     std::vector<vdd::DisplayManifest> manifests {};
     std::vector<std::string> events {};
+
+    vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
+      render_adapter_request = request;
+      events.push_back("set_render_adapter");
+      return fail_render_adapter ? vdd::BackendError::Failed : vdd::BackendError::None;
+    }
   };
 
   vdd::CreateTemporaryDisplayRequest make_create_request(
@@ -117,6 +125,32 @@ TEST(VirtualDisplayDriverController, CreateTemporaryDisplayArrivesBackendAndRetu
   EXPECT_EQ(backend.arrived[0].physical_height_mm, 330u);
   EXPECT_TRUE(vdd::has_valid_edid_checksums(backend.arrived[0].edid));
   EXPECT_TRUE(vdd::has_hdr_static_metadata(backend.arrived[0].edid));
+}
+
+TEST(VirtualDisplayDriverController, SetRenderAdapterForwardsPreferenceToBackend) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  vdd::SetRenderAdapterRequest request {};
+  request.adapter_luid = {123, 4};
+
+  const auto status = controller.set_render_adapter(request);
+
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(backend.render_adapter_request.adapter_luid, (vdd::AdapterLuid {123, 4}));
+  EXPECT_EQ(backend.events, (std::vector<std::string> {"set_render_adapter"}));
+}
+
+TEST(VirtualDisplayDriverController, SetRenderAdapterRejectsUnknownFlags) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  vdd::SetRenderAdapterRequest request {};
+  request.flags = 1;
+
+  const auto status = controller.set_render_adapter(request);
+
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.validation_error, vdd::ValidationError::InvalidFlags);
+  EXPECT_TRUE(backend.events.empty());
 }
 
 TEST(VirtualDisplayDriverController, CreateTemporaryDisplayReservesIdentityBeforeArrival) {

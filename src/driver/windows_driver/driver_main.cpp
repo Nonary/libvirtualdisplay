@@ -1459,6 +1459,33 @@ namespace {
       return vdd::BackendError::None;
     }
 
+    vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
+      const auto preferred_render_adapter = vdd::to_windows_luid(request.adapter_luid);
+      IDDCX_ADAPTER adapter {};
+      {
+        std::lock_guard lock {mutex_};
+        preferred_render_adapter_luid_ = preferred_render_adapter;
+        adapter = adapter_;
+      }
+
+      if (!adapter) {
+        return vdd::BackendError::None;
+      }
+
+      IDARG_IN_ADAPTERSETRENDERADAPTER args {};
+      args.PreferredRenderAdapter = preferred_render_adapter;
+      IddCxAdapterSetRenderAdapter(adapter, &args);
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "RenderAdapterPreferenceSet",
+        TraceLoggingInt32(preferred_render_adapter.HighPart, "AdapterHigh"),
+        TraceLoggingUInt32(preferred_render_adapter.LowPart, "AdapterLow")
+      );
+      TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "RenderAdapterPreferenceSet");
+      return vdd::BackendError::None;
+    }
+
     NTSTATUS adapter_init_finished(const IDARG_IN_ADAPTER_INIT_FINISHED *args) {
       if (!args) {
         return STATUS_INVALID_PARAMETER;
@@ -1466,15 +1493,29 @@ namespace {
 
       // The async callback status is the point where IddCx says monitor arrival
       // is legal. Keep DeviceAdd successful, but block display creation until then.
-      std::lock_guard lock {mutex_};
-      adapter_init_status_ = args->AdapterInitStatus;
-      adapter_ready_ = NT_SUCCESS(adapter_init_status_);
-      if (!adapter_ready_) {
+      LUID preferred_render_adapter {};
+      IDDCX_ADAPTER adapter {};
+      bool adapter_ready = false;
+      {
+        std::lock_guard lock {mutex_};
+        adapter_init_status_ = args->AdapterInitStatus;
+        adapter_ready_ = NT_SUCCESS(adapter_init_status_);
+        adapter_ready = adapter_ready_;
+        adapter = adapter_;
+        preferred_render_adapter = preferred_render_adapter_luid_;
+      }
+      if (!adapter_ready) {
         TraceLoggingWrite(
           g_trace_provider,
           "AdapterInitFailed",
-          TraceLoggingInt32(adapter_init_status_, "Status")
+          TraceLoggingInt32(args->AdapterInitStatus, "Status")
         );
+        return STATUS_SUCCESS;
+      }
+      if (adapter && (preferred_render_adapter.HighPart != 0 || preferred_render_adapter.LowPart != 0)) {
+        IDARG_IN_ADAPTERSETRENDERADAPTER set_render_adapter {};
+        set_render_adapter.PreferredRenderAdapter = preferred_render_adapter;
+        IddCxAdapterSetRenderAdapter(adapter, &set_render_adapter);
       }
       return STATUS_SUCCESS;
     }
@@ -1920,6 +1961,7 @@ namespace {
     WDFDRIVER driver_ {};
     WDFDEVICE device_ {};
     IDDCX_ADAPTER adapter_ {};
+    LUID preferred_render_adapter_luid_ {};
     bool adapter_ready_ {};
     NTSTATUS adapter_init_status_ {STATUS_DEVICE_NOT_READY};
     std::map<std::uint64_t, MonitorRecord> monitors_ {};

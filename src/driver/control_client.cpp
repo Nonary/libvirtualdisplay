@@ -67,6 +67,10 @@ namespace virtual_display::driver {
     return ioctl_out<DisplayManifest>(kIoctlQueryDisplayManifest, nullptr, 0);
   }
 
+  ControlOperationResult ControlClient::set_render_adapter(const SetRenderAdapterRequest &request) {
+    return ioctl_no_out(kIoctlSetRenderAdapter, &request, sizeof(request));
+  }
+
   ControlOperationResult ControlClient::ioctl_no_out(
     const std::uint32_t ioctl_code,
     const void *input,
