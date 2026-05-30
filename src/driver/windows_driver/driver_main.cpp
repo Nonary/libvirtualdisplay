@@ -1079,25 +1079,25 @@ namespace {
           try {
             process_frames(render_adapter_luid);
           } catch (...) {
-            publish_startup_result(E_FAIL);
+            // Failures are handled inside process_frames() (delete_swapchain()).
           }
         });
       } catch (...) {
         return E_OUTOFMEMORY;
       }
 
-      std::unique_lock lock {startup_mutex_};
-      startup_ready_.wait(lock, [this]() {
-        return startup_result_.has_value();
-      });
-      const auto result = *startup_result_;
-      lock.unlock();
-
-      if (FAILED(result)) {
-        stop();
-      }
-
-      return result;
+      // Do NOT block here waiting for the worker to create its D3D render device.
+      // start() runs inside the IddCx EvtIddCxMonitorAssignSwapChain callback. Creating
+      // a D3D11 device on the render adapter (create_dxgi_device_for_luid ->
+      // D3D11CreateDevice) while that callback is in flight serializes against the OS
+      // display stack and deadlocks with concurrent D3D11CreateDevice calls coming from a
+      // capture client on the same adapter (e.g. Sunshine's capture reinit when the
+      // virtual display topology changes). That stalls D3D11CreateDevice in
+      // ZwWaitForAlertByThreadId, wedges capture reinit, and ultimately trips the host's
+      // session-teardown watchdog. The WDK IddCx sample likewise starts the worker and
+      // returns immediately; device creation and teardown stay entirely on the worker
+      // thread, and a creation failure simply stops frame processing for this swapchain.
+      return S_OK;
     }
 
     void stop() {
@@ -1189,7 +1189,6 @@ namespace {
       MmcssRegistration mmcss {kSwapchainMmcssTask};
 
       HRESULT hr = reset_render_device(render_adapter_luid);
-      publish_startup_result(hr);
       if (FAILED(hr) || stop_requested_.load(std::memory_order_acquire)) {
         return;
       }
@@ -1278,24 +1277,10 @@ namespace {
 
     }
 
-    void publish_startup_result(const HRESULT hr) {
-      {
-        std::lock_guard lock {startup_mutex_};
-        if (startup_result_) {
-          return;
-        }
-        startup_result_ = hr;
-      }
-      startup_ready_.notify_all();
-    }
-
     IDDCX_SWAPCHAIN swapchain_ {};
     HANDLE next_surface_available_ {};
     std::atomic<bool> stop_requested_ {false};
     std::thread worker_ {};
-    std::mutex startup_mutex_ {};
-    std::condition_variable startup_ready_ {};
-    std::optional<HRESULT> startup_result_ {};
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
