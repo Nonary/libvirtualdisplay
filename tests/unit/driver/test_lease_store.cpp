@@ -164,6 +164,7 @@ TEST(VirtualDisplayDriverLeaseStore, QueriesAndFeedsLease) {
   auto query = store.query_lease(lease_id(100), now + std::chrono::seconds(10));
   EXPECT_EQ(query.lease_exists, 1u);
   EXPECT_EQ(query.temporary_display_count, 1u);
+  EXPECT_EQ(query.pending_departure_count, 0u);
   EXPECT_EQ(query.effective_timeout_ms, 30'000u);
   EXPECT_EQ(query.remaining_ms, 20'000u);
 

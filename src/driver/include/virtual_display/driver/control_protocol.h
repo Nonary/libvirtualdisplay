@@ -32,7 +32,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 3;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 4;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
 
   inline constexpr std::uint32_t kDisplayNameChars = 32;
@@ -199,6 +199,7 @@ namespace virtual_display::driver {
     std::uint32_t effective_timeout_ms {};
     std::uint32_t remaining_ms {};
     std::uint32_t lease_exists {};
+    std::uint32_t pending_departure_count {};
   };
 
   struct PermanentDisplayCountRequest {
@@ -387,7 +388,7 @@ namespace virtual_display::driver {
   static_assert(sizeof(SetRenderAdapterRequest) == 32);
   static_assert(sizeof(LeaseDisplayRequest) == 32);
   static_assert(sizeof(LeaseRequest) == 32);
-  static_assert(sizeof(QueryLeaseResult) == 40);
+  static_assert(sizeof(QueryLeaseResult) == 48);
   static_assert(sizeof(PermanentDisplayCountRequest) == 76);
   static_assert(sizeof(PermanentDisplayCountResult) == 80);
   static_assert(sizeof(DisplayStateEntry) == 104);

@@ -343,6 +343,11 @@ namespace virtual_display::driver {
         return entry.second.lease_id == lease_id;
       })
     );
+    result.pending_departure_count = static_cast<std::uint32_t>(
+      std::count_if(displays_by_id_.begin(), displays_by_id_.end(), [lease_id](const auto &entry) {
+        return entry.second.lease_id == lease_id && entry.second.pending_departure;
+      })
+    );
 
     return result;
   }

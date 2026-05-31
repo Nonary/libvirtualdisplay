@@ -267,12 +267,19 @@ TEST(VirtualDisplayDriverController, RemoveTemporaryDisplayKeepsStoreWhenBackend
   const auto retained = controller.store().find_temporary_display(0x12345678);
   ASSERT_TRUE(retained);
   EXPECT_TRUE(retained->pending_departure);
+  EXPECT_EQ(controller.query_lease(lease_id(100), now).pending_departure_count, 1u);
   EXPECT_EQ(backend.departed, (std::vector<std::uint64_t> {0x12345678}));
 
   vdd::LeaseRequest feed {};
   feed.lease_id = lease_id(100);
   feed.requested_timeout_ms = 60'000;
   EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::LeaseNotFound);
+
+  backend.fail_depart = false;
+  const auto retry_status = controller.remove_temporary_display(remove);
+  EXPECT_TRUE(retry_status.ok());
+  EXPECT_EQ(controller.store().temporary_display_count(), 0u);
+  EXPECT_EQ(controller.query_lease(lease_id(100), now).lease_exists, 0u);
 }
 
 TEST(VirtualDisplayDriverController, ReleaseLeaseDepartsEveryDisplayInLease) {
@@ -310,13 +317,21 @@ TEST(VirtualDisplayDriverController, ReleaseLeaseKeepsStoreWhenBackendDepartFail
   for (const auto &display: controller.store().temporary_displays()) {
     EXPECT_TRUE(display.pending_departure);
   }
-  EXPECT_EQ(controller.query_lease(lease_id(100), now).lease_exists, 1u);
+  const auto query = controller.query_lease(lease_id(100), now);
+  EXPECT_EQ(query.lease_exists, 1u);
+  EXPECT_EQ(query.pending_departure_count, 2u);
   EXPECT_EQ(backend.departed, (std::vector<std::uint64_t> {200, 201}));
 
   vdd::LeaseRequest feed {};
   feed.lease_id = lease_id(100);
   feed.requested_timeout_ms = 60'000;
   EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::LeaseNotFound);
+
+  backend.fail_depart = false;
+  const auto retry_status = controller.release_lease(release);
+  EXPECT_TRUE(retry_status.ok());
+  EXPECT_EQ(controller.store().temporary_display_count(), 0u);
+  EXPECT_EQ(controller.query_lease(lease_id(100), now).lease_exists, 0u);
 }
 
 TEST(VirtualDisplayDriverController, FeedLeaseExtendsStoreWithoutBackendArrival) {

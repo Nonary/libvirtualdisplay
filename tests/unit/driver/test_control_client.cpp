@@ -183,6 +183,7 @@ TEST(VirtualDisplayDriverControlClient, QueryLeaseReturnsLeaseState) {
   expected.lease_id = 10;
   expected.lease_exists = 1;
   expected.temporary_display_count = 2;
+  expected.pending_departure_count = 1;
   transport.set_output(expected);
   vdd::ControlClient client {transport};
 
@@ -190,6 +191,7 @@ TEST(VirtualDisplayDriverControlClient, QueryLeaseReturnsLeaseState) {
 
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(result.value.temporary_display_count, 2u);
+  EXPECT_EQ(result.value.pending_departure_count, 1u);
   ASSERT_EQ(transport.calls.size(), 1u);
   EXPECT_EQ(transport.calls[0].ioctl_code, vdd::kIoctlQueryLease);
 }
