@@ -653,6 +653,25 @@ TEST(VirtualDisplayWindowsDriverContract, RegistersTraceLoggingProvider) {
   EXPECT_NE(source.find("\"GammaRampSet\""), std::string::npos);
 }
 
+TEST(VirtualDisplayWindowsDriverContract, BoundsControllerSerializationWaits) {
+  const auto source = read_windows_driver_source();
+
+  const auto device_state = source.find("class DeviceState");
+  ASSERT_NE(device_state, std::string::npos);
+  const auto dispatch = source.find("vdd::IoctlDispatchResult dispatch", device_state);
+  ASSERT_NE(dispatch, std::string::npos);
+  const auto reaper_loop = source.find("void reaper_loop()", dispatch);
+  ASSERT_NE(reaper_loop, std::string::npos);
+  const auto state_body = source.substr(device_state, source.find("NTSTATUS ntstatus_from_ioctl_status", device_state) - device_state);
+
+  EXPECT_NE(state_body.find("static constexpr auto kControllerLockTimeout = std::chrono::seconds(30);"), std::string::npos);
+  EXPECT_NE(state_body.find("std::timed_mutex controller_mutex {};"), std::string::npos);
+  EXPECT_NE(state_body.find("lock.try_lock_for(kControllerLockTimeout)"), std::string::npos);
+  EXPECT_NE(state_body.find("\"DeviceIoControlControllerBusy\""), std::string::npos);
+  EXPECT_NE(state_body.find("controller_lock.try_lock_for(std::chrono::milliseconds(10))"), std::string::npos);
+  EXPECT_NE(state_body.find("\"LeaseReaperSkippedBusyController\""), std::string::npos);
+}
+
 TEST(VirtualDisplayWindowsDriverContract, EnablesWppInflightRecorder) {
   const auto source = read_windows_driver_source();
   const auto cmake = read_windows_driver_cmake();

@@ -2435,7 +2435,16 @@ namespace {
       const std::size_t output_buffer_length,
       const std::chrono::steady_clock::time_point now
     ) {
-      std::lock_guard lock {controller_mutex};
+      std::unique_lock lock {controller_mutex, std::defer_lock};
+      if (!lock.try_lock_for(kControllerLockTimeout)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "DeviceIoControlControllerBusy",
+          TraceLoggingUInt32(io_control_code, "IoControlCode")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "DeviceIoControlControllerBusy");
+        return {vdd::IoctlStatus::BackendFailed, 0, {}};
+      }
       return dispatcher.dispatch(
         io_control_code,
         input,
@@ -2452,6 +2461,7 @@ namespace {
 
   private:
     static constexpr auto kReaperInterval = std::chrono::seconds(1);
+    static constexpr auto kControllerLockTimeout = std::chrono::seconds(30);
 
     void start_reaper() {
       try {
@@ -2482,12 +2492,17 @@ namespace {
           break;
         }
 
-        std::lock_guard controller_lock {controller_mutex};
+        std::unique_lock controller_lock {controller_mutex, std::defer_lock};
+        if (!controller_lock.try_lock_for(std::chrono::milliseconds(10))) {
+          TraceLoggingWrite(g_trace_provider, "LeaseReaperSkippedBusyController");
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "LeaseReaperSkippedBusyController");
+          continue;
+        }
         (void) controller.reap_expired(std::chrono::steady_clock::now());
       }
     }
 
-    std::mutex controller_mutex {};
+    std::timed_mutex controller_mutex {};
     std::atomic<bool> reaper_stop_requested {false};
     std::mutex reaper_wait_mutex {};
     std::condition_variable reaper_cv {};
