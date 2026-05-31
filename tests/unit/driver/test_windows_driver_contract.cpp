@@ -557,6 +557,27 @@ TEST(VirtualDisplayWindowsDriverContract, MonitorCallbacksValidateCurrentHandle)
   }
 }
 
+TEST(VirtualDisplayWindowsDriverContract, DeviceStateQuiescesBackendBeforeDestruction) {
+  const auto source = read_windows_driver_source();
+
+  const auto backend = source.find("class IddCxBackend");
+  ASSERT_NE(backend, std::string::npos);
+  EXPECT_NE(source.find("void shutdown()", backend), std::string::npos);
+  EXPECT_NE(source.find("shutting_down_ = true;", backend), std::string::npos);
+  EXPECT_NE(source.find("(void) depart_display(display_id);", backend), std::string::npos);
+  EXPECT_NE(source.find("if (shutting_down_ || !adapter_ready_)", backend), std::string::npos);
+  EXPECT_NE(source.find("record == monitors_.end() || record->second.departing || shutting_down_", backend), std::string::npos);
+  EXPECT_NE(source.find("bool shutting_down_ {};"), std::string::npos);
+
+  const auto destructor = source.find("~DeviceState()");
+  ASSERT_NE(destructor, std::string::npos);
+  const auto stop_reaper = source.find("stop_reaper();", destructor);
+  ASSERT_NE(stop_reaper, std::string::npos);
+  const auto shutdown = source.find("backend.shutdown();", stop_reaper);
+  ASSERT_NE(shutdown, std::string::npos);
+  EXPECT_LT(stop_reaper, shutdown);
+}
+
 TEST(VirtualDisplayWindowsDriverContract, AssignSwapChainDoesNotJoinWorkerWhileBackendLocked) {
   const auto source = read_windows_driver_source();
 

@@ -1957,6 +1957,24 @@ namespace {
       return STATUS_SUCCESS;
     }
 
+    void shutdown() {
+      std::vector<std::uint64_t> display_ids;
+      {
+        std::lock_guard lock {mutex_};
+        shutting_down_ = true;
+        display_ids.reserve(monitors_.size());
+        for (const auto &[display_id, record]: monitors_) {
+          if (!record.departing) {
+            display_ids.push_back(display_id);
+          }
+        }
+      }
+
+      for (const auto display_id: display_ids) {
+        (void) depart_display(display_id);
+      }
+    }
+
   private:
     auto find_current_monitor_locked(const std::uint64_t display_id, const IDDCX_MONITOR monitor) {
       const auto record = monitors_.find(display_id);
@@ -2004,7 +2022,7 @@ namespace {
       IDDCX_ADAPTER adapter {};
       {
         std::lock_guard lock {mutex_};
-        if (!adapter_ready_) {
+        if (shutting_down_ || !adapter_ready_) {
           return {vdd::BackendError::Failed, {}, 0};
         }
         if (!adapter_ || monitors_.contains(descriptor.display_id)) {
@@ -2183,7 +2201,7 @@ namespace {
       {
         std::lock_guard lock {mutex_};
         const auto record = find_current_monitor_locked(context->display_id, monitor);
-        if (record == monitors_.end() || record->second.departing) {
+        if (record == monitors_.end() || record->second.departing || shutting_down_) {
           // This status is the IddCx-approved way to decline a swapchain that
           // races with monitor teardown; generic failures trip verifier 0x700.
           return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
@@ -2408,6 +2426,7 @@ namespace {
     IDDCX_ADAPTER adapter_ {};
     LUID preferred_render_adapter_luid_ {};
     bool adapter_ready_ {};
+    bool shutting_down_ {};
     NTSTATUS adapter_init_status_ {STATUS_DEVICE_NOT_READY};
     std::map<std::uint64_t, MonitorRecord> monitors_ {};
   };
@@ -2430,6 +2449,7 @@ namespace {
 
     ~DeviceState() {
       stop_reaper();
+      backend.shutdown();
     }
 
     vdd::IoctlDispatchResult dispatch(
