@@ -78,6 +78,8 @@ namespace {
   };
   constexpr DWORD kBrokerServiceStateTimeoutMs {30'000};
   constexpr DWORD kBrokerServiceStatePollMs {250};
+  constexpr DWORD kBrokerPipeIoTimeoutMs {30'000};
+  constexpr DWORD kBrokerPipeCancelWaitMs {1'000};
   constexpr std::size_t kMaxBrokerResponseBytes {1024 * 1024};
 
   struct DevInfoSet {
@@ -161,6 +163,19 @@ namespace {
     bool ok {};
     std::string text;
     std::uint32_t native_error {};
+  };
+
+  struct OverlappedRequest {
+    LocalHandle event {CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    OVERLAPPED value {};
+
+    OverlappedRequest() {
+      value.hEvent = event.get();
+    }
+
+    bool valid() const {
+      return event.get() != nullptr;
+    }
   };
 
   std::wstring widen(const std::string_view value) {
@@ -438,6 +453,99 @@ namespace {
 
     return broker_pipe_server_matches_service(*server_pid) &&
            broker_pipe_server_has_expected_image(*server_pid);
+  }
+
+  bool wait_for_broker_pipe_io(
+    HANDLE pipe,
+    OVERLAPPED &overlapped,
+    DWORD &bytes_transferred,
+    DWORD &native_error
+  ) {
+    const auto wait_result = WaitForSingleObject(overlapped.hEvent, kBrokerPipeIoTimeoutMs);
+    if (wait_result == WAIT_TIMEOUT) {
+      native_error = ERROR_TIMEOUT;
+      CancelIoEx(pipe, &overlapped);
+      (void) WaitForSingleObject(overlapped.hEvent, kBrokerPipeCancelWaitMs);
+      return false;
+    }
+    if (wait_result != WAIT_OBJECT_0) {
+      native_error = GetLastError();
+      CancelIoEx(pipe, &overlapped);
+      return false;
+    }
+
+    if (!GetOverlappedResult(pipe, &overlapped, &bytes_transferred, FALSE)) {
+      native_error = GetLastError();
+      return false;
+    }
+
+    return true;
+  }
+
+  bool write_broker_pipe(
+    HANDLE pipe,
+    const void *buffer,
+    const DWORD requested,
+    DWORD &bytes_written,
+    DWORD &native_error
+  ) {
+    OverlappedRequest request;
+    if (!request.valid()) {
+      native_error = GetLastError();
+      return false;
+    }
+
+    if (WriteFile(pipe, buffer, requested, &bytes_written, &request.value)) {
+      return true;
+    }
+
+    const auto error = GetLastError();
+    if (error != ERROR_IO_PENDING) {
+      native_error = error;
+      return false;
+    }
+
+    return wait_for_broker_pipe_io(pipe, request.value, bytes_written, native_error);
+  }
+
+  bool read_broker_pipe(
+    HANDLE pipe,
+    void *buffer,
+    const DWORD buffer_size,
+    DWORD &bytes_read,
+    bool &more_data,
+    DWORD &native_error
+  ) {
+    more_data = false;
+    OverlappedRequest request;
+    if (!request.valid()) {
+      native_error = GetLastError();
+      return false;
+    }
+
+    if (ReadFile(pipe, buffer, buffer_size, &bytes_read, &request.value)) {
+      return true;
+    }
+
+    const auto error = GetLastError();
+    if (error == ERROR_MORE_DATA) {
+      more_data = true;
+      return true;
+    }
+    if (error != ERROR_IO_PENDING) {
+      native_error = error;
+      return false;
+    }
+
+    if (!wait_for_broker_pipe_io(pipe, request.value, bytes_read, native_error)) {
+      if (native_error == ERROR_MORE_DATA) {
+        more_data = true;
+        return true;
+      }
+      return false;
+    }
+
+    return true;
   }
 
   std::optional<SERVICE_STATUS_PROCESS> query_broker_service_status(
@@ -1035,7 +1143,7 @@ namespace {
       0,
       nullptr,
       OPEN_EXISTING,
-      FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
       nullptr
     )};
     if (pipe.get() == INVALID_HANDLE_VALUE) {
@@ -1053,16 +1161,10 @@ namespace {
 
     DWORD bytes_written = 0;
     const auto requested = static_cast<DWORD>(command.size());
-    if (!WriteFile(
-          pipe.get(),
-          command.data(),
-          requested,
-          &bytes_written,
-          nullptr
-        ) ||
+    DWORD native_error = ERROR_SUCCESS;
+    if (!write_broker_pipe(pipe.get(), command.data(), requested, bytes_written, native_error) ||
         bytes_written != requested) {
-      const auto error = GetLastError();
-      return {true, false, "error write_failed\n", error == ERROR_SUCCESS ? ERROR_WRITE_FAULT : error};
+      return {true, false, "error write_failed\n", native_error == ERROR_SUCCESS ? ERROR_WRITE_FAULT : native_error};
     }
 
     std::string text;
@@ -1070,18 +1172,9 @@ namespace {
     while (true) {
       DWORD bytes_read = 0;
       bool more_data = false;
-      if (!ReadFile(
-            pipe.get(),
-            response.data(),
-            static_cast<DWORD>(response.size()),
-            &bytes_read,
-            nullptr
-          )) {
-        const auto error = GetLastError();
-        if (error != ERROR_MORE_DATA) {
-          return {true, false, "error read_failed\n", error};
-        }
-        more_data = true;
+      native_error = ERROR_SUCCESS;
+      if (!read_broker_pipe(pipe.get(), response.data(), static_cast<DWORD>(response.size()), bytes_read, more_data, native_error)) {
+        return {true, false, "error read_failed\n", native_error};
       }
 
       if (bytes_read != 0) {

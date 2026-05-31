@@ -76,8 +76,12 @@ TEST(VirtualDisplayCliContract, BrokerCommandsUseSecuredIpcPath) {
   expect_contains(source, "start the broker service before using display management commands");
   expect_contains(source, "permanent-set ");
   expect_contains(source, "CreateFileW(");
+  expect_contains(source, "FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION");
   expect_contains(source, "WriteFile(");
   expect_contains(source, "ReadFile(");
+  expect_contains(source, "kBrokerPipeIoTimeoutMs {30'000}");
+  expect_contains(source, "CancelIoEx(pipe, &overlapped)");
+  expect_contains(source, "wait_for_broker_pipe_io");
   expect_contains(source, "broker_pipe_server_matches_service(*server_pid)");
   expect_contains(source, "status.dwCurrentState == SERVICE_RUNNING");
   expect_contains(source, "status.dwProcessId == server_pid");
