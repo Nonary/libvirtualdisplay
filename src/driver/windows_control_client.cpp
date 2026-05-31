@@ -11,6 +11,9 @@
 
 namespace virtual_display::driver {
   namespace {
+    constexpr DWORD kControlIoTimeoutMs = 30'000;
+    constexpr DWORD kControlIoCancelWaitMs = 1'000;
+
     struct DevInfoSet {
       HDEVINFO value {INVALID_HANDLE_VALUE};
 
@@ -36,7 +39,7 @@ namespace virtual_display::driver {
       }
 
       ~UniqueHandle() {
-        if (value != INVALID_HANDLE_VALUE) {
+        if (value != INVALID_HANDLE_VALUE && value != nullptr) {
           CloseHandle(value);
         }
       }
@@ -51,6 +54,10 @@ namespace virtual_display::driver {
 
     HANDLE invalid_handle() {
       return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE invalid_event() {
+      return nullptr;
     }
 
     std::vector<std::wstring> enumerate_control_device_paths(std::uint32_t &native_error) {
@@ -155,6 +162,16 @@ namespace virtual_display::driver {
       return false;
     }
 
+    UniqueHandle event {
+      CreateEventW(nullptr, TRUE, FALSE, nullptr)
+    };
+    if (event.value == invalid_event()) {
+      native_error = GetLastError();
+      return false;
+    }
+
+    OVERLAPPED overlapped {};
+    overlapped.hEvent = event.value;
     DWORD returned = 0;
     const BOOL ok = DeviceIoControl(
       handle_,
@@ -164,13 +181,35 @@ namespace virtual_display::driver {
       output,
       static_cast<DWORD>(output_size),
       &returned,
-      nullptr
+      &overlapped
     );
-    bytes_returned = returned;
     if (!ok) {
+      const auto error = GetLastError();
+      if (error != ERROR_IO_PENDING) {
+        native_error = error;
+        return false;
+      }
+
+      const auto wait_result = WaitForSingleObject(event.value, kControlIoTimeoutMs);
+      if (wait_result == WAIT_TIMEOUT) {
+        native_error = ERROR_TIMEOUT;
+        CancelIoEx(handle_, &overlapped);
+        (void) WaitForSingleObject(event.value, kControlIoCancelWaitMs);
+        return false;
+      }
+      if (wait_result != WAIT_OBJECT_0) {
+        native_error = GetLastError();
+        CancelIoEx(handle_, &overlapped);
+        return false;
+      }
+    }
+
+    if (!GetOverlappedResult(handle_, &overlapped, &returned, FALSE)) {
       native_error = GetLastError();
       return false;
     }
+
+    bytes_returned = returned;
     return true;
   }
 
@@ -220,7 +259,7 @@ namespace virtual_display::driver {
           FILE_SHARE_READ | FILE_SHARE_WRITE,
           nullptr,
           OPEN_EXISTING,
-          FILE_ATTRIBUTE_NORMAL,
+          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
           nullptr
         )
       };

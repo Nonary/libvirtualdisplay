@@ -685,6 +685,10 @@ TEST(VirtualDisplayWindowsDriverContract, ControlClientHandlesSetupApiAndHandleF
 
   EXPECT_NE(source.find("struct UniqueHandle"), std::string::npos);
   EXPECT_NE(source.find("std::exchange(value, INVALID_HANDLE_VALUE)"), std::string::npos);
+  EXPECT_NE(source.find("FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED"), std::string::npos);
+  EXPECT_NE(source.find("constexpr DWORD kControlIoTimeoutMs = 30'000;"), std::string::npos);
+  EXPECT_NE(source.find("CancelIoEx(handle_, &overlapped);"), std::string::npos);
+  EXPECT_NE(source.find("native_error = ERROR_TIMEOUT;"), std::string::npos);
   EXPECT_NE(source.find("auto transport = std::make_unique<WindowsControlTransport>(handle.release());"), std::string::npos);
   EXPECT_NE(source.find("detail_size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)"), std::string::npos);
   EXPECT_NE(source.find("native_error = paths.empty() ? ERROR_FILE_NOT_FOUND : ERROR_SUCCESS;"), std::string::npos);
