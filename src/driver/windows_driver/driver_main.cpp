@@ -740,18 +740,15 @@ namespace {
     return mode_shape_from_description(description);
   }
 
-  IDDCX_BITS_PER_COMPONENT supported_hdr_bits_per_component() {
+  IDDCX_BITS_PER_COMPONENT preferred_rgb_bits_per_component() {
     const auto capabilities = vdd::hdr_output_capabilities();
-    UINT bits = 0;
-    if (capabilities.output_bits.rgb_8bpc) {
-      bits |= static_cast<UINT>(IDDCX_BITS_PER_COMPONENT_8);
-    }
     if (capabilities.output_bits.rgb_10bpc) {
-      bits |= static_cast<UINT>(IDDCX_BITS_PER_COMPONENT_10);
+      return IDDCX_BITS_PER_COMPONENT_10;
     }
-    return static_cast<IDDCX_BITS_PER_COMPONENT>(
-      bits
-    );
+    if (capabilities.output_bits.rgb_8bpc) {
+      return IDDCX_BITS_PER_COMPONENT_8;
+    }
+    return IDDCX_BITS_PER_COMPONENT_NONE;
   }
 
   void populate_rgb_wire_bits(IDDCX_WIRE_BITS_PER_COMPONENT &bits, const IDDCX_BITS_PER_COMPONENT rgb_bits) {
@@ -829,7 +826,7 @@ namespace {
     mode.Size = sizeof(mode);
     mode.Origin = origin;
     mode.MonitorVideoSignalInfo = make_signal_info(shape, true);
-    populate_rgb_wire_bits(mode.BitsPerComponent, supported_hdr_bits_per_component());
+    populate_rgb_wire_bits(mode.BitsPerComponent, preferred_rgb_bits_per_component());
     return mode;
   }
 
@@ -844,7 +841,7 @@ namespace {
     IDDCX_TARGET_MODE2 mode {};
     mode.Size = sizeof(mode);
     mode.TargetVideoSignalInfo.targetVideoSignalInfo = make_signal_info(shape, false);
-    populate_rgb_wire_bits(mode.BitsPerComponent, supported_hdr_bits_per_component());
+    populate_rgb_wire_bits(mode.BitsPerComponent, preferred_rgb_bits_per_component());
     return mode;
   }
 

@@ -601,6 +601,30 @@ TEST(VirtualDisplayWindowsDriverContract, GatesHdrDescriptorsOnRuntimeIddCxSuppo
   EXPECT_NE(source.find("options.hdr_supported = false;"), std::string::npos);
 }
 
+TEST(VirtualDisplayWindowsDriverContract, PrefersTenBitRgbModesWhenAvailable) {
+  const auto source = read_windows_driver_source();
+
+  const auto bits_function = source.find("IDDCX_BITS_PER_COMPONENT preferred_rgb_bits_per_component()");
+  ASSERT_NE(bits_function, std::string::npos);
+
+  const auto ten_bit_check = source.find("if (capabilities.output_bits.rgb_10bpc)", bits_function);
+  ASSERT_NE(ten_bit_check, std::string::npos);
+  const auto ten_bit_return = source.find("return IDDCX_BITS_PER_COMPONENT_10;", ten_bit_check);
+  ASSERT_NE(ten_bit_return, std::string::npos);
+  const auto eight_bit_check = source.find("if (capabilities.output_bits.rgb_8bpc)", ten_bit_return);
+  ASSERT_NE(eight_bit_check, std::string::npos);
+  EXPECT_LT(ten_bit_return, eight_bit_check);
+
+  EXPECT_NE(
+    source.find("populate_rgb_wire_bits(mode.BitsPerComponent, preferred_rgb_bits_per_component());"),
+    std::string::npos
+  );
+  EXPECT_NE(
+    source.find("populate_rgb_wire_bits(output->DitheringSupport, IDDCX_BITS_PER_COMPONENT_10);"),
+    std::string::npos
+  );
+}
+
 TEST(VirtualDisplayWindowsDriverContract, RegistersTraceLoggingProvider) {
   const auto source = read_windows_driver_source();
 
