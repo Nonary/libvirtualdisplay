@@ -31,7 +31,7 @@ namespace {
     vdd::BackendError unreserve_temporary_display_identity(const std::uint64_t display_id) override {
       unreserved.push_back(display_id);
       events.push_back("unreserve");
-      return vdd::BackendError::None;
+      return fail_unreserve ? vdd::BackendError::Failed : vdd::BackendError::None;
     }
 
     vdd::BackendDisplayResult arrive_temporary_display(const vdd::DisplayDescriptor &descriptor) override {
@@ -64,6 +64,7 @@ namespace {
     bool fail_depart {};
     bool fail_permanent {};
     bool fail_reserve {};
+    bool fail_unreserve {};
     bool fail_render_adapter {};
     vdd::AdapterLuid adapter_luid {44, 2};
     vdd::SetRenderAdapterRequest render_adapter_request {};
@@ -229,6 +230,30 @@ TEST(VirtualDisplayDriverController, CreateTemporaryDisplayRollsBackStoreWhenBac
   );
   EXPECT_TRUE(retried.status.ok());
   EXPECT_EQ(retried.result.connector_index, 4u);
+}
+
+TEST(VirtualDisplayDriverController, CreateTemporaryDisplayRetainsConnectorWhenIdentityCleanupFails) {
+  FakeBackend backend;
+  backend.fail_arrive = true;
+  backend.fail_unreserve = true;
+  auto controller = make_controller(backend);
+
+  const auto created = controller.create_temporary_display(make_create_request(), std::chrono::steady_clock::now());
+
+  EXPECT_FALSE(created.status.ok());
+  EXPECT_EQ(controller.store().temporary_display_count(), 0u);
+  EXPECT_FALSE(controller.store().find_temporary_display(0x12345678));
+  EXPECT_EQ(backend.unreserved, (std::vector<std::uint64_t> {0x12345678}));
+  EXPECT_EQ(backend.events, (std::vector<std::string> {"reserve", "arrive", "unreserve"}));
+
+  backend.fail_arrive = false;
+  backend.fail_unreserve = false;
+  const auto retried = controller.create_temporary_display(
+    make_create_request(lease_id(101), 0x87654321),
+    std::chrono::steady_clock::now()
+  );
+  EXPECT_TRUE(retried.status.ok());
+  EXPECT_EQ(retried.result.connector_index, 5u);
 }
 
 TEST(VirtualDisplayDriverController, RemoveTemporaryDisplayDepartsBackend) {

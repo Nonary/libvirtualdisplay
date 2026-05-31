@@ -55,15 +55,18 @@ namespace virtual_display::driver {
 
     const auto backend_result = backend_.arrive_temporary_display(descriptor);
     if (backend_result.error != BackendError::None) {
+      auto rollback_mode = RemoveTemporaryDisplayMode::ReleaseConnectorReservation;
       if (identity_reserved) {
-        (void) backend_.unreserve_temporary_display_identity(request.display_id);
+        if (backend_.unreserve_temporary_display_identity(request.display_id) != BackendError::None) {
+          rollback_mode = RemoveTemporaryDisplayMode::RetainConnectorReservation;
+        }
       }
       LeaseDisplayRequest rollback {};
       rollback.lease_id = request.lease_id;
       rollback.display_id = request.display_id;
       (void) store_.remove_temporary_display(
         rollback,
-        RemoveTemporaryDisplayMode::ReleaseConnectorReservation
+        rollback_mode
       );
       return {
         {StoreError::None, ValidationError::None, backend_result.error},

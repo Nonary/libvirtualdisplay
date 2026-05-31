@@ -647,6 +647,7 @@ TEST(VirtualDisplayWindowsDriverContract, RegistersTraceLoggingProvider) {
   EXPECT_NE(source.find("\"RenderDeviceCreated\""), std::string::npos);
   EXPECT_NE(source.find("\"MonitorArrived\""), std::string::npos);
   EXPECT_NE(source.find("\"MonitorDeparted\""), std::string::npos);
+  EXPECT_NE(source.find("\"TemporaryIdentityUnreserveFailed\""), std::string::npos);
   EXPECT_NE(source.find("\"SwapChainAssigned\""), std::string::npos);
   EXPECT_NE(source.find("\"SwapChainUnassigned\""), std::string::npos);
   EXPECT_NE(source.find("\"DefaultHdrMetadataSet\""), std::string::npos);

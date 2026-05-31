@@ -1830,7 +1830,12 @@ namespace {
     }
 
     vdd::BackendError unreserve_temporary_display_identity(const std::uint64_t display_id) override {
-      return remove_temporary_display_profile(driver_, device_, display_id);
+      const auto result = remove_temporary_display_profile(driver_, device_, display_id);
+      if (result != vdd::BackendError::None) {
+        TraceLoggingWrite(g_trace_provider, "TemporaryIdentityUnreserveFailed", TraceLoggingUInt64(display_id, "DisplayId"));
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "TemporaryIdentityUnreserveFailed");
+      }
+      return result;
     }
 
     vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
