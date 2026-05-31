@@ -9,6 +9,7 @@ TEST(VirtualDisplayDriverHdrCapabilities, AdvertisesWindowsHdrPrerequisites) {
   EXPECT_TRUE(capabilities.fp16_swapchain);
   EXPECT_TRUE(capabilities.wide_color_space);
   EXPECT_TRUE(capabilities.high_color_space);
+  EXPECT_FALSE(capabilities.endpoint_gamma_transform);
   EXPECT_TRUE(capabilities.output_bits.rgb_8bpc);
   EXPECT_TRUE(capabilities.output_bits.rgb_10bpc);
   EXPECT_FALSE(capabilities.output_bits.ycbcr444);

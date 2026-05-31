@@ -6,6 +6,7 @@ namespace virtual_display::driver {
       true,
       true,
       true,
+      false,
       WireColorSupport {
         true,
         true,

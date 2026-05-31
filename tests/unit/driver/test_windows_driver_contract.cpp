@@ -274,12 +274,17 @@ TEST(VirtualDisplayWindowsDriverContract, StoresTemporaryIdentityInWdfPersistent
   EXPECT_NE(source.find("TemporaryDisplayProfiles"), std::string::npos);
   EXPECT_NE(source.find("REG_BINARY"), std::string::npos);
   EXPECT_NE(source.find("entry.connector_index == descriptor.connector_index"), std::string::npos);
+  const auto persistent_state = source.find("std::vector<TemporaryDisplayProfile> load_temporary_display_profiles");
+  ASSERT_NE(persistent_state, std::string::npos);
+  const auto persistent_state_end = source.find("bool read_registry_string", persistent_state);
+  ASSERT_NE(persistent_state_end, std::string::npos);
+  const auto persistent_state_body = source.substr(persistent_state, persistent_state_end - persistent_state);
   EXPECT_EQ(source.find("KEY_ALL_ACCESS"), std::string::npos);
-  EXPECT_EQ(source.find("KEY_WRITE"), std::string::npos);
+  EXPECT_EQ(persistent_state_body.find("KEY_WRITE"), std::string::npos);
   EXPECT_EQ(source.find("WdfRegistryCreateKey"), std::string::npos);
-  EXPECT_EQ(source.find("RegEnumKeyExW"), std::string::npos);
   EXPECT_EQ(source.find("SOFTWARE\\\\Sunshine\\\\VirtualDisplayDriver"), std::string::npos);
-  EXPECT_EQ(source.find("RegCreateKeyExW"), std::string::npos);
+  EXPECT_EQ(persistent_state_body.find("RegEnumKeyExW"), std::string::npos);
+  EXPECT_EQ(persistent_state_body.find("RegCreateKeyExW"), std::string::npos);
   EXPECT_NE(inf.find("HKR,,\"ConfigVersion\",0x00010001,1"), std::string::npos);
 }
 
@@ -587,7 +592,10 @@ TEST(VirtualDisplayWindowsDriverContract, DepartureWaitsOnlyForInflightAssignCal
   const auto depart_display = source.find("vdd::BackendError depart_display");
   ASSERT_NE(depart_display, std::string::npos);
   EXPECT_NE(source.find("departure_cv_.wait_for(lock, std::chrono::milliseconds(250)", depart_display), std::string::npos);
-  EXPECT_EQ(source.find("std::this_thread::sleep_for(std::chrono::milliseconds(250));"), std::string::npos);
+  const auto depart_display_end = source.find("NTSTATUS assign_swapchain", depart_display);
+  ASSERT_NE(depart_display_end, std::string::npos);
+  const auto depart_display_body = source.substr(depart_display, depart_display_end - depart_display);
+  EXPECT_EQ(depart_display_body.find("std::this_thread::sleep_for(std::chrono::milliseconds(250));"), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, GatesHdrDescriptorsOnRuntimeIddCxSupport) {
@@ -696,6 +704,32 @@ TEST(VirtualDisplayWindowsDriverContract, RecordsAdvancedColorCallbacksPerMonito
   EXPECT_NE(source.find("record->second.gamma_ramp_size = args->GammaRampSizeInBytes;"), std::string::npos);
   EXPECT_NE(source.find("return context->backend->set_default_hdr_metadata(monitor, args);"), std::string::npos);
   EXPECT_NE(source.find("return context->backend->set_gamma_ramp(monitor, args);"), std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, DoesNotAdvertiseUnimplementedEndpointGammaTransform) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(
+    source.find("caps.EndPointDiagnostics.GammaSupport = hdr_capabilities.endpoint_gamma_transform ?"),
+    std::string::npos
+  );
+  EXPECT_NE(source.find("IDDCX_FEATURE_IMPLEMENTATION_NONE;"), std::string::npos);
+  EXPECT_NE(source.find("SetGammaRamp callback registered for FP16/HDR diagnostics"), std::string::npos);
+  EXPECT_NE(source.find("endpoint pixel-processing stage where this transform can be applied"), std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, RetainsHdrProfileAssociationForStableTemporaryIdentity) {
+  const auto source = read_windows_driver_source();
+  const auto cmake = read_windows_driver_cmake();
+
+  EXPECT_NE(source.find("#include <Wtsapi32.h>"), std::string::npos);
+  EXPECT_NE(source.find("active_console_user_sid_string()"), std::string::npos);
+  EXPECT_NE(source.find("WTSQueryUserToken(session_id, &token)"), std::string::npos);
+  EXPECT_NE(source.find("HKEY_USERS"), std::string::npos);
+  EXPECT_NE(source.find("ICMProfileAC"), std::string::npos);
+  EXPECT_NE(source.find("monitor_driver_value_for_identity"), std::string::npos);
+  EXPECT_NE(source.find("schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId);"), std::string::npos);
+  EXPECT_NE(cmake.find("wtsapi32"), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, RegistersGammaRampIndependentOfHdrCallbacks) {

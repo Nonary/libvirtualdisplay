@@ -11,7 +11,9 @@
 #include <avrt.h>
 #include <d3d11.h>
 #include <dxgi1_4.h>
+#include <sddl.h>
 #include <TraceLoggingProvider.h>
+#include <Wtsapi32.h>
 #include <wdf.h>
 #include <IddCx.h>
 #include <wrl/client.h>
@@ -88,9 +90,15 @@ namespace {
     class DeviceState *state {};
   };
 
+  struct HdrProfileRetentionWorkItemContext {
+    vdd::DisplayDescriptor descriptor {};
+    std::uint32_t target_id {};
+  };
+
   WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(AdapterContext, GetAdapterContext);
   WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MonitorContext, GetMonitorContext);
   WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DeviceContext, GetDeviceContext);
+  WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(HdrProfileRetentionWorkItemContext, GetHdrProfileRetentionWorkItemContext);
 
   struct MonitorRecord {
     vdd::DisplayDescriptor descriptor {};
@@ -373,6 +381,47 @@ namespace {
     WDFKEY key_ {};
   };
 
+  class NativeRegistryKey {
+  public:
+    NativeRegistryKey() = default;
+    explicit NativeRegistryKey(HKEY key):
+        key_ {key} {
+    }
+    NativeRegistryKey(const NativeRegistryKey &) = delete;
+    NativeRegistryKey &operator=(const NativeRegistryKey &) = delete;
+    NativeRegistryKey(NativeRegistryKey &&other) noexcept:
+        key_ {std::exchange(other.key_, nullptr)} {
+    }
+    NativeRegistryKey &operator=(NativeRegistryKey &&other) noexcept {
+      if (this != &other) {
+        reset(std::exchange(other.key_, nullptr));
+      }
+      return *this;
+    }
+    ~NativeRegistryKey() {
+      reset();
+    }
+
+    HKEY get() const {
+      return key_;
+    }
+
+    HKEY *put() {
+      reset();
+      return &key_;
+    }
+
+    void reset(HKEY key = nullptr) {
+      if (key_) {
+        RegCloseKey(key_);
+      }
+      key_ = key;
+    }
+
+  private:
+    HKEY key_ {};
+  };
+
   NTSTATUS open_driver_state_key(WDFDRIVER driver, WDFDEVICE device, ACCESS_MASK desired_access, RegistryKey &key) {
     if (!driver && !device) {
       return STATUS_INVALID_PARAMETER;
@@ -617,6 +666,385 @@ namespace {
     );
 
     return NT_SUCCESS(status) ? vdd::BackendError::None : vdd::BackendError::Failed;
+  }
+
+  bool read_registry_string(HKEY key, const wchar_t *value_name, std::wstring &value) {
+    DWORD type {};
+    DWORD size {};
+    auto status = RegQueryValueExW(key, value_name, nullptr, &type, nullptr, &size);
+    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || size < sizeof(wchar_t)) {
+      return false;
+    }
+
+    std::wstring buffer(size / sizeof(wchar_t), L'\0');
+    status = RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(buffer.data()), &size);
+    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+      return false;
+    }
+
+    while (!buffer.empty() && buffer.back() == L'\0') {
+      buffer.pop_back();
+    }
+    value = std::move(buffer);
+    return true;
+  }
+
+  bool read_registry_dword(HKEY key, const wchar_t *value_name, DWORD &value) {
+    DWORD type {};
+    DWORD size = sizeof(value);
+    return RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS &&
+           type == REG_DWORD &&
+           size == sizeof(value);
+  }
+
+  std::vector<std::byte> read_registry_profile_value(HKEY key, const wchar_t *value_name, DWORD &type) {
+    type = 0;
+    DWORD size {};
+    auto status = RegQueryValueExW(key, value_name, nullptr, &type, nullptr, &size);
+    if (status != ERROR_SUCCESS || size == 0 || (type != REG_MULTI_SZ && type != REG_SZ)) {
+      return {};
+    }
+
+    std::vector<std::byte> value(size);
+    status = RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(value.data()), &size);
+    if (status != ERROR_SUCCESS || size == 0 || (type != REG_MULTI_SZ && type != REG_SZ)) {
+      return {};
+    }
+    value.resize(size);
+    return value;
+  }
+
+  std::optional<std::wstring> active_console_user_sid_string() {
+    const DWORD session_id = WTSGetActiveConsoleSessionId();
+    if (session_id == 0xffffffffu) {
+      return std::nullopt;
+    }
+
+    HANDLE token {};
+    if (!WTSQueryUserToken(session_id, &token)) {
+      TraceLoggingWrite(
+        g_trace_provider,
+        "HdrProfileRetentionUserTokenUnavailable",
+        TraceLoggingUInt32(GetLastError(), "NativeError"),
+        TraceLoggingUInt32(session_id, "SessionId")
+      );
+      return std::nullopt;
+    }
+
+    DWORD token_user_size {};
+    (void) GetTokenInformation(token, TokenUser, nullptr, 0, &token_user_size);
+    if (token_user_size == 0) {
+      CloseHandle(token);
+      return std::nullopt;
+    }
+
+    std::vector<std::byte> token_user_buffer(token_user_size);
+    if (!GetTokenInformation(token, TokenUser, token_user_buffer.data(), token_user_size, &token_user_size)) {
+      CloseHandle(token);
+      return std::nullopt;
+    }
+
+    CloseHandle(token);
+
+    const auto *token_user = reinterpret_cast<const TOKEN_USER *>(token_user_buffer.data());
+    LPWSTR sid_text {};
+    if (!ConvertSidToStringSidW(token_user->User.Sid, &sid_text)) {
+      return std::nullopt;
+    }
+
+    std::wstring result {sid_text};
+    LocalFree(sid_text);
+    return result;
+  }
+
+  std::wstring temporary_monitor_hardware_id(const vdd::DisplayDescriptor &descriptor) {
+    wchar_t text[8] {};
+    std::swprintf(text, std::size(text), L"SDD%04X", static_cast<unsigned int>(vdd::read_product_code(descriptor.edid)));
+    return text;
+  }
+
+  std::wstring guid_registry_string(const vdd::Guid &guid) {
+    wchar_t text[39] {};
+    std::swprintf(
+      text,
+      std::size(text),
+      L"{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+      static_cast<unsigned int>(guid.data1),
+      static_cast<unsigned int>(guid.data2),
+      static_cast<unsigned int>(guid.data3),
+      static_cast<unsigned int>(guid.data4[0]),
+      static_cast<unsigned int>(guid.data4[1]),
+      static_cast<unsigned int>(guid.data4[2]),
+      static_cast<unsigned int>(guid.data4[3]),
+      static_cast<unsigned int>(guid.data4[4]),
+      static_cast<unsigned int>(guid.data4[5]),
+      static_cast<unsigned int>(guid.data4[6]),
+      static_cast<unsigned int>(guid.data4[7])
+    );
+    return text;
+  }
+
+  bool equals_ci(const std::wstring &left, const std::wstring &right) {
+    return left.size() == right.size() && _wcsicmp(left.c_str(), right.c_str()) == 0;
+  }
+
+  std::optional<std::wstring> profile_association_path_from_driver_value(const std::wstring &driver_value) {
+    const auto slash = driver_value.rfind(L'\\');
+    if (slash == std::wstring::npos || slash + 1 >= driver_value.size()) {
+      return std::nullopt;
+    }
+
+    return L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display\\" + driver_value;
+  }
+
+  std::optional<std::wstring> monitor_driver_value_for_identity(
+    const vdd::DisplayDescriptor &descriptor,
+    const std::uint32_t target_id
+  ) {
+    const auto hardware_id = temporary_monitor_hardware_id(descriptor);
+    NativeRegistryKey hardware_key;
+    const auto hardware_path = L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" + hardware_id;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, hardware_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, hardware_key.put()) != ERROR_SUCCESS) {
+      return std::nullopt;
+    }
+
+    const auto expected_container_id = guid_registry_string(descriptor.container_id);
+    std::optional<std::wstring> fallback_driver;
+    for (DWORD index = 0;; ++index) {
+      wchar_t instance_name[256] {};
+      DWORD instance_name_size = static_cast<DWORD>(std::size(instance_name));
+      const auto enum_status = RegEnumKeyExW(hardware_key.get(), index, instance_name, &instance_name_size, nullptr, nullptr, nullptr, nullptr);
+      if (enum_status == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      if (enum_status != ERROR_SUCCESS) {
+        continue;
+      }
+
+      NativeRegistryKey instance_key;
+      if (RegOpenKeyExW(hardware_key.get(), instance_name, 0, KEY_QUERY_VALUE, instance_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      std::wstring container_id;
+      if (!read_registry_string(instance_key.get(), L"ContainerID", container_id) ||
+          !equals_ci(container_id, expected_container_id)) {
+        continue;
+      }
+
+      std::wstring driver_value;
+      if (!read_registry_string(instance_key.get(), L"Driver", driver_value)) {
+        continue;
+      }
+
+      DWORD address {};
+      if (read_registry_dword(instance_key.get(), L"Address", address) && address == target_id) {
+        return driver_value;
+      }
+
+      fallback_driver = driver_value;
+    }
+
+    return fallback_driver;
+  }
+
+  bool monitor_driver_value_matches_identity(
+    const std::wstring &driver_value,
+    const std::wstring &hardware_id,
+    const std::wstring &container_id
+  ) {
+    NativeRegistryKey hardware_key;
+    const auto hardware_path = L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" + hardware_id;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, hardware_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, hardware_key.put()) != ERROR_SUCCESS) {
+      return false;
+    }
+
+    for (DWORD index = 0;; ++index) {
+      wchar_t instance_name[256] {};
+      DWORD instance_name_size = static_cast<DWORD>(std::size(instance_name));
+      const auto enum_status = RegEnumKeyExW(hardware_key.get(), index, instance_name, &instance_name_size, nullptr, nullptr, nullptr, nullptr);
+      if (enum_status == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      if (enum_status != ERROR_SUCCESS) {
+        continue;
+      }
+
+      NativeRegistryKey instance_key;
+      if (RegOpenKeyExW(hardware_key.get(), instance_name, 0, KEY_QUERY_VALUE, instance_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      std::wstring candidate_driver;
+      std::wstring candidate_container;
+      if (read_registry_string(instance_key.get(), L"Driver", candidate_driver) &&
+          read_registry_string(instance_key.get(), L"ContainerID", candidate_container) &&
+          equals_ci(candidate_driver, driver_value) &&
+          equals_ci(candidate_container, container_id)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  void migrate_hdr_profile_association_for_monitor(
+    const vdd::DisplayDescriptor descriptor,
+    const std::uint32_t target_id
+  ) {
+    if (!descriptor.retain_identity) {
+      return;
+    }
+
+    const auto sid = active_console_user_sid_string();
+    if (!sid) {
+      return;
+    }
+
+    const auto current_driver = monitor_driver_value_for_identity(descriptor, target_id);
+    if (!current_driver) {
+      return;
+    }
+
+    const auto current_profile_path = profile_association_path_from_driver_value(*current_driver);
+    if (!current_profile_path) {
+      return;
+    }
+
+    NativeRegistryKey current_profile_key;
+    const auto current_user_path = *sid + L"\\" + *current_profile_path;
+    if (RegCreateKeyExW(
+          HKEY_USERS,
+          current_user_path.c_str(),
+          0,
+          nullptr,
+          REG_OPTION_NON_VOLATILE,
+          KEY_QUERY_VALUE | KEY_SET_VALUE,
+          nullptr,
+          current_profile_key.put(),
+          nullptr
+        ) != ERROR_SUCCESS) {
+      return;
+    }
+
+    DWORD current_profile_type {};
+    if (!read_registry_profile_value(current_profile_key.get(), L"ICMProfileAC", current_profile_type).empty()) {
+      return;
+    }
+
+    const auto current_slash = current_driver->rfind(L'\\');
+    if (current_slash == std::wstring::npos) {
+      return;
+    }
+
+    const auto profile_class_path =
+      *sid +
+      L"\\Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display\\" +
+      current_driver->substr(0, current_slash);
+
+    NativeRegistryKey profile_class_key;
+    if (RegOpenKeyExW(HKEY_USERS, profile_class_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, profile_class_key.put()) != ERROR_SUCCESS) {
+      return;
+    }
+
+    const auto hardware_id = temporary_monitor_hardware_id(descriptor);
+    const auto container_id = guid_registry_string(descriptor.container_id);
+    for (DWORD index = 0;; ++index) {
+      wchar_t profile_key_name[64] {};
+      DWORD profile_key_name_size = static_cast<DWORD>(std::size(profile_key_name));
+      const auto enum_status = RegEnumKeyExW(profile_class_key.get(), index, profile_key_name, &profile_key_name_size, nullptr, nullptr, nullptr, nullptr);
+      if (enum_status == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      if (enum_status != ERROR_SUCCESS) {
+        continue;
+      }
+
+      const auto candidate_driver = current_driver->substr(0, current_slash + 1) + profile_key_name;
+      if (equals_ci(candidate_driver, *current_driver) ||
+          !monitor_driver_value_matches_identity(candidate_driver, hardware_id, container_id)) {
+        continue;
+      }
+
+      NativeRegistryKey source_profile_key;
+      if (RegOpenKeyExW(profile_class_key.get(), profile_key_name, 0, KEY_QUERY_VALUE, source_profile_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      DWORD source_profile_type {};
+      const auto source_profile = read_registry_profile_value(source_profile_key.get(), L"ICMProfileAC", source_profile_type);
+      if (source_profile.empty()) {
+        continue;
+      }
+
+      DWORD use_per_user = 1;
+      (void) read_registry_dword(source_profile_key.get(), L"UsePerUserProfiles", use_per_user);
+      (void) RegSetValueExW(
+        current_profile_key.get(),
+        L"UsePerUserProfiles",
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE *>(&use_per_user),
+        sizeof(use_per_user)
+      );
+
+      if (RegSetValueExW(
+            current_profile_key.get(),
+            L"ICMProfileAC",
+            0,
+            source_profile_type,
+            reinterpret_cast<const BYTE *>(source_profile.data()),
+            static_cast<DWORD>(source_profile.size())
+          ) == ERROR_SUCCESS) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "HdrProfileAssociationRetained",
+          TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+          TraceLoggingUInt32(target_id, "TargetId")
+        );
+      }
+      return;
+    }
+  }
+
+  EVT_WDF_WORKITEM hdr_profile_retention_work_item;
+
+  void hdr_profile_retention_work_item(WDFWORKITEM work_item) {
+    const auto *context = GetHdrProfileRetentionWorkItemContext(work_item);
+    if (context) {
+      for (std::uint32_t attempt = 0; attempt < 20; ++attempt) {
+        migrate_hdr_profile_association_for_monitor(context->descriptor, context->target_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+    }
+    WdfObjectDelete(work_item);
+  }
+
+  void schedule_hdr_profile_association_retention(
+    WDFDEVICE device,
+    const vdd::DisplayDescriptor &descriptor,
+    const std::uint32_t target_id
+  ) {
+    if (!descriptor.retain_identity) {
+      return;
+    }
+
+    WDF_WORKITEM_CONFIG config;
+    WDF_WORKITEM_CONFIG_INIT(&config, hdr_profile_retention_work_item);
+
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, HdrProfileRetentionWorkItemContext);
+    attributes.ParentObject = device;
+
+    WDFWORKITEM work_item {};
+    if (!NT_SUCCESS(WdfWorkItemCreate(&config, &attributes, &work_item))) {
+      return;
+    }
+
+    auto *context = GetHdrProfileRetentionWorkItemContext(work_item);
+    context->descriptor = descriptor;
+    context->target_id = target_id;
+    WdfWorkItemEnqueue(work_item);
   }
 
   bool has_hdr_iddcx_ddi() {
@@ -1330,9 +1758,11 @@ namespace {
         IDDCX_ADAPTER_FLAGS_NONE;
       caps.MaxMonitorsSupported = kMaxPermanentDisplays + kMaxTemporaryDisplays;
       caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
-      // IddCx expects gamma support to be advertised when exposing high color
-      // space; accepting SetGammaRamp below is enough for our software path.
-      caps.EndPointDiagnostics.GammaSupport = hdr_capabilities.high_color_space ?
+      // The virtual sink does not render an endpoint image or apply the OS
+      // 3x4 color-space/gamma transform to a downstream panel. Keep the
+      // SetGammaRamp callback registered for FP16/HDR diagnostics, but do not
+      // advertise software gamma support until the frame path applies it.
+      caps.EndPointDiagnostics.GammaSupport = hdr_capabilities.endpoint_gamma_transform ?
         IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE :
         IDDCX_FEATURE_IMPLEMENTATION_NONE;
       caps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -1632,6 +2062,9 @@ namespace {
         TraceLoggingUInt32(arrival_out.OsTargetId, "OsTargetId")
       );
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorArrived");
+      if (!permanent) {
+        schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId);
+      }
       return {
         vdd::BackendError::None,
         vdd::from_windows_luid(arrival_out.OsAdapterLuid),
@@ -1867,6 +2300,10 @@ namespace {
         return STATUS_INVALID_PARAMETER;
       }
 
+      // FP16-capable IddCx adapters can still receive 3x4 color-space
+      // transforms even when endpoint gamma support is not advertised. Record
+      // the callback for diagnostics; the current virtual-display sink has no
+      // endpoint pixel-processing stage where this transform can be applied.
       auto *context = GetMonitorContext(monitor);
       if (!context || !context->backend) {
         return STATUS_DEVICE_NOT_READY;

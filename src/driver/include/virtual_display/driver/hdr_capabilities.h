@@ -13,6 +13,7 @@ namespace virtual_display::driver {
     bool fp16_swapchain {};
     bool wide_color_space {};
     bool high_color_space {};
+    bool endpoint_gamma_transform {};
     WireColorSupport output_bits {};
     WireColorSupport dithering_bits {};
   };
