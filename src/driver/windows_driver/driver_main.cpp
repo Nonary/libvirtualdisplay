@@ -1504,7 +1504,7 @@ namespace {
           try {
             process_frames(render_adapter_luid);
           } catch (...) {
-            // Failures are handled inside process_frames() (delete_swapchain()).
+            delete_swapchain();
           }
         });
       } catch (...) {
@@ -1526,15 +1526,19 @@ namespace {
     }
 
     void stop() {
-      stop_requested_.store(true, std::memory_order_release);
-      if (next_surface_available_) {
-        SetEvent(next_surface_available_);
-      }
+      request_stop();
       if (worker_.joinable()) {
         worker_.join();
       }
       dxgi_device_.Reset();
       device_.Reset();
+    }
+
+    void request_stop() {
+      stop_requested_.store(true, std::memory_order_release);
+      if (next_surface_available_) {
+        SetEvent(next_surface_available_);
+      }
     }
 
     void abandon_swapchain() {
@@ -1614,7 +1618,11 @@ namespace {
       MmcssRegistration mmcss {kSwapchainMmcssTask};
 
       HRESULT hr = reset_render_device(render_adapter_luid);
-      if (FAILED(hr) || stop_requested_.load(std::memory_order_acquire)) {
+      if (FAILED(hr)) {
+        delete_swapchain();
+        return;
+      }
+      if (stop_requested_.load(std::memory_order_acquire)) {
         return;
       }
 
@@ -1720,11 +1728,23 @@ namespace {
     processor.reset();
   }
 
+  void request_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
+    if (processor) {
+      processor->request_stop();
+    }
+  }
+
   void stop_swapchain_processors_without_delete(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
     for (auto &processor: processors) {
       stop_swapchain_processor_without_delete(processor);
     }
     processors.clear();
+  }
+
+  void request_stop_swapchain_processors(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
+    for (auto &processor: processors) {
+      request_stop_swapchain_processor(processor);
+    }
   }
 
   class IddCxBackend: public vdd::DisplayDriverBackend {
@@ -2105,17 +2125,18 @@ namespace {
         retired_processors_to_stop = std::move(monitor->second.retired_swapchain_processors);
       }
 
-      // Stop frame processing and release local swapchain references before
-      // departure.
-      // IddCxMonitorDeparture can invalidate swapchain objects before local
-      // processors leave scope during temporary-display removal.
-      stop_swapchain_processor_without_delete(processor_to_stop);
-      stop_swapchain_processors_without_delete(retired_processors_to_stop);
+      // Wake frame processing before departure, but do not join here. If a
+      // worker is blocked inside IddCx swapchain processing, monitor departure
+      // is the state transition that can invalidate and release that wait.
+      request_stop_swapchain_processor(processor_to_stop);
+      request_stop_swapchain_processors(retired_processors_to_stop);
 
       // IddCx can synchronously or asynchronously issue swapchain callbacks
       // during departure. Calling it outside the backend mutex keeps those
       // callbacks from re-entering a locked monitor map.
       const auto status = IddCxMonitorDeparture(monitor_handle);
+      stop_swapchain_processor_without_delete(processor_to_stop);
+      stop_swapchain_processors_without_delete(retired_processors_to_stop);
       if (!NT_SUCCESS(status)) {
         TraceLoggingWrite(
           g_trace_provider,
@@ -2198,10 +2219,10 @@ namespace {
       }
 
       if (previous_processor) {
-        // IddCx rotates swapchains inside HandleNewSwapChain. Keep the old WDF
-        // object alive until monitor teardown, but never join its worker while
-        // holding the backend monitor map mutex.
-        previous_processor->stop();
+        // IddCx rotates swapchains inside HandleNewSwapChain. Request the old
+        // worker to stop, but keep the old WDF object alive until monitor
+        // teardown so this callback never waits on a worker blocked in IddCx.
+        previous_processor->request_stop();
         bool retired = false;
         try {
           std::lock_guard lock {mutex_};

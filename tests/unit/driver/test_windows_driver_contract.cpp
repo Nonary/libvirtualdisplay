@@ -223,19 +223,23 @@ TEST(VirtualDisplayWindowsDriverContract, DeletesMonitorObjectWhenArrivalFails) 
   EXPECT_LT(cleanup, backend_failure);
 }
 
-TEST(VirtualDisplayWindowsDriverContract, StopsAndAbandonsSwapChainBeforeDeparture) {
+TEST(VirtualDisplayWindowsDriverContract, RequestsSwapChainStopBeforeDeparture) {
   const auto source = read_windows_driver_source();
 
   const auto depart = source.find("vdd::BackendError depart_display");
   ASSERT_NE(depart, std::string::npos);
 
-  const auto stop = source.find("stop_swapchain_processor_without_delete(processor_to_stop);", depart);
-  ASSERT_NE(stop, std::string::npos);
+  const auto request_stop = source.find("request_stop_swapchain_processor(processor_to_stop);", depart);
+  ASSERT_NE(request_stop, std::string::npos);
 
-  const auto departure = source.find("IddCxMonitorDeparture(monitor_handle);", stop);
+  const auto departure = source.find("IddCxMonitorDeparture(monitor_handle);", request_stop);
   ASSERT_NE(departure, std::string::npos);
-  EXPECT_LT(stop, departure);
-  EXPECT_NE(source.find("IddCxMonitorDeparture can invalidate swapchain objects", depart), std::string::npos);
+  EXPECT_LT(request_stop, departure);
+
+  const auto stop = source.find("stop_swapchain_processor_without_delete(processor_to_stop);", departure);
+  ASSERT_NE(stop, std::string::npos);
+  EXPECT_LT(departure, stop);
+  EXPECT_NE(source.find("monitor departure", depart), std::string::npos);
 
   const auto helper = source.find("void stop_swapchain_processor_without_delete");
   ASSERT_NE(helper, std::string::npos);
@@ -333,38 +337,36 @@ TEST(VirtualDisplayWindowsDriverContract, SetsSwapChainDeviceFromProcessingThrea
   EXPECT_NE(source.find("HandleNewSwapChain still owns IddCx's internal OPM cleanup", assign), std::string::npos);
 }
 
-TEST(VirtualDisplayWindowsDriverContract, SwapChainStartupReportsInitialDeviceAssignment) {
+TEST(VirtualDisplayWindowsDriverContract, SwapChainStartupDoesNotBlockAssignCallback) {
   const auto source = read_windows_driver_source();
 
   const auto start = source.find("HRESULT start(const LUID &render_adapter_luid)");
   ASSERT_NE(start, std::string::npos);
-  EXPECT_NE(source.find("startup_ready_.wait(lock", start), std::string::npos);
-  EXPECT_NE(source.find("const auto result = *startup_result_;", start), std::string::npos);
+  const auto start_end = source.find("void stop()", start);
+  ASSERT_NE(start_end, std::string::npos);
+  const auto start_body = source.substr(start, start_end - start);
+  EXPECT_NE(start_body.find("return S_OK;"), std::string::npos);
+  EXPECT_EQ(start_body.find("wait("), std::string::npos);
 
   const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
   ASSERT_NE(process_frames, std::string::npos);
-  EXPECT_NE(source.find("publish_startup_result(hr);", process_frames), std::string::npos);
+  const auto reset = source.find("reset_render_device(render_adapter_luid);", process_frames);
+  ASSERT_NE(reset, std::string::npos);
+  const auto assign = source.find("HRESULT assign_swapchain_device()");
+  ASSERT_NE(assign, std::string::npos);
+  EXPECT_NE(source.find("IddCxSwapChainSetDevice(swapchain_, &set_device);", assign), std::string::npos);
 }
 
-TEST(VirtualDisplayWindowsDriverContract, JoinsFailedStartupBeforeAbandoningSwapChain) {
+TEST(VirtualDisplayWindowsDriverContract, FailedAsyncStartupDeletesSwapChain) {
   const auto source = read_windows_driver_source();
-
-  const auto start = source.find("HRESULT start(const LUID &render_adapter_luid)");
-  ASSERT_NE(start, std::string::npos);
-  const auto failed_result = source.find("if (FAILED(result))", start);
-  ASSERT_NE(failed_result, std::string::npos);
-  EXPECT_NE(source.find("stop();", failed_result), std::string::npos);
 
   const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
   ASSERT_NE(process_frames, std::string::npos);
-  const auto startup_failure = source.find("if (FAILED(hr) || stop_requested_.load(std::memory_order_acquire))", process_frames);
+  const auto startup_failure = source.find("if (FAILED(hr))", process_frames);
   ASSERT_NE(startup_failure, std::string::npos);
   const auto normal_loop = source.find("while (!stop_requested_.load(std::memory_order_acquire))", startup_failure);
   ASSERT_NE(normal_loop, std::string::npos);
-  EXPECT_EQ(
-    source.substr(startup_failure, normal_loop - startup_failure).find("delete_swapchain();"),
-    std::string::npos
-  );
+  EXPECT_NE(source.substr(startup_failure, normal_loop - startup_failure).find("delete_swapchain();"), std::string::npos);
 
   const auto assign_swapchain = source.find("NTSTATUS assign_swapchain");
   ASSERT_NE(assign_swapchain, std::string::npos);
@@ -373,7 +375,7 @@ TEST(VirtualDisplayWindowsDriverContract, JoinsFailedStartupBeforeAbandoningSwap
   EXPECT_NE(source.find("processor->abandon_swapchain();", failed_start), std::string::npos);
 }
 
-TEST(VirtualDisplayWindowsDriverContract, WorkerPublishesFailureOnStartupException) {
+TEST(VirtualDisplayWindowsDriverContract, WorkerClosesSwapChainOnStartupException) {
   const auto source = read_windows_driver_source();
 
   const auto start = source.find("HRESULT start(const LUID &render_adapter_luid)");
@@ -381,11 +383,8 @@ TEST(VirtualDisplayWindowsDriverContract, WorkerPublishesFailureOnStartupExcepti
   const auto thread_body = source.find("worker_ = std::thread([this, render_adapter_luid]()", start);
   ASSERT_NE(thread_body, std::string::npos);
   EXPECT_NE(source.find("catch (...)", thread_body), std::string::npos);
-  EXPECT_NE(source.find("publish_startup_result(E_FAIL);", thread_body), std::string::npos);
-
-  const auto publish = source.find("void publish_startup_result(const HRESULT hr)");
-  ASSERT_NE(publish, std::string::npos);
-  EXPECT_NE(source.find("if (startup_result_)"), std::string::npos);
+  EXPECT_NE(source.find("delete_swapchain();", thread_body), std::string::npos);
+  EXPECT_EQ(source.find("publish_startup_result"), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, StopsSwapChainOnFrameCompletionFailure) {
@@ -573,11 +572,12 @@ TEST(VirtualDisplayWindowsDriverContract, AssignSwapChainDoesNotJoinWorkerWhileB
 
   const auto retire = assign_body.find("if (previous_processor)");
   ASSERT_NE(retire, std::string::npos);
-  const auto stop = assign_body.find("previous_processor->stop();", retire);
-  ASSERT_NE(stop, std::string::npos);
-  const auto retire_lock = assign_body.find("std::lock_guard lock {mutex_};", stop);
+  const auto request_stop = assign_body.find("previous_processor->request_stop();", retire);
+  ASSERT_NE(request_stop, std::string::npos);
+  EXPECT_EQ(assign_body.find("previous_processor->stop();", retire), std::string::npos);
+  const auto retire_lock = assign_body.find("std::lock_guard lock {mutex_};", request_stop);
   ASSERT_NE(retire_lock, std::string::npos);
-  EXPECT_LT(stop, retire_lock);
+  EXPECT_LT(request_stop, retire_lock);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, DepartureWaitsOnlyForInflightAssignCallbacks) {
@@ -927,6 +927,8 @@ TEST(VirtualDisplayWindowsDriverContract, AbandonsInvalidatedSwapchainHandlesDur
 
   const auto depart_display = source.find("vdd::BackendError depart_display");
   ASSERT_NE(depart_display, std::string::npos);
+  EXPECT_NE(source.find("request_stop_swapchain_processor(processor_to_stop);", depart_display), std::string::npos);
+  EXPECT_NE(source.find("request_stop_swapchain_processors(retired_processors_to_stop);", depart_display), std::string::npos);
   EXPECT_NE(source.find("stop_swapchain_processor_without_delete(processor_to_stop);", depart_display), std::string::npos);
   EXPECT_NE(source.find("stop_swapchain_processors_without_delete(retired_processors_to_stop);", depart_display), std::string::npos);
 
