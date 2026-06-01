@@ -387,16 +387,29 @@ TEST(VirtualDisplayWindowsDriverContract, WorkerClosesSwapChainOnStartupExceptio
   EXPECT_EQ(source.find("publish_startup_result"), std::string::npos);
 }
 
-TEST(VirtualDisplayWindowsDriverContract, StopsSwapChainOnFrameCompletionFailure) {
+TEST(VirtualDisplayWindowsDriverContract, RecoversRenderDeviceOnFrameCompletionDeviceLoss) {
   const auto source = read_windows_driver_source();
 
   const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
   ASSERT_NE(process_frames, std::string::npos);
-  const auto finished = source.find("const HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);", process_frames);
+  const auto finished = source.find("HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);", process_frames);
   ASSERT_NE(finished, std::string::npos);
-  const auto failure = source.find("SwapChainFinishedFrameFailed", finished);
-  ASSERT_NE(failure, std::string::npos);
-  EXPECT_NE(source.find("delete_swapchain();", failure), std::string::npos);
+  const auto finished_failure = source.find("if (FAILED(finished_result))", finished);
+  ASSERT_NE(finished_failure, std::string::npos);
+  const auto device_lost = source.find("is_device_lost_hresult(finished_result)", finished_failure);
+  ASSERT_NE(device_lost, std::string::npos);
+  const auto reset = source.find("reset_render_device(render_adapter_luid)", device_lost);
+  ASSERT_NE(reset, std::string::npos);
+  const auto retry_finished = source.find("finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);", reset);
+  ASSERT_NE(retry_finished, std::string::npos);
+  const auto retry_success = source.find("if (SUCCEEDED(finished_result))", retry_finished);
+  ASSERT_NE(retry_success, std::string::npos);
+  const auto continue_processing = source.find("continue;", retry_success);
+  ASSERT_NE(continue_processing, std::string::npos);
+  const auto hard_failure = source.find("SwapChainFinishedFrameFailed", continue_processing);
+  ASSERT_NE(hard_failure, std::string::npos);
+  EXPECT_LT(retry_finished, hard_failure);
+  EXPECT_NE(source.find("delete_swapchain();", hard_failure), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, RegistersSwapChainWorkerWithMmcss) {
@@ -478,6 +491,7 @@ TEST(VirtualDisplayWindowsDriverContract, RecoversRenderDeviceBeforeAbandoningSw
   EXPECT_NE(source.find("is_device_lost_hresult"), std::string::npos);
   EXPECT_NE(source.find("DXGI_ERROR_DEVICE_REMOVED"), std::string::npos);
   EXPECT_NE(source.find("DXGI_ERROR_DEVICE_RESET"), std::string::npos);
+  EXPECT_NE(source.find("DXGI_ERROR_ACCESS_LOST"), std::string::npos);
   EXPECT_NE(source.find("SwapChainProcessingFailed"), std::string::npos);
 
   const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");

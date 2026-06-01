@@ -1480,7 +1480,8 @@ namespace {
     return hr == DXGI_ERROR_DEVICE_REMOVED ||
            hr == DXGI_ERROR_DEVICE_RESET ||
            hr == DXGI_ERROR_DEVICE_HUNG ||
-           hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+           hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR ||
+           hr == DXGI_ERROR_ACCESS_LOST;
   }
 
   class SwapChainProcessor {
@@ -1691,8 +1692,24 @@ namespace {
           // Drop the acquired surface before reporting the frame complete so
           // IddCx can reclaim the buffer during unassign/departure.
           surface.Reset();
-          const HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
+          HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
           if (FAILED(finished_result)) {
+            if (is_device_lost_hresult(finished_result)) {
+              TraceLoggingWrite(
+                g_trace_provider,
+                "RenderDeviceLost",
+                TraceLoggingUInt32(static_cast<std::uint32_t>(finished_result), "HResult")
+              );
+              TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "RenderDeviceLost");
+              if (FAILED(reset_render_device(render_adapter_luid))) {
+                delete_swapchain();
+                return;
+              }
+              finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
+              if (SUCCEEDED(finished_result)) {
+                continue;
+              }
+            }
             TraceLoggingWrite(
               g_trace_provider,
               "SwapChainFinishedFrameFailed",
