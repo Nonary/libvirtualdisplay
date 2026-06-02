@@ -52,6 +52,7 @@ TEST(VirtualDisplayCliContract, ExposesFriendlyPermanentDisplayCommands) {
   expect_contains(source, "helper-apply-manifest-topology");
   expect_contains(source, "helper-query-color-profiles");
   expect_contains(source, "broker helper-associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]");
+  expect_contains(source, "broker helper-stress-capture-remove [iterations width height refresh_hz]");
   expect_contains(source, "display query");
   expect_contains(source, "driver install [--inf PATH]");
   expect_contains(source, "spawn [--width N] [--height N] [--physical-width-mm N] [--physical-height-mm N] [--refresh HZ] [--name TEXT]");
@@ -98,7 +99,9 @@ TEST(VirtualDisplayCliContract, BrokerCommandsUseSecuredIpcPath) {
   expect_contains(source, "args[1] == \"helper-apply-extended-topology\"");
   expect_contains(source, "args[1] == \"helper-apply-manifest-topology\"");
   expect_contains(source, "args[1] == \"helper-query-color-profiles\"");
+  expect_contains(source, "args[1] == \"helper-stress-capture-remove\"");
   expect_contains(source, "args[1] == \"helper-associate-color-profile\"");
+  expect_contains(source, "stress_capture_remove_broker_command(args)");
   expect_contains(source, "color_profile_association_broker_command(args)");
   expect_contains(source, "<< (advanced_color ? \"advanced\" : \"standard\")");
   expect_contains(source, "<< (set_default ? \"default\" : \"nodefault\")");

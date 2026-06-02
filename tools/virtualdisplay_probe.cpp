@@ -3,6 +3,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -23,7 +24,10 @@
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
+  #include <d3d11.h>
+  #include <dxgi1_2.h>
   #include <Icm.h>
+  #include <wrl/client.h>
   #include <windows.h>
 #endif
 
@@ -49,6 +53,9 @@ namespace {
     CPST_EXTENDED_DISPLAY_COLOR_MODE;
   #else
     static_cast<COLORPROFILESUBTYPE>(8);
+  #endif
+  #ifndef DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR
+  constexpr std::uint32_t DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR = 2;
   #endif
 
   std::wstring widen_ascii(const std::string_view text) {
@@ -96,6 +103,7 @@ namespace {
       << "  --qa-multi-temp-lease [count timeout_ms]\n"
       << "  --qa-temp-identity-retention [width height refresh_hz timeout_ms]\n"
       << "  --qa-temp-lease [width height refresh_hz timeout_ms]\n"
+      << "  --stress-capture-remove [iterations width height refresh_hz]\n"
       << "  --debug-temp-config [width height refresh_hz timeout_ms]\n";
   }
 
@@ -397,6 +405,7 @@ namespace {
            command == "--self-test-hdr" ||
            command == "--qa-temp-identity-retention" ||
            command == "--qa-temp-lease" ||
+           command == "--stress-capture-remove" ||
            command == "--debug-temp-config";
   }
 
@@ -1208,6 +1217,154 @@ namespace {
     }
 
     return std::wstring {source_name.viewGdiDeviceName};
+  }
+
+  struct DxgiCaptureStats {
+    std::atomic<bool> ready {false};
+    std::atomic<bool> done {false};
+    std::atomic<std::uint32_t> frames {};
+    std::atomic<std::uint32_t> timeouts {};
+    std::atomic<std::uint32_t> errors {};
+    std::atomic<HRESULT> last_result {S_OK};
+  };
+
+  std::string hresult_hex(const HRESULT hr) {
+    char buffer[16] {};
+    std::snprintf(buffer, sizeof(buffer), "0x%08lx", static_cast<unsigned long>(static_cast<std::uint32_t>(hr)));
+    return buffer;
+  }
+
+  HRESULT duplicate_output_for_gdi_name(
+    const std::wstring &gdi_name,
+    Microsoft::WRL::ComPtr<ID3D11Device> &device,
+    Microsoft::WRL::ComPtr<IDXGIOutputDuplication> &duplication
+  ) {
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+      return hr;
+    }
+
+    for (UINT adapter_index = 0;; ++adapter_index) {
+      Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+      hr = factory->EnumAdapters1(adapter_index, &adapter);
+      if (hr == DXGI_ERROR_NOT_FOUND) {
+        return DXGI_ERROR_NOT_FOUND;
+      }
+      if (FAILED(hr)) {
+        return hr;
+      }
+
+      for (UINT output_index = 0;; ++output_index) {
+        Microsoft::WRL::ComPtr<IDXGIOutput> output;
+        hr = adapter->EnumOutputs(output_index, &output);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(hr)) {
+          return hr;
+        }
+
+        DXGI_OUTPUT_DESC desc {};
+        hr = output->GetDesc(&desc);
+        if (FAILED(hr) || gdi_name != desc.DeviceName) {
+          continue;
+        }
+
+        D3D_FEATURE_LEVEL selected_feature_level {};
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+        hr = D3D11CreateDevice(
+          adapter.Get(),
+          D3D_DRIVER_TYPE_UNKNOWN,
+          nullptr,
+          D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+          nullptr,
+          0,
+          D3D11_SDK_VERSION,
+          &device,
+          &selected_feature_level,
+          &context
+        );
+        if (FAILED(hr)) {
+          return hr;
+        }
+
+        Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
+        hr = output.As(&output1);
+        if (FAILED(hr)) {
+          return hr;
+        }
+
+        return output1->DuplicateOutput(device.Get(), &duplication);
+      }
+    }
+  }
+
+  void run_dxgi_duplication_capture(
+    const std::wstring gdi_name,
+    std::atomic<bool> &stop_requested,
+    DxgiCaptureStats &stats
+  ) {
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication;
+    HRESULT hr = E_FAIL;
+    const auto startup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!stop_requested.load(std::memory_order_acquire)) {
+      hr = duplicate_output_for_gdi_name(gdi_name, device, duplication);
+      stats.last_result.store(hr, std::memory_order_release);
+      if (SUCCEEDED(hr)) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= startup_deadline) {
+        stats.errors.fetch_add(1, std::memory_order_relaxed);
+        stats.done.store(true, std::memory_order_release);
+        return;
+      }
+      device.Reset();
+      duplication.Reset();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!duplication) {
+      stats.done.store(true, std::memory_order_release);
+      return;
+    }
+
+    stats.ready.store(true, std::memory_order_release);
+    while (!stop_requested.load(std::memory_order_acquire)) {
+      DXGI_OUTDUPL_FRAME_INFO frame_info {};
+      IDXGIResource *resource_ptr = nullptr;
+      hr = duplication->AcquireNextFrame(100, &frame_info, &resource_ptr);
+      stats.last_result.store(hr, std::memory_order_release);
+      if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (FAILED(hr)) {
+        stats.errors.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+
+      Microsoft::WRL::ComPtr<IDXGIResource> resource;
+      resource.Attach(resource_ptr);
+      resource.Reset();
+      duplication->ReleaseFrame();
+      stats.frames.fetch_add(1, std::memory_order_relaxed);
+    }
+    stats.done.store(true, std::memory_order_release);
+  }
+
+  bool wait_for_capture_ready(DxgiCaptureStats &stats, const std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (stats.ready.load(std::memory_order_acquire)) {
+        return true;
+      }
+      if (stats.done.load(std::memory_order_acquire)) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return stats.ready.load(std::memory_order_acquire);
   }
 
   class LocalWideString {
@@ -2648,6 +2805,142 @@ int main(const int argc, char **argv) {
                 << (active_path ? active_path->refresh_millihz : 0) << "mHz\n";
       return 1;
     }
+    return 0;
+  }
+
+  if (command == "--stress-capture-remove") {
+    if (!require_arg_count(argc, 2, 6)) {
+      return 2;
+    }
+    std::uint32_t iterations {};
+    std::uint32_t width {};
+    std::uint32_t height {};
+    std::uint32_t refresh_hz {};
+    if (!read_u32_arg(argc, argv, 2, 10u, "iterations", iterations) ||
+        !read_u32_arg(argc, argv, 3, 1280u, "width", width) ||
+        !read_u32_arg(argc, argv, 4, 720u, "height", height) ||
+        !read_u32_arg(argc, argv, 5, 60u, "refresh_hz", refresh_hz)) {
+      return 2;
+    }
+    if (iterations == 0) {
+      std::cerr << "iterations must be non-zero\n";
+      return 2;
+    }
+
+    for (std::uint32_t iteration = 1; iteration <= iterations; ++iteration) {
+      auto request = make_temporary_request(width, height, refresh_hz);
+      request.requested_timeout_ms = 30'000;
+
+      const auto created = client.create_temporary_display(request);
+      if (!created.ok()) {
+        return fail("stress create temporary display failed", created);
+      }
+
+      const vdd::LeaseRequest lease_request {
+        vdd::kApiNamespaceGuid,
+        request.lease_id,
+        request.requested_timeout_ms,
+        0
+      };
+      const auto cleanup_created = [&]() {
+        return client.remove_temporary_display({vdd::kApiNamespaceGuid, request.lease_id, request.display_id});
+      };
+      const auto feed_stress_lease = [&]() {
+        (void) client.feed_lease(lease_request);
+      };
+
+      feed_stress_lease();
+      const auto activate_result = activate_target_path_result(
+        created.value.os_adapter_luid,
+        created.value.target_id,
+        width,
+        height,
+        refresh_hz
+      );
+      if (activate_result != ERROR_SUCCESS) {
+        (void) apply_extended_topology();
+      }
+      if (!ensure_active_display_mode(
+            created.value.os_adapter_luid,
+            created.value.target_id,
+            width,
+            height,
+            refresh_hz,
+            feed_stress_lease
+          )) {
+        (void) cleanup_created();
+        std::cerr << "stress iteration " << iteration << " failed to activate display\n";
+        return 1;
+      }
+
+      const auto source_id = active_source_id_for_target(created.value.os_adapter_luid, created.value.target_id);
+      if (!source_id) {
+        (void) cleanup_created();
+        std::cerr << "stress iteration " << iteration << " could not find active source id\n";
+        return 1;
+      }
+      const auto gdi_name = gdi_device_name_for_source(created.value.os_adapter_luid, *source_id);
+      if (!gdi_name || gdi_name->empty()) {
+        (void) cleanup_created();
+        std::cerr << "stress iteration " << iteration << " could not resolve GDI display name\n";
+        return 1;
+      }
+
+      std::atomic<bool> stop_capture {false};
+      DxgiCaptureStats stats;
+      std::thread capture_thread {
+        [gdi_name = *gdi_name, &stop_capture, &stats]() {
+          run_dxgi_duplication_capture(gdi_name, stop_capture, stats);
+        }
+      };
+
+      if (!wait_for_capture_ready(stats, std::chrono::seconds(3))) {
+        stop_capture.store(true, std::memory_order_release);
+        if (capture_thread.joinable()) {
+          capture_thread.join();
+        }
+        (void) cleanup_created();
+        std::cerr << "stress iteration " << iteration
+                  << " failed to start DXGI duplication capture"
+                  << " result=" << hresult_hex(stats.last_result.load(std::memory_order_acquire))
+                  << '\n';
+        return 1;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      const auto removed = cleanup_created();
+      if (!removed.ok()) {
+        stop_capture.store(true, std::memory_order_release);
+        if (capture_thread.joinable()) {
+          capture_thread.join();
+        }
+        return fail("stress remove temporary display failed", removed);
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      stop_capture.store(true, std::memory_order_release);
+      if (capture_thread.joinable()) {
+        capture_thread.join();
+      }
+
+      const auto departed_path = wait_for_display_path(created.value.os_adapter_luid, created.value.target_id, false);
+      if (departed_path) {
+        std::cerr << "stress iteration " << iteration << " display path still present after removal\n";
+        return 1;
+      }
+
+      std::cout << "stress_iteration=" << iteration
+                << " display_id=" << created.value.display_id
+                << " target_id=" << created.value.target_id
+                << " frames=" << stats.frames.load(std::memory_order_acquire)
+                << " timeouts=" << stats.timeouts.load(std::memory_order_acquire)
+                << " errors=" << stats.errors.load(std::memory_order_acquire)
+                << " last_result=" << hresult_hex(stats.last_result.load(std::memory_order_acquire))
+                << '\n';
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    std::cout << "stress_capture_remove=1 iterations=" << iterations << '\n';
     return 0;
   }
 

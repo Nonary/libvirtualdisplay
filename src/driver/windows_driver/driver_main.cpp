@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -67,6 +68,7 @@ namespace {
   constexpr std::uint32_t kMaxTemporaryDisplays = 8;
   constexpr std::uint32_t kPersistentStateSchemaVersion = 1;
   constexpr wchar_t kSwapchainMmcssTask[] = L"DisplayPostProcessing";
+  constexpr auto kSwapchainProcessorTeardownTimeout = std::chrono::milliseconds(500);
   constexpr wchar_t kTemporaryDisplayProfilesValue[] = L"TemporaryDisplayProfiles";
   constexpr std::size_t kTemporaryDisplayProfileBytes = 36;
   constexpr std::size_t kTemporaryDisplayProfilesHeaderBytes = 8;
@@ -190,6 +192,14 @@ namespace {
     {5120, 1440, 480'000}
   }};
 
+  constexpr std::array<std::uint32_t, 5> kPreferredModeScalePercent {{
+    100,
+    50,
+    75,
+    125,
+    150
+  }};
+
   std::uint32_t clamp_u32(const std::uint64_t value) {
     return static_cast<std::uint32_t>(
       (std::min<std::uint64_t>)(value, (std::numeric_limits<std::uint32_t>::max)())
@@ -218,6 +228,68 @@ namespace {
     return active_mode_shape(spec.width, spec.height, spec.refresh_rate_millihz);
   }
 
+  std::uint32_t append_unique_mode(std::vector<ModeShape> &modes, const ModeShape &candidate) {
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+      const auto &mode = modes[index];
+      if (mode.width == candidate.width &&
+          mode.height == candidate.height &&
+          mode.refresh_rate_millihz == candidate.refresh_rate_millihz) {
+        return static_cast<std::uint32_t>(index);
+      }
+    }
+
+    const auto index = static_cast<std::uint32_t>(modes.size());
+    modes.push_back(candidate);
+    return index;
+  }
+
+  std::optional<ModeShape> scaled_mode_shape(
+    const ModeShape &base,
+    const std::uint32_t scale_percent,
+    const std::uint32_t refresh_rate_millihz
+  ) {
+    const auto width = static_cast<std::uint32_t>(
+      static_cast<std::uint64_t>(base.width) * scale_percent / 100ull
+    );
+    const auto height = static_cast<std::uint32_t>(
+      static_cast<std::uint64_t>(base.height) * scale_percent / 100ull
+    );
+
+    if (width < vdd::kMinWidth || width > vdd::kMaxWidth ||
+        height < vdd::kMinHeight || height > vdd::kMaxHeight ||
+        refresh_rate_millihz < vdd::kMinRefreshRateMilliHz) {
+      return std::nullopt;
+    }
+
+    return active_mode_shape(width, height, refresh_rate_millihz);
+  }
+
+  std::uint32_t append_preferred_mode_variants(std::vector<ModeShape> &modes, const ModeShape &preferred) {
+    std::uint32_t preferred_index = static_cast<std::uint32_t>(modes.size());
+    bool preferred_index_set = false;
+
+    for (const auto scale_percent: kPreferredModeScalePercent) {
+      if (const auto scaled = scaled_mode_shape(preferred, scale_percent, preferred.refresh_rate_millihz)) {
+        const auto index = append_unique_mode(modes, *scaled);
+        if (scale_percent == 100) {
+          preferred_index = index;
+          preferred_index_set = true;
+        }
+      }
+
+      const auto doubled_refresh_rate_millihz =
+        clamp_u32(static_cast<std::uint64_t>(preferred.refresh_rate_millihz) * 2ull);
+      if (const auto doubled = scaled_mode_shape(preferred, scale_percent, doubled_refresh_rate_millihz)) {
+        (void) append_unique_mode(modes, *doubled);
+      }
+    }
+
+    if (!preferred_index_set) {
+      preferred_index = append_unique_mode(modes, preferred);
+    }
+    return preferred_index;
+  }
+
   std::uint32_t default_preferred_mode_index(const std::vector<ModeShape> &modes) {
     for (std::size_t index = 0; index < modes.size(); ++index) {
       const auto &mode = modes[index];
@@ -241,8 +313,7 @@ namespace {
 
     std::uint32_t preferred_index = default_preferred_mode_index(modes);
     if (preferred) {
-      preferred_index = static_cast<std::uint32_t>(modes.size());
-      modes.push_back(*preferred);
+      preferred_index = append_preferred_mode_variants(modes, *preferred);
     }
 
     return {std::move(modes), preferred_index};
@@ -1164,7 +1235,78 @@ namespace {
     return active_mode_shape(descriptor.width, descriptor.height, descriptor.refresh_rate_millihz);
   }
 
+  struct RegisteredMonitorDescriptionMode {
+    ModeShape mode;
+    std::uint32_t references {};
+  };
+
+  std::mutex g_monitor_description_modes_mutex;
+  std::map<std::array<std::byte, vdd::kEdidSize>, RegisteredMonitorDescriptionMode> g_monitor_description_modes;
+
+  std::optional<std::array<std::byte, vdd::kEdidSize>> monitor_description_key(
+    const IDDCX_MONITOR_DESCRIPTION &description
+  ) {
+    if (description.Type != IDDCX_MONITOR_DESCRIPTION_TYPE_EDID ||
+        !description.pData ||
+        description.DataSize < vdd::kEdidSize) {
+      return std::nullopt;
+    }
+
+    std::array<std::byte, vdd::kEdidSize> key {};
+    const auto *data = static_cast<const std::byte *>(description.pData);
+    std::copy_n(data, key.size(), key.begin());
+    return key;
+  }
+
+  void register_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
+    const auto mode = mode_shape_from_descriptor(descriptor);
+    if (mode.width == 0 || mode.height == 0 || mode.refresh_rate_millihz == 0) {
+      return;
+    }
+
+    std::lock_guard lock {g_monitor_description_modes_mutex};
+    auto &entry = g_monitor_description_modes[descriptor.edid];
+    entry.mode = mode;
+    ++entry.references;
+  }
+
+  void unregister_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
+    std::lock_guard lock {g_monitor_description_modes_mutex};
+    const auto entry = g_monitor_description_modes.find(descriptor.edid);
+    if (entry == g_monitor_description_modes.end()) {
+      return;
+    }
+
+    if (entry->second.references <= 1) {
+      g_monitor_description_modes.erase(entry);
+      return;
+    }
+
+    --entry->second.references;
+  }
+
+  std::optional<ModeShape> registered_mode_shape_from_description(
+    const IDDCX_MONITOR_DESCRIPTION &description
+  ) {
+    const auto key = monitor_description_key(description);
+    if (!key) {
+      return std::nullopt;
+    }
+
+    std::lock_guard lock {g_monitor_description_modes_mutex};
+    const auto entry = g_monitor_description_modes.find(*key);
+    if (entry == g_monitor_description_modes.end()) {
+      return std::nullopt;
+    }
+
+    return entry->second.mode;
+  }
+
   std::optional<ModeShape> preferred_mode_shape_from_description(const IDDCX_MONITOR_DESCRIPTION &description) {
+    if (const auto registered = registered_mode_shape_from_description(description)) {
+      return registered;
+    }
+
     return mode_shape_from_description(description);
   }
 
@@ -1185,6 +1327,22 @@ namespace {
     bits.YCbCr444 = IDDCX_BITS_PER_COMPONENT_NONE;
     bits.YCbCr422 = IDDCX_BITS_PER_COMPONENT_NONE;
     bits.YCbCr420 = IDDCX_BITS_PER_COMPONENT_NONE;
+  }
+
+  DISPLAYCONFIG_RATIONAL make_frequency_rational(
+    std::uint64_t numerator,
+    std::uint32_t denominator
+  ) {
+    denominator = (std::max)(denominator, 1u);
+    if (numerator == 0) {
+      return {0, 1};
+    }
+
+    const auto divisor = std::gcd(numerator, static_cast<std::uint64_t>(denominator));
+    numerator /= divisor;
+    denominator = static_cast<std::uint32_t>(denominator / divisor);
+
+    return {clamp_u32(numerator), denominator};
   }
 
   vdd::DisplayDescriptor descriptor_with_runtime_hdr_policy(const vdd::DisplayDescriptor &descriptor) {
@@ -1220,13 +1378,12 @@ namespace {
     signal.activeSize.cy = shape.height;
     signal.totalSize.cx = (std::max)(shape.total_width, shape.width);
     signal.totalSize.cy = (std::max)(shape.total_height, shape.height);
-    signal.vSyncFreq.Numerator = (std::max)(shape.refresh_rate_millihz, 1u);
-    signal.vSyncFreq.Denominator = 1000;
-    signal.hSyncFreq.Numerator = clamp_u32(
-      static_cast<std::uint64_t>(signal.vSyncFreq.Numerator) *
-      static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u))
+    signal.vSyncFreq = make_frequency_rational((std::max)(shape.refresh_rate_millihz, 1u), 1000);
+    signal.hSyncFreq = make_frequency_rational(
+      static_cast<std::uint64_t>((std::max)(shape.refresh_rate_millihz, 1u)) *
+        static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u)),
+      1000
     );
-    signal.hSyncFreq.Denominator = signal.vSyncFreq.Denominator;
     // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY_OTHER is not accepted here; 255 is
     // the documented "not initialized" value Windows itself uses for EDID modes.
     signal.AdditionalSignalInfo.videoStandard = 255;
@@ -1535,6 +1692,37 @@ namespace {
       device_.Reset();
     }
 
+    bool stop_for_teardown(const std::chrono::milliseconds timeout) {
+      request_stop();
+      if (!worker_.joinable()) {
+        dxgi_device_.Reset();
+        device_.Reset();
+        return true;
+      }
+
+      const auto wait_ms = static_cast<DWORD>((std::min<std::int64_t>)(
+        (std::max<std::int64_t>)(timeout.count(), 0),
+        MAXDWORD
+      ));
+      const DWORD wait_result = WaitForSingleObject(worker_.native_handle(), wait_ms);
+      if (wait_result == WAIT_OBJECT_0) {
+        worker_.join();
+        dxgi_device_.Reset();
+        device_.Reset();
+        return true;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "SwapChainWorkerTeardownDeferred",
+        TraceLoggingUInt32(wait_result, "WaitResult"),
+        TraceLoggingUInt32(GetLastError(), "LastError")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerTeardownDeferred");
+      worker_.detach();
+      return false;
+    }
+
     void request_stop() {
       stop_requested_.store(true, std::memory_order_release);
       if (next_surface_available_) {
@@ -1620,6 +1808,9 @@ namespace {
 
       HRESULT hr = reset_render_device(render_adapter_luid);
       if (FAILED(hr)) {
+        if (stop_requested_.load(std::memory_order_acquire)) {
+          return;
+        }
         delete_swapchain();
         return;
       }
@@ -1665,6 +1856,15 @@ namespace {
             break;
           }
           if (FAILED(acquire_result)) {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+              TraceLoggingWrite(
+                g_trace_provider,
+                "SwapChainAcquireStoppedDuringTeardown",
+                TraceLoggingUInt32(static_cast<std::uint32_t>(acquire_result), "HResult")
+              );
+              TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainAcquireStoppedDuringTeardown");
+              return;
+            }
             if (is_device_lost_hresult(acquire_result)) {
               TraceLoggingWrite(
                 g_trace_provider,
@@ -1694,6 +1894,15 @@ namespace {
           surface.Reset();
           HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
           if (FAILED(finished_result)) {
+            if (stop_requested_.load(std::memory_order_acquire)) {
+              TraceLoggingWrite(
+                g_trace_provider,
+                "SwapChainFinishedStoppedDuringTeardown",
+                TraceLoggingUInt32(static_cast<std::uint32_t>(finished_result), "HResult")
+              );
+              TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainFinishedStoppedDuringTeardown");
+              return;
+            }
             if (is_device_lost_hresult(finished_result)) {
               TraceLoggingWrite(
                 g_trace_provider,
@@ -1740,9 +1949,17 @@ namespace {
       return;
     }
 
-    processor->stop();
-    processor->abandon_swapchain();
-    processor.reset();
+    if (processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)) {
+      processor->abandon_swapchain();
+      processor.reset();
+      return;
+    }
+
+    // Keep the detached worker's backing object alive if IddCx is still
+    // unwinding a frame while the monitor is departing. Leaking this rare
+    // teardown object is preferable to blocking monitor removal or deleting
+    // state that the worker may still touch after the IddCx call returns.
+    (void) processor.release();
   }
 
   void request_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
@@ -1966,6 +2183,11 @@ namespace {
         );
         return STATUS_SUCCESS;
       }
+      TraceLoggingWrite(
+        g_trace_provider,
+        "AdapterInitSucceeded",
+        TraceLoggingInt32(args->AdapterInitStatus, "Status")
+      );
       if (adapter && (preferred_render_adapter.HighPart != 0 || preferred_render_adapter.LowPart != 0)) {
         IDARG_IN_ADAPTERSETRENDERADAPTER set_render_adapter {};
         set_render_adapter.PreferredRenderAdapter = preferred_render_adapter;
@@ -2040,9 +2262,23 @@ namespace {
       {
         std::lock_guard lock {mutex_};
         if (shutting_down_ || !adapter_ready_) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalBlockedAdapterNotReady",
+            TraceLoggingBool(shutting_down_, "ShuttingDown"),
+            TraceLoggingBool(adapter_ready_, "AdapterReady"),
+            TraceLoggingInt32(adapter_init_status_, "AdapterInitStatus")
+          );
           return {vdd::BackendError::Failed, {}, 0};
         }
         if (!adapter_ || monitors_.contains(descriptor.display_id)) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalBlockedInvalidState",
+            TraceLoggingBool(adapter_ != nullptr, "HasAdapter"),
+            TraceLoggingBool(monitors_.contains(descriptor.display_id), "DuplicateDisplayId"),
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+          );
           return {vdd::BackendError::Failed, {}, 0};
         }
         adapter = adapter_;
@@ -2072,9 +2308,27 @@ namespace {
       create_args.ObjectAttributes = &monitor_attributes;
       create_args.pMonitorInfo = &monitor_info;
 
+      try {
+        register_monitor_description_mode(descriptor);
+      } catch (...) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorArrivalRegisterModeFailed",
+          TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+        );
+        return {vdd::BackendError::Failed, {}, 0};
+      }
+
       IDARG_OUT_MONITORCREATE create_out {};
       auto status = IddCxMonitorCreate(adapter, &create_args, &create_out);
       if (!NT_SUCCESS(status)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorCreateFailed",
+          TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+          TraceLoggingInt32(status, "Status")
+        );
+        unregister_monitor_description_mode(descriptor);
         return {vdd::BackendError::Failed, {}, 0};
       }
 
@@ -2094,22 +2348,42 @@ namespace {
           }
         } catch (...) {
           WdfObjectDelete(create_out.MonitorObject);
+          unregister_monitor_description_mode(descriptor);
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalBookkeepingException",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+          );
           return {vdd::BackendError::Failed, {}, 0};
         }
       }
       if (!NT_SUCCESS(status)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorArrivalBookkeepingFailed",
+          TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+          TraceLoggingInt32(status, "Status")
+        );
         WdfObjectDelete(create_out.MonitorObject);
+        unregister_monitor_description_mode(descriptor);
         return {vdd::BackendError::Failed, {}, 0};
       }
 
       IDARG_OUT_MONITORARRIVAL arrival_out {};
       status = IddCxMonitorArrival(create_out.MonitorObject, &arrival_out);
       if (!NT_SUCCESS(status)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorArrivalFailed",
+          TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+          TraceLoggingInt32(status, "Status")
+        );
         {
           std::lock_guard lock {mutex_};
           monitors_.erase(descriptor.display_id);
         }
         WdfObjectDelete(create_out.MonitorObject);
+        unregister_monitor_description_mode(descriptor);
         return {vdd::BackendError::Failed, {}, 0};
       }
 
@@ -2134,6 +2408,7 @@ namespace {
 
     vdd::BackendError depart_display(const std::uint64_t display_id) {
       IDDCX_MONITOR monitor_handle {};
+      std::optional<vdd::DisplayDescriptor> descriptor_to_unregister;
       std::unique_ptr<SwapChainProcessor> processor_to_stop;
       std::vector<std::unique_ptr<SwapChainProcessor>> retired_processors_to_stop;
       {
@@ -2197,7 +2472,11 @@ namespace {
       if (const auto monitor = monitors_.find(display_id);
           monitor != monitors_.end() &&
           monitor->second.monitor == monitor_handle) {
+        descriptor_to_unregister = monitor->second.descriptor;
         monitors_.erase(monitor);
+      }
+      if (descriptor_to_unregister) {
+        unregister_monitor_description_mode(*descriptor_to_unregister);
       }
       TraceLoggingWrite(g_trace_provider, "MonitorDeparted", TraceLoggingUInt64(display_id, "DisplayId"));
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorDeparted");

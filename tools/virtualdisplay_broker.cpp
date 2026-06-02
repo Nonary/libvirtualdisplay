@@ -875,14 +875,48 @@ namespace {
     return session_id;
   }
 
-  DWORD launch_session_helper(const DWORD session_id, const std::wstring &arguments) {
+  std::optional<DWORD> active_console_session_id() {
+    const DWORD session_id = WTSGetActiveConsoleSessionId();
     if (session_id == 0xffffffffu) {
-      return ERROR_NO_TOKEN;
+      return std::nullopt;
+    }
+    return session_id;
+  }
+
+  struct HelperLaunchResult {
+    DWORD exit_code {ERROR_SUCCESS};
+    std::string output;
+  };
+
+  std::string read_pipe_to_string(HANDLE pipe) {
+    std::string output;
+    std::array<char, 4096> buffer {};
+    for (;;) {
+      DWORD bytes_read = 0;
+      if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_BROKEN_PIPE) {
+          break;
+        }
+        output += "helper_output_read_error=" + std::to_string(error) + "\n";
+        break;
+      }
+      if (bytes_read == 0) {
+        break;
+      }
+      output.append(buffer.data(), bytes_read);
+    }
+    return output;
+  }
+
+  HelperLaunchResult launch_session_helper(const DWORD session_id, const std::wstring &arguments) {
+    if (session_id == 0xffffffffu) {
+      return {ERROR_NO_TOKEN, {}};
     }
 
     ScopedHandle impersonation_token;
     if (!WTSQueryUserToken(session_id, impersonation_token.put())) {
-      return GetLastError();
+      return {GetLastError(), {}};
     }
 
     ScopedHandle primary_token;
@@ -894,18 +928,18 @@ namespace {
           TokenPrimary,
           primary_token.put()
         )) {
-      return GetLastError();
+      return {GetLastError(), {}};
     }
 
     void *environment = nullptr;
     if (!CreateEnvironmentBlock(&environment, primary_token.get(), FALSE)) {
-      return GetLastError();
+      return {GetLastError(), {}};
     }
     EnvironmentBlock environment_block {environment};
 
     const auto directory = executable_directory();
     if (directory.empty()) {
-      return ERROR_FILE_NOT_FOUND;
+      return {ERROR_FILE_NOT_FOUND, {}};
     }
 
     const std::wstring helper_path = directory + L"\\" + kSessionHelperExecutable;
@@ -915,9 +949,25 @@ namespace {
       command_line += arguments;
     }
 
+    SECURITY_ATTRIBUTES pipe_security {};
+    pipe_security.nLength = sizeof(pipe_security);
+    pipe_security.bInheritHandle = TRUE;
+    ScopedHandle output_read;
+    ScopedHandle output_write;
+    if (!CreatePipe(output_read.put(), output_write.put(), &pipe_security, 0)) {
+      return {GetLastError(), {}};
+    }
+    if (!SetHandleInformation(output_read.get(), HANDLE_FLAG_INHERIT, 0)) {
+      return {GetLastError(), {}};
+    }
+
     STARTUPINFOW startup {};
     startup.cb = sizeof(startup);
     startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = output_write.get();
+    startup.hStdError = output_write.get();
+    startup.hStdInput = nullptr;
     PROCESS_INFORMATION process {};
     if (!CreateProcessAsUserW(
           primary_token.get(),
@@ -932,10 +982,11 @@ namespace {
           &startup,
           &process
         )) {
-      return GetLastError();
+      return {GetLastError(), {}};
     }
 
     CloseHandle(process.hThread);
+    output_write.reset();
     auto stop_event = duplicate_stop_event();
     HANDLE wait_handles[] {process.hProcess, stop_event.get()};
     const DWORD wait_result = stop_event.valid() ?
@@ -947,14 +998,15 @@ namespace {
     } else if (wait_result == WAIT_FAILED) {
       const DWORD wait_error = GetLastError();
       CloseHandle(process.hProcess);
-      return wait_error;
+      return {wait_error, read_pipe_to_string(output_read.get())};
     }
     DWORD exit_code = ERROR_SUCCESS;
     if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
       exit_code = GetLastError();
     }
+    const auto output = read_pipe_to_string(output_read.get());
     CloseHandle(process.hProcess);
-    return exit_code;
+    return {exit_code, output};
   }
 
   std::optional<std::wstring> helper_arguments_for_broker_command(const std::string_view command) {
@@ -969,6 +1021,29 @@ namespace {
     }
     if (command == "helper-query-color-profiles") {
       return L"--query-color-profiles";
+    }
+    if (command == "helper-stress-capture-remove") {
+      return L"--stress-capture-remove";
+    }
+    constexpr std::string_view stress_prefix {"helper-stress-capture-remove "};
+    if (command.starts_with(stress_prefix)) {
+      const auto payload = command.substr(stress_prefix.size());
+      const auto fields = split_words(payload, 5);
+      if (fields.size() != 4) {
+        return std::nullopt;
+      }
+      for (const auto field: fields) {
+        if (!is_u32_text(field)) {
+          return std::nullopt;
+        }
+      }
+
+      std::wstring arguments = quote_argument(L"--stress-capture-remove");
+      for (const auto field: fields) {
+        arguments += L" ";
+        arguments += quote_argument(widen_ascii(field));
+      }
+      return arguments;
     }
     constexpr std::string_view associate_prefix {"helper-associate-color-profile "};
     if (command.starts_with(associate_prefix)) {
@@ -1146,17 +1221,24 @@ namespace {
       }
 
       report_event_log(EVENTLOG_INFORMATION_TYPE, kEventHelperStarting, L"Starting client-session helper");
-      const DWORD helper_result = launch_session_helper(*session_id, *helper_arguments);
-      if (helper_result != ERROR_SUCCESS) {
+      auto helper_result = launch_session_helper(*session_id, *helper_arguments);
+      if (helper_result.exit_code == ERROR_NO_TOKEN) {
+        if (const auto console_session_id = active_console_session_id();
+            console_session_id && *console_session_id != *session_id) {
+          report_event_log(EVENTLOG_INFORMATION_TYPE, kEventHelperStarting, L"Retrying helper in active console session");
+          helper_result = launch_session_helper(*console_session_id, *helper_arguments);
+        }
+      }
+      if (helper_result.exit_code != ERROR_SUCCESS) {
         report_event_log(
           EVENTLOG_ERROR_TYPE,
           kEventHelperFinished,
-          "Client-session helper failed result=" + std::to_string(helper_result)
+          "Client-session helper failed result=" + std::to_string(helper_result.exit_code)
         );
-        return "error helper_result=" + std::to_string(helper_result) + "\n";
+        return "error helper_result=" + std::to_string(helper_result.exit_code) + "\n" + helper_result.output;
       }
       report_event_log(EVENTLOG_INFORMATION_TYPE, kEventHelperFinished, L"Client-session helper completed");
-      return "ok helper_result=0\n";
+      return "ok helper_result=0\n" + helper_result.output;
     }
 
     return "error unknown_command\n";

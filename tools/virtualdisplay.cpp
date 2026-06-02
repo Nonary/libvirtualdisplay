@@ -43,6 +43,7 @@ namespace {
       << "  broker install|start|stop|status|uninstall\n"
       << "  broker protocol|query-state|query-manifest|helper-diagnose|helper-apply-extended-topology|helper-apply-manifest-topology|helper-query-color-profiles\n"
       << "  broker helper-associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]\n"
+      << "  broker helper-stress-capture-remove [iterations width height refresh_hz]\n"
       << "  status\n"
       << "  display query\n"
       << "  spawn [--width N] [--height N] [--physical-width-mm N] [--physical-height-mm N] [--refresh HZ] [--name TEXT]\n"
@@ -1487,6 +1488,34 @@ namespace {
       << args[4];
     return command.str();
   }
+
+  std::optional<std::string> stress_capture_remove_broker_command(const std::vector<std::string> &args) {
+    if (args.size() == 2) {
+      return std::string {"helper-stress-capture-remove"};
+    }
+    if (args.size() != 6) {
+      return std::nullopt;
+    }
+
+    for (std::size_t index = 2; index < args.size(); ++index) {
+      std::uint32_t parsed {};
+      if (!parse_u32(args[index], parsed)) {
+        return std::nullopt;
+      }
+      if (index == 2 && parsed == 0) {
+        return std::nullopt;
+      }
+    }
+
+    std::ostringstream command;
+    command
+      << "helper-stress-capture-remove "
+      << args[2] << ' '
+      << args[3] << ' '
+      << args[4] << ' '
+      << args[5];
+    return command.str();
+  }
 #endif
 
   std::optional<PermanentOptions> parse_permanent_options(
@@ -1765,7 +1794,8 @@ int main(int argc, char **argv) {
          args[1] == "helper-diagnose" ||
          args[1] == "helper-apply-extended-topology" ||
          args[1] == "helper-apply-manifest-topology" ||
-         args[1] == "helper-query-color-profiles")) {
+         args[1] == "helper-query-color-profiles" ||
+         args[1] == "helper-stress-capture-remove")) {
 #ifdef _WIN32
       return query_broker(args[1]);
 #else
@@ -1776,6 +1806,19 @@ int main(int argc, char **argv) {
     if (args.size() >= 5 && args[1] == "helper-associate-color-profile") {
 #ifdef _WIN32
       const auto command = color_profile_association_broker_command(args);
+      if (!command) {
+        print_usage();
+        return 2;
+      }
+      return query_broker(*command);
+#else
+      std::cerr << "broker queries are only supported on Windows.\n";
+      return 1;
+#endif
+    }
+    if ((args.size() == 2 || args.size() == 6) && args[1] == "helper-stress-capture-remove") {
+#ifdef _WIN32
+      const auto command = stress_capture_remove_broker_command(args);
       if (!command) {
         print_usage();
         return 2;

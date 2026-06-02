@@ -243,7 +243,10 @@ TEST(VirtualDisplayWindowsDriverContract, RequestsSwapChainStopBeforeDeparture) 
 
   const auto helper = source.find("void stop_swapchain_processor_without_delete");
   ASSERT_NE(helper, std::string::npos);
-  const auto abandon = source.find("processor->abandon_swapchain();", helper);
+  const auto timed_stop = source.find("processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)", helper);
+  ASSERT_NE(timed_stop, std::string::npos);
+
+  const auto abandon = source.find("processor->abandon_swapchain();", timed_stop);
   ASSERT_NE(abandon, std::string::npos);
 
   const auto cleanup = source.find("processor.reset();", abandon);
@@ -373,6 +376,47 @@ TEST(VirtualDisplayWindowsDriverContract, FailedAsyncStartupDeletesSwapChain) {
   const auto failed_start = source.find("if (FAILED(hr))", assign_swapchain);
   ASSERT_NE(failed_start, std::string::npos);
   EXPECT_NE(source.find("processor->abandon_swapchain();", failed_start), std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, SwapChainTeardownDoesNotBlockIndefinitely) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("kSwapchainProcessorTeardownTimeout"), std::string::npos);
+  EXPECT_NE(source.find("bool stop_for_teardown(const std::chrono::milliseconds timeout)"), std::string::npos);
+  EXPECT_NE(source.find("WaitForSingleObject(worker_.native_handle(), wait_ms)"), std::string::npos);
+  EXPECT_NE(source.find("SwapChainWorkerTeardownDeferred"), std::string::npos);
+  EXPECT_NE(source.find("worker_.detach();"), std::string::npos);
+
+  const auto helper = source.find("void stop_swapchain_processor_without_delete");
+  ASSERT_NE(helper, std::string::npos);
+  const auto timed_stop = source.find("processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)", helper);
+  ASSERT_NE(timed_stop, std::string::npos);
+  const auto release = source.find("(void) processor.release();", timed_stop);
+  ASSERT_NE(release, std::string::npos);
+  EXPECT_LT(timed_stop, release);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, FrameProcessingStopsCleanlyDuringTeardownFailures) {
+  const auto source = read_windows_driver_source();
+
+  const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
+  ASSERT_NE(process_frames, std::string::npos);
+
+  const auto acquire_failure = source.find("if (FAILED(acquire_result))", process_frames);
+  ASSERT_NE(acquire_failure, std::string::npos);
+  const auto acquire_stop = source.find("SwapChainAcquireStoppedDuringTeardown", acquire_failure);
+  ASSERT_NE(acquire_stop, std::string::npos);
+  const auto acquire_delete = source.find("delete_swapchain();", acquire_failure);
+  ASSERT_NE(acquire_delete, std::string::npos);
+  EXPECT_LT(acquire_stop, acquire_delete);
+
+  const auto finished_failure = source.find("if (FAILED(finished_result))", process_frames);
+  ASSERT_NE(finished_failure, std::string::npos);
+  const auto finished_stop = source.find("SwapChainFinishedStoppedDuringTeardown", finished_failure);
+  ASSERT_NE(finished_stop, std::string::npos);
+  const auto finished_delete = source.find("delete_swapchain();", finished_failure);
+  ASSERT_NE(finished_delete, std::string::npos);
+  EXPECT_LT(finished_stop, finished_delete);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, WorkerClosesSwapChainOnStartupException) {
@@ -977,7 +1021,7 @@ TEST(VirtualDisplayWindowsDriverContract, AbandonsInvalidatedSwapchainHandlesDur
 
   const auto helper = source.find("void stop_swapchain_processor_without_delete");
   ASSERT_NE(helper, std::string::npos);
-  EXPECT_NE(source.find("processor->stop();", helper), std::string::npos);
+  EXPECT_NE(source.find("processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)", helper), std::string::npos);
   EXPECT_NE(source.find("processor->abandon_swapchain();", helper), std::string::npos);
 
   const auto depart_display = source.find("vdd::BackendError depart_display");
@@ -1050,6 +1094,8 @@ TEST(VirtualDisplayWindowsDriverContract, TargetModesUseRequestedDescriptorTimin
   EXPECT_EQ(source.find("mode.RequiredBandwidth = shape.pixel_rate;"), std::string::npos);
   EXPECT_NE(source.find("{5120, 1440, 240'000}"), std::string::npos);
   EXPECT_NE(source.find("{5120, 1440, 480'000}"), std::string::npos);
+  EXPECT_NE(source.find("kPreferredModeScalePercent"), std::string::npos);
+  EXPECT_NE(source.find("append_preferred_mode_variants(modes, *preferred)"), std::string::npos);
 
   const auto query_target_modes = source.find("NTSTATUS query_target_modes(");
   ASSERT_NE(query_target_modes, std::string::npos);
@@ -1068,6 +1114,37 @@ TEST(VirtualDisplayWindowsDriverContract, TargetModesUseRequestedDescriptorTimin
 
   const auto fill_with_requested_shape2 = source.find("fill_target_modes2(input, output, &*requested_shape)", requested_shape2);
   ASSERT_NE(fill_with_requested_shape2, std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, MonitorModesUseRegisteredRequestedDescriptorTiming) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("register_monitor_description_mode(descriptor);"), std::string::npos);
+  EXPECT_NE(source.find("unregister_monitor_description_mode(descriptor);"), std::string::npos);
+  EXPECT_NE(source.find("registered_mode_shape_from_description(description)"), std::string::npos);
+  EXPECT_NE(source.find("return mode_shape_from_description(description);"), std::string::npos);
+
+  const auto preferred_shape = source.find("std::optional<ModeShape> preferred_mode_shape_from_description");
+  ASSERT_NE(preferred_shape, std::string::npos);
+
+  const auto registered_lookup = source.find("registered_mode_shape_from_description(description)", preferred_shape);
+  ASSERT_NE(registered_lookup, std::string::npos);
+
+  const auto fallback_lookup = source.find("mode_shape_from_description(description)", registered_lookup);
+  ASSERT_NE(fallback_lookup, std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, SignalFrequenciesReduceMillihertzRationals) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("#include <numeric>"), std::string::npos);
+  EXPECT_NE(source.find("DISPLAYCONFIG_RATIONAL make_frequency_rational"), std::string::npos);
+  EXPECT_NE(source.find("std::gcd(numerator, static_cast<std::uint64_t>(denominator))"), std::string::npos);
+  EXPECT_NE(source.find("signal.vSyncFreq = make_frequency_rational((std::max)(shape.refresh_rate_millihz, 1u), 1000);"), std::string::npos);
+  EXPECT_NE(source.find("signal.hSyncFreq = make_frequency_rational("), std::string::npos);
+  EXPECT_NE(source.find("static_cast<std::uint64_t>((std::max)(shape.refresh_rate_millihz, 1u)) *"), std::string::npos);
+  EXPECT_NE(source.find("static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u))"), std::string::npos);
+  EXPECT_EQ(source.find("signal.hSyncFreq.Numerator = clamp_u32("), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, InvalidEdidDescriptionDoesNotCreatePreferredMode) {

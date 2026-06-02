@@ -152,6 +152,7 @@ TEST(VirtualDisplayProbeContract, ExposesTemporaryAndPermanentRuntimeChecks) {
   expect_contains(source, "--apply-manifest-topology");
   expect_contains(source, "--query-color-profiles");
   expect_contains(source, "--associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]");
+  expect_contains(source, "--stress-capture-remove [iterations width height refresh_hz]");
   expect_contains(source, "--check");
   expect_contains(source, "--query-permanent");
   expect_contains(source, "--set-permanent <count>");
@@ -271,7 +272,7 @@ TEST(VirtualDisplayProbeContract, HdrSelfTestVerifiesWindowsAdvancedColorState) 
   expect_contains(source, "ColorProfileGetDisplayUserScope");
   expect_contains(source, "ColorProfileGetDisplayList");
   expect_contains(source, "ColorProfileGetDisplayDefault");
-  expect_contains(cmake, "target_link_libraries(virtualdisplay_probe PRIVATE libvirtualdisplay::driver advapi32 mscms)");
+  expect_contains(cmake, "target_link_libraries(virtualdisplay_probe PRIVATE libvirtualdisplay::driver advapi32 d3d11 dxgi mscms)");
   expect_contains(source, "kEventHelperColorQueryCompleted");
   expect_contains(source, "const auto after = wait_for_advanced_color(");
   expect_contains(source, "latest->active");
@@ -465,6 +466,9 @@ TEST(VirtualDisplayProbeContract, BrokerOwnsDriverAccessBehindSecuredPipe) {
   expect_contains(source, "return L\"--apply-extended-topology\"");
   expect_contains(source, "return L\"--apply-manifest-topology\"");
   expect_contains(source, "return L\"--query-color-profiles\"");
+  expect_contains(source, "command == \"helper-stress-capture-remove\"");
+  expect_contains(source, "helper-stress-capture-remove ");
+  expect_contains(source, "quote_argument(L\"--stress-capture-remove\")");
   expect_contains(source, "helper-associate-color-profile ");
   expect_contains(source, "is_luid_text(fields[0])");
   expect_contains(source, "is_u32_text(fields[1])");
@@ -474,6 +478,11 @@ TEST(VirtualDisplayProbeContract, BrokerOwnsDriverAccessBehindSecuredPipe) {
   expect_contains(source, "--advanced-color");
   expect_contains(source, "--default");
   expect_contains(source, "pipe_client_session_id(pipe)");
+  expect_contains(source, "WTSGetActiveConsoleSessionId()");
+  expect_contains(source, "Retrying helper in active console session");
+  expect_contains(source, "read_pipe_to_string(output_read.get())");
+  expect_contains(source, "\"error helper_result=\" + std::to_string(helper_result.exit_code) + \"\\n\" + helper_result.output");
+  expect_contains(source, "\"ok helper_result=0\\n\" + helper_result.output");
   expect_contains(source, "launch_session_helper(*session_id, *helper_arguments)");
   expect_contains(source, "GetNamedPipeClientProcessId(pipe, &client_pid)");
   expect_contains(source, "ProcessIdToSessionId(client_pid, &session_id)");
