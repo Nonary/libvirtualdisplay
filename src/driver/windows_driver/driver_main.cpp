@@ -1719,8 +1719,13 @@ namespace {
         TraceLoggingUInt32(GetLastError(), "LastError")
       );
       TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerTeardownDeferred");
-      worker_.detach();
       return false;
+    }
+
+    void detach_worker_for_leak() {
+      if (worker_.joinable()) {
+        worker_.detach();
+      }
     }
 
     void request_stop() {
@@ -1944,6 +1949,32 @@ namespace {
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
 
+  void defer_stop_swapchain_processor_without_delete(std::unique_ptr<SwapChainProcessor> processor) {
+    if (!processor) {
+      return;
+    }
+
+    try {
+      std::thread {[processor = std::move(processor)]() mutable {
+        TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupStarted");
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupStarted");
+        processor->stop();
+        processor->abandon_swapchain();
+        processor.reset();
+        TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupComplete");
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupComplete");
+      }}.detach();
+    } catch (...) {
+      // If cleanup ownership cannot be transferred, preserve the old safety
+      // fallback: leak the backing object so a still-running worker never
+      // dereferences freed C++ state.
+      processor->detach_worker_for_leak();
+      (void) processor.release();
+      TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupFailed");
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupFailed");
+    }
+  }
+
   void stop_swapchain_processor_without_delete(std::unique_ptr<SwapChainProcessor> &processor) {
     if (!processor) {
       return;
@@ -1955,11 +1986,10 @@ namespace {
       return;
     }
 
-    // Keep the detached worker's backing object alive if IddCx is still
-    // unwinding a frame while the monitor is departing. Leaking this rare
-    // teardown object is preferable to blocking monitor removal or deleting
-    // state that the worker may still touch after the IddCx call returns.
-    (void) processor.release();
+    // Keep teardown non-blocking for IddCx, but retain ownership so slow
+    // workers eventually release their D3D and swapchain resources instead of
+    // accumulating for the lifetime of the UMDF host.
+    defer_stop_swapchain_processor_without_delete(std::move(processor));
   }
 
   void request_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {

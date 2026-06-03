@@ -385,15 +385,33 @@ TEST(VirtualDisplayWindowsDriverContract, SwapChainTeardownDoesNotBlockIndefinit
   EXPECT_NE(source.find("bool stop_for_teardown(const std::chrono::milliseconds timeout)"), std::string::npos);
   EXPECT_NE(source.find("WaitForSingleObject(worker_.native_handle(), wait_ms)"), std::string::npos);
   EXPECT_NE(source.find("SwapChainWorkerTeardownDeferred"), std::string::npos);
-  EXPECT_NE(source.find("worker_.detach();"), std::string::npos);
+  EXPECT_NE(source.find("void defer_stop_swapchain_processor_without_delete"), std::string::npos);
+  EXPECT_NE(source.find("SwapChainWorkerDeferredCleanupComplete"), std::string::npos);
 
   const auto helper = source.find("void stop_swapchain_processor_without_delete");
   ASSERT_NE(helper, std::string::npos);
   const auto timed_stop = source.find("processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)", helper);
   ASSERT_NE(timed_stop, std::string::npos);
-  const auto release = source.find("(void) processor.release();", timed_stop);
-  ASSERT_NE(release, std::string::npos);
-  EXPECT_LT(timed_stop, release);
+  const auto deferred = source.find("defer_stop_swapchain_processor_without_delete(std::move(processor));", timed_stop);
+  ASSERT_NE(deferred, std::string::npos);
+  EXPECT_LT(timed_stop, deferred);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, DeferredSwapChainCleanupRetainsOwnership) {
+  const auto source = read_windows_driver_source();
+
+  const auto cleanup = source.find("void defer_stop_swapchain_processor_without_delete");
+  ASSERT_NE(cleanup, std::string::npos);
+  EXPECT_NE(source.find("std::thread {[processor = std::move(processor)]()", cleanup), std::string::npos);
+  EXPECT_NE(source.find("processor->stop();", cleanup), std::string::npos);
+  EXPECT_NE(source.find("processor->abandon_swapchain();", cleanup), std::string::npos);
+  EXPECT_NE(source.find("processor.reset();", cleanup), std::string::npos);
+
+  const auto fallback = source.find("} catch (...)", cleanup);
+  ASSERT_NE(fallback, std::string::npos);
+  EXPECT_NE(source.find("processor->detach_worker_for_leak();", fallback), std::string::npos);
+  EXPECT_NE(source.find("(void) processor.release();", fallback), std::string::npos);
+  EXPECT_NE(source.find("SwapChainWorkerDeferredCleanupFailed", fallback), std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, FrameProcessingStopsCleanlyDuringTeardownFailures) {
