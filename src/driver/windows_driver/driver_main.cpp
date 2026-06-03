@@ -52,7 +52,8 @@ TRACELOGGING_DEFINE_PROVIDER(
     (b0dcb744, 045b, 463b, 9c2f, 6a3c897d3458), \
     WPP_DEFINE_BIT(TRACE_DRIVER) \
     WPP_DEFINE_BIT(TRACE_DEVICE) \
-    WPP_DEFINE_BIT(TRACE_SWAPCHAIN))
+    WPP_DEFINE_BIT(TRACE_SWAPCHAIN) \
+    WPP_DEFINE_BIT(TRACE_CURSOR))
 
 #define WPP_LEVEL_FLAGS_LOGGER(level, flags) WPP_LEVEL_LOGGER(flags)
 #define WPP_LEVEL_FLAGS_ENABLED(level, flags) \
@@ -69,6 +70,12 @@ namespace {
   constexpr std::uint32_t kPersistentStateSchemaVersion = 1;
   constexpr wchar_t kSwapchainMmcssTask[] = L"DisplayPostProcessing";
   constexpr auto kSwapchainProcessorTeardownTimeout = std::chrono::milliseconds(500);
+  constexpr std::uint32_t kHardwareCursorMaxWidth = 256;
+  constexpr std::uint32_t kHardwareCursorMaxHeight = 256;
+  constexpr std::size_t kHardwareCursorShapeBufferBytes =
+    static_cast<std::size_t>(kHardwareCursorMaxWidth) *
+    static_cast<std::size_t>(kHardwareCursorMaxHeight) *
+    sizeof(std::uint32_t);
   constexpr wchar_t kTemporaryDisplayProfilesValue[] = L"TemporaryDisplayProfiles";
   constexpr std::size_t kTemporaryDisplayProfileBytes = 36;
   constexpr std::size_t kTemporaryDisplayProfilesHeaderBytes = 8;
@@ -77,6 +84,7 @@ namespace {
   const GUID kControlInterfaceGuid = vdd::to_windows_guid(vdd::kDeviceInterfaceGuid);
 
   class IddCxBackend;
+  class CursorProcessor;
   class SwapChainProcessor;
 
   struct AdapterContext {
@@ -105,6 +113,7 @@ namespace {
   struct MonitorRecord {
     vdd::DisplayDescriptor descriptor {};
     IDDCX_MONITOR monitor {};
+    std::unique_ptr<CursorProcessor> cursor_processor {};
     std::unique_ptr<SwapChainProcessor> swapchain_processor {};
     std::vector<std::unique_ptr<SwapChainProcessor>> retired_swapchain_processors {};
     bool permanent {};
@@ -1641,6 +1650,221 @@ namespace {
            hr == DXGI_ERROR_ACCESS_LOST;
   }
 
+  class UniqueHandle {
+  public:
+    UniqueHandle() = default;
+    explicit UniqueHandle(HANDLE handle):
+        handle_ {handle} {
+    }
+    UniqueHandle(const UniqueHandle &) = delete;
+    UniqueHandle &operator=(const UniqueHandle &) = delete;
+    UniqueHandle(UniqueHandle &&other) noexcept:
+        handle_ {std::exchange(other.handle_, nullptr)} {
+    }
+    UniqueHandle &operator=(UniqueHandle &&other) noexcept {
+      if (this != &other) {
+        reset(std::exchange(other.handle_, nullptr));
+      }
+      return *this;
+    }
+    ~UniqueHandle() {
+      reset();
+    }
+
+    HANDLE get() const {
+      return handle_;
+    }
+
+    explicit operator bool() const {
+      return handle_ && handle_ != INVALID_HANDLE_VALUE;
+    }
+
+    void reset(HANDLE handle = nullptr) {
+      if (handle_ && handle_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle_);
+      }
+      handle_ = handle;
+    }
+
+  private:
+    HANDLE handle_ {};
+  };
+
+  class CursorProcessor {
+  public:
+    explicit CursorProcessor(IDDCX_MONITOR monitor):
+        monitor_ {monitor},
+        shape_buffer_(kHardwareCursorShapeBufferBytes) {
+    }
+
+    ~CursorProcessor() {
+      stop();
+    }
+
+    CursorProcessor(const CursorProcessor &) = delete;
+    CursorProcessor &operator=(const CursorProcessor &) = delete;
+
+    NTSTATUS start() {
+      if (!monitor_) {
+        return STATUS_INVALID_PARAMETER;
+      }
+
+      cursor_event_.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+      if (!cursor_event_) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+      }
+
+      IDARG_IN_SETUP_HWCURSOR setup {};
+      setup.CursorInfo.Size = sizeof(setup.CursorInfo);
+      setup.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_EMULATION;
+      setup.CursorInfo.AlphaCursorSupport = TRUE;
+      setup.CursorInfo.MaxX = kHardwareCursorMaxWidth;
+      setup.CursorInfo.MaxY = kHardwareCursorMaxHeight;
+      setup.hNewCursorDataAvailable = cursor_event_.get();
+
+      const NTSTATUS status = IddCxMonitorSetupHardwareCursor(monitor_, &setup);
+      if (!NT_SUCCESS(status)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "HardwareCursorSetupFailed",
+          TraceLoggingInt32(status, "Status")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorSetupFailed");
+        return status;
+      }
+
+      try {
+        worker_ = std::thread([this]() {
+          cursor_loop();
+        });
+      } catch (...) {
+        TraceLoggingWrite(g_trace_provider, "HardwareCursorWorkerStartFailed");
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorWorkerStartFailed");
+        return STATUS_INSUFFICIENT_RESOURCES;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "HardwareCursorEnabled",
+        TraceLoggingUInt32(kHardwareCursorMaxWidth, "MaxWidth"),
+        TraceLoggingUInt32(kHardwareCursorMaxHeight, "MaxHeight")
+      );
+      TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_CURSOR, "HardwareCursorEnabled");
+      return STATUS_SUCCESS;
+    }
+
+    void stop() {
+      stop_requested_.store(true, std::memory_order_release);
+      if (cursor_event_) {
+        SetEvent(cursor_event_.get());
+      }
+      if (worker_.joinable()) {
+        worker_.join();
+      }
+      cursor_event_.reset();
+    }
+
+  private:
+    void cursor_loop() {
+      (void) query_cursor();
+      while (!stop_requested_.load(std::memory_order_acquire)) {
+        const DWORD wait_result = WaitForSingleObject(cursor_event_.get(), 1000);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+          break;
+        }
+        if (wait_result == WAIT_TIMEOUT) {
+          continue;
+        }
+        if (wait_result != WAIT_OBJECT_0) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "HardwareCursorWaitFailed",
+            TraceLoggingUInt32(wait_result, "WaitResult"),
+            TraceLoggingUInt32(GetLastError(), "LastError")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorWaitFailed");
+          return;
+        }
+
+        (void) query_cursor();
+      }
+    }
+
+    NTSTATUS query_cursor() {
+      IDARG_IN_QUERY_HWCURSOR input {};
+      input.LastShapeId = last_shape_id_;
+      input.ShapeBufferSizeInBytes = static_cast<UINT>(shape_buffer_.size());
+      input.pShapeBuffer = shape_buffer_.data();
+
+      if (IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorQueryHardwareCursor3)) {
+        IDARG_OUT_QUERY_HWCURSOR3 output {};
+        const HRESULT hr = IddCxMonitorQueryHardwareCursor3(monitor_, &input, &output);
+        if (SUCCEEDED(hr)) {
+          update_cursor_state(output.IsCursorVisible, output.X, output.Y, output.IsCursorShapeUpdated, output.CursorShapeInfo);
+        }
+        return cursor_query_status(hr);
+      }
+
+      if (IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorQueryHardwareCursor2)) {
+        IDARG_OUT_QUERY_HWCURSOR2 output {};
+        const NTSTATUS status = IddCxMonitorQueryHardwareCursor2(monitor_, &input, &output);
+        if (NT_SUCCESS(status)) {
+          update_cursor_state(output.IsCursorVisible, output.X, output.Y, output.IsCursorShapeUpdated, output.CursorShapeInfo);
+        }
+        return cursor_query_status(status);
+      }
+
+      IDARG_OUT_QUERY_HWCURSOR output {};
+      const NTSTATUS status = IddCxMonitorQueryHardwareCursor(monitor_, &input, &output);
+      if (NT_SUCCESS(status)) {
+        update_cursor_state(output.IsCursorVisible, output.X, output.Y, output.IsCursorShapeUpdated, output.CursorShapeInfo);
+      }
+      return cursor_query_status(status);
+    }
+
+    NTSTATUS cursor_query_status(const HRESULT status) {
+      const auto ntstatus = static_cast<NTSTATUS>(status);
+      if (NT_SUCCESS(ntstatus) || ntstatus == STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY) {
+        return ntstatus;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "HardwareCursorQueryFailed",
+        TraceLoggingInt32(ntstatus, "Status")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorQueryFailed");
+      return ntstatus;
+    }
+
+    void update_cursor_state(
+      const BOOL visible,
+      const INT x,
+      const INT y,
+      const BOOL shape_updated,
+      const IDDCX_CURSOR_SHAPE_INFO &shape_info
+    ) {
+      cursor_visible_ = visible != FALSE;
+      cursor_x_ = x;
+      cursor_y_ = y;
+      if (shape_updated) {
+        last_shape_id_ = shape_info.ShapeId;
+        cursor_shape_ = shape_info;
+      }
+    }
+
+    IDDCX_MONITOR monitor_ {};
+    UniqueHandle cursor_event_ {};
+    std::thread worker_ {};
+    std::atomic<bool> stop_requested_ {false};
+    std::vector<std::uint8_t> shape_buffer_ {};
+    DWORD last_shape_id_ {};
+    IDDCX_CURSOR_SHAPE_INFO cursor_shape_ {};
+    bool cursor_visible_ {};
+    INT cursor_x_ {};
+    INT cursor_y_ {};
+  };
+
   class SwapChainProcessor {
   public:
     SwapChainProcessor(IDDCX_SWAPCHAIN swapchain, HANDLE next_surface_available):
@@ -2226,6 +2450,48 @@ namespace {
       return STATUS_SUCCESS;
     }
 
+    NTSTATUS commit_modes(const IDARG_IN_COMMITMODES *args) {
+      if (!args || (args->PathCount > 0 && !args->pPaths)) {
+        return STATUS_INVALID_PARAMETER;
+      }
+
+      for (UINT index = 0; index < args->PathCount; ++index) {
+        const auto &path = args->pPaths[index];
+        if (!path.MonitorObject) {
+          continue;
+        }
+
+        if ((static_cast<UINT>(path.Flags) & static_cast<UINT>(IDDCX_PATH_FLAGS_ACTIVE)) == 0) {
+          stop_hardware_cursor(path.MonitorObject);
+        } else {
+          (void) setup_hardware_cursor(path.MonitorObject);
+        }
+      }
+
+      return STATUS_SUCCESS;
+    }
+
+    NTSTATUS commit_modes2(const IDARG_IN_COMMITMODES2 *args) {
+      if (!args || (args->PathCount > 0 && !args->pPaths)) {
+        return STATUS_INVALID_PARAMETER;
+      }
+
+      for (UINT index = 0; index < args->PathCount; ++index) {
+        const auto &path = args->pPaths[index];
+        if (!path.MonitorObject) {
+          continue;
+        }
+
+        if ((static_cast<UINT>(path.Flags) & static_cast<UINT>(IDDCX_PATH_FLAGS_ACTIVE)) == 0) {
+          stop_hardware_cursor(path.MonitorObject);
+        } else {
+          (void) setup_hardware_cursor(path.MonitorObject);
+        }
+      }
+
+      return STATUS_SUCCESS;
+    }
+
     void shutdown() {
       std::vector<std::uint64_t> display_ids;
       {
@@ -2245,6 +2511,80 @@ namespace {
     }
 
   private:
+    NTSTATUS setup_hardware_cursor(IDDCX_MONITOR monitor) {
+      if (!monitor) {
+        return STATUS_INVALID_PARAMETER;
+      }
+
+      auto *context = GetMonitorContext(monitor);
+      if (!context || !context->backend) {
+        return STATUS_DEVICE_NOT_READY;
+      }
+
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(context->display_id, monitor);
+        if (record == monitors_.end() || record->second.departing || shutting_down_) {
+          return STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY;
+        }
+      }
+
+      std::unique_ptr<CursorProcessor> processor;
+      try {
+        processor = std::make_unique<CursorProcessor>(monitor);
+      } catch (...) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+      }
+
+      const NTSTATUS status = processor->start();
+      if (!NT_SUCCESS(status)) {
+        return status;
+      }
+
+      std::unique_ptr<CursorProcessor> previous_processor;
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(context->display_id, monitor);
+        if (record == monitors_.end() || record->second.departing || shutting_down_) {
+          return STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY;
+        }
+
+        previous_processor = std::move(record->second.cursor_processor);
+        record->second.cursor_processor = std::move(processor);
+      }
+
+      if (previous_processor) {
+        previous_processor->stop();
+      }
+      return STATUS_SUCCESS;
+    }
+
+    void stop_hardware_cursor(IDDCX_MONITOR monitor) {
+      if (!monitor) {
+        return;
+      }
+
+      auto *context = GetMonitorContext(monitor);
+      if (!context || !context->backend) {
+        return;
+      }
+
+      std::unique_ptr<CursorProcessor> processor;
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(context->display_id, monitor);
+        if (record == monitors_.end()) {
+          return;
+        }
+
+        processor = std::move(record->second.cursor_processor);
+      }
+
+      if (processor) {
+        processor->stop();
+      }
+    }
+
     auto find_current_monitor_locked(const std::uint64_t display_id, const IDDCX_MONITOR monitor) {
       const auto record = monitors_.find(display_id);
       if (record == monitors_.end() || record->second.monitor != monitor) {
@@ -2439,6 +2779,7 @@ namespace {
     vdd::BackendError depart_display(const std::uint64_t display_id) {
       IDDCX_MONITOR monitor_handle {};
       std::optional<vdd::DisplayDescriptor> descriptor_to_unregister;
+      std::unique_ptr<CursorProcessor> cursor_processor_to_stop;
       std::unique_ptr<SwapChainProcessor> processor_to_stop;
       std::vector<std::unique_ptr<SwapChainProcessor>> retired_processors_to_stop;
       {
@@ -2466,8 +2807,13 @@ namespace {
         if (monitor == monitors_.end() || monitor->second.monitor != monitor_handle) {
           return vdd::BackendError::None;
         }
+        cursor_processor_to_stop = std::move(monitor->second.cursor_processor);
         processor_to_stop = std::move(monitor->second.swapchain_processor);
         retired_processors_to_stop = std::move(monitor->second.retired_swapchain_processors);
+      }
+
+      if (cursor_processor_to_stop) {
+        cursor_processor_to_stop->stop();
       }
 
       // Wake frame processing before departure, but do not join here. If a
@@ -3096,8 +3442,13 @@ NTSTATUS SunshineEvtQueryTargetModes(
   return fill_target_modes(input, output);
 }
 
-NTSTATUS SunshineEvtCommitModes(IDDCX_ADAPTER, const IDARG_IN_COMMITMODES *) {
-  return STATUS_SUCCESS;
+NTSTATUS SunshineEvtCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES *args) {
+  auto *context = GetAdapterContext(adapter);
+  if (!context || !context->backend) {
+    return STATUS_DEVICE_NOT_READY;
+  }
+
+  return context->backend->commit_modes(args);
 }
 
 NTSTATUS SunshineEvtParseMonitorDescription2(
@@ -3124,8 +3475,13 @@ NTSTATUS SunshineEvtAdapterQueryTargetInfo(
   return STATUS_SUCCESS;
 }
 
-NTSTATUS SunshineEvtCommitModes2(IDDCX_ADAPTER, const IDARG_IN_COMMITMODES2 *) {
-  return STATUS_SUCCESS;
+NTSTATUS SunshineEvtCommitModes2(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES2 *args) {
+  auto *context = GetAdapterContext(adapter);
+  if (!context || !context->backend) {
+    return STATUS_DEVICE_NOT_READY;
+  }
+
+  return context->backend->commit_modes2(args);
 }
 
 NTSTATUS SunshineEvtSetDefaultHdrMetadata(

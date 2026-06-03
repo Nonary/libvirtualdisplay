@@ -827,6 +827,45 @@ TEST(VirtualDisplayWindowsDriverContract, RecordsAdvancedColorCallbacksPerMonito
   EXPECT_NE(source.find("return context->backend->set_gamma_ramp(monitor, args);"), std::string::npos);
 }
 
+TEST(VirtualDisplayWindowsDriverContract, EnablesHardwareCursorOnActiveCommittedPaths) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("std::unique_ptr<CursorProcessor> cursor_processor"), std::string::npos);
+  EXPECT_NE(source.find("IddCxMonitorSetupHardwareCursor(monitor_, &setup);"), std::string::npos);
+  EXPECT_NE(source.find("IDDCX_XOR_CURSOR_SUPPORT_EMULATION"), std::string::npos);
+  EXPECT_NE(source.find("setup.CursorInfo.AlphaCursorSupport = TRUE;"), std::string::npos);
+  EXPECT_NE(source.find("setup.CursorInfo.MaxX = kHardwareCursorMaxWidth;"), std::string::npos);
+  EXPECT_NE(source.find("setup.CursorInfo.MaxY = kHardwareCursorMaxHeight;"), std::string::npos);
+
+  const auto commit_modes = source.find("NTSTATUS commit_modes(const IDARG_IN_COMMITMODES *args)");
+  ASSERT_NE(commit_modes, std::string::npos);
+  EXPECT_NE(source.find("IDDCX_PATH_FLAGS_ACTIVE", commit_modes), std::string::npos);
+  EXPECT_NE(source.find("setup_hardware_cursor(path.MonitorObject)", commit_modes), std::string::npos);
+
+  const auto commit_modes2 = source.find("NTSTATUS commit_modes2(const IDARG_IN_COMMITMODES2 *args)");
+  ASSERT_NE(commit_modes2, std::string::npos);
+  EXPECT_NE(source.find("IDDCX_PATH_FLAGS_ACTIVE", commit_modes2), std::string::npos);
+  EXPECT_NE(source.find("setup_hardware_cursor(path.MonitorObject)", commit_modes2), std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, PumpsHardwareCursorUpdatesUntilMonitorDeparture) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("WaitForSingleObject(cursor_event_.get(), 1000)"), std::string::npos);
+  EXPECT_NE(source.find("IddCxMonitorQueryHardwareCursor3(monitor_, &input, &output)"), std::string::npos);
+  EXPECT_NE(source.find("IddCxMonitorQueryHardwareCursor2(monitor_, &input, &output)"), std::string::npos);
+  EXPECT_NE(source.find("IddCxMonitorQueryHardwareCursor(monitor_, &input, &output)"), std::string::npos);
+  EXPECT_NE(source.find("last_shape_id_ = shape_info.ShapeId;"), std::string::npos);
+
+  const auto depart_display = source.find("vdd::BackendError depart_display(const std::uint64_t display_id)");
+  ASSERT_NE(depart_display, std::string::npos);
+  const auto stop_cursor = source.find("cursor_processor_to_stop->stop();", depart_display);
+  ASSERT_NE(stop_cursor, std::string::npos);
+  const auto departure = source.find("IddCxMonitorDeparture(monitor_handle);", depart_display);
+  ASSERT_NE(departure, std::string::npos);
+  EXPECT_LT(stop_cursor, departure);
+}
+
 TEST(VirtualDisplayWindowsDriverContract, DoesNotAdvertiseUnimplementedEndpointGammaTransform) {
   const auto source = read_windows_driver_source();
 
