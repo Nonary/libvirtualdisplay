@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace virtual_display::driver {
@@ -113,7 +114,11 @@ namespace virtual_display::driver {
       auto safe = options;
       safe.width = std::clamp(safe.width, 1u, 4095u);
       safe.height = std::clamp(safe.height, 1u, 4095u);
-      safe.refresh_rate_millihz = std::clamp(safe.refresh_rate_millihz, 1u, 1'000'000u);
+      safe.refresh_rate_millihz = std::clamp(
+        safe.refresh_rate_millihz,
+        1u,
+        (std::numeric_limits<std::uint32_t>::max)()
+      );
       safe.physical_width_mm = std::clamp(safe.physical_width_mm, 1u, 4095u);
       safe.physical_height_mm = std::clamp(safe.physical_height_mm, 1u, 4095u);
       return safe;

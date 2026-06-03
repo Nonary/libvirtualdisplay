@@ -350,7 +350,7 @@ TEST(VirtualDisplayDriverControlProtocol, RejectsOutOfRangeMode) {
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidPhysicalSize);
 
   request = valid_create_request();
-  request.refresh_rate_millihz = vdd::kMaxRefreshRateMilliHz + 1;
+  request.refresh_rate_millihz = 0;
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidRefreshRate);
 
   request = valid_create_request();
@@ -358,16 +358,16 @@ TEST(VirtualDisplayDriverControlProtocol, RejectsOutOfRangeMode) {
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidWidth);
 
   request = valid_create_request();
-  request.width = 5120;
-  request.height = 1440;
-  request.refresh_rate_millihz = 480'000;
+  request.width = 3840;
+  request.height = 2160;
+  request.refresh_rate_millihz = 1'000'000;
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
 
   request = valid_create_request();
   request.width = 7680;
   request.height = 4320;
-  request.refresh_rate_millihz = 480'000;
-  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidRefreshRate);
+  request.refresh_rate_millihz = 1'000'000;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, RejectsReservedCreateFields) {
@@ -507,7 +507,7 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesPermanentDisplaySettings) {
   EXPECT_EQ(vdd::validate_permanent_display_count(request, 4), vdd::ValidationError::InvalidPhysicalSize);
 
   request.physical_height_mm = 390;
-  request.refresh_rate_millihz = vdd::kMaxRefreshRateMilliHz + 1;
+  request.refresh_rate_millihz = 0;
   EXPECT_EQ(vdd::validate_permanent_display_count(request, 4), vdd::ValidationError::InvalidRefreshRate);
 
   request.refresh_rate_millihz = 144'000;
@@ -548,11 +548,11 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesDisplayManifest) {
   EXPECT_EQ(vdd::validate_display_manifest(manifest, 2), vdd::ValidationError::InvalidModeCount);
 
   manifest = valid_display_manifest();
-  manifest.profiles[0].allowed_modes[0].refresh_rate_millihz = vdd::kMaxRefreshRateMilliHz + 1;
+  manifest.profiles[0].allowed_modes[0].refresh_rate_millihz = 0;
   EXPECT_EQ(vdd::validate_display_manifest(manifest, 2), vdd::ValidationError::InvalidRefreshRate);
 
   manifest = valid_display_manifest();
-  manifest.profiles[0].allowed_modes[0] = {5120, 1440, 240'000};
+  manifest.profiles[0].allowed_modes[0] = {3840, 2160, 1'000'000};
   EXPECT_EQ(vdd::validate_display_manifest(manifest, 2), vdd::ValidationError::None);
 
   manifest = valid_display_manifest();

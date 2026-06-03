@@ -173,7 +173,7 @@ The driver validates modes against the protocol range:
 - width: `320` through `16384`
 - height: `200` through `16384`
 - physical width and height: `10 mm` through `2550 mm`
-- refresh: `23 Hz` through `480 Hz`
+- refresh: any positive millihertz value accepted by the protocol; the driver no longer applies a policy refresh-rate ceiling
 
 Use `virtualdisplay_probe.exe` for diagnostics and runtime validation rather
 than normal display management. Common commands are:
@@ -356,7 +356,7 @@ if (!released.ok()) {
 
 ### Protocol notes
 
-- The current protocol version is `3.4.0`.
+- The current protocol version is `3.5.0`.
 - `ControlClient::check_protocol_compatible()` should be called before issuing
   state-changing requests.
 - IDs are caller-owned. Reuse `DisplayId` for the same logical display when you

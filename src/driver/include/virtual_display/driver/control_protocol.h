@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 #include <type_traits>
 
@@ -32,7 +33,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 4;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 5;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
 
   inline constexpr std::uint32_t kDisplayNameChars = 32;
@@ -45,8 +46,8 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kMinHeight = 200;
   inline constexpr std::uint32_t kMaxWidth = 7680;
   inline constexpr std::uint32_t kMaxHeight = 4320;
-  inline constexpr std::uint32_t kMinRefreshRateMilliHz = 23'000;
-  inline constexpr std::uint32_t kMaxRefreshRateMilliHz = 480'000;
+  inline constexpr std::uint32_t kMinRefreshRateMilliHz = 1;
+  inline constexpr std::uint32_t kMaxRefreshRateMilliHz = (std::numeric_limits<std::uint32_t>::max)();
   inline constexpr std::uint32_t kDefaultPhysicalWidthMillimeters = 600;
   inline constexpr std::uint32_t kDefaultPhysicalHeightMillimeters = 340;
   inline constexpr std::uint32_t kMinPhysicalSizeMillimeters = 10;

@@ -5,7 +5,6 @@
 namespace virtual_display::driver {
   namespace {
     constexpr std::uint64_t kMaxModePixels = 7680ull * 4320ull;
-    constexpr std::uint64_t kMaxPixelRateMilliHz = 3840ull * 2160ull * kMaxRefreshRateMilliHz;
 
     bool valid_manufacturer_id(const char (&manufacturer_id)[4]) {
       return manufacturer_id[0] >= 'A' && manufacturer_id[0] <= 'Z' &&
@@ -29,17 +28,13 @@ namespace virtual_display::driver {
       if (height < kMinHeight || height > kMaxHeight) {
         return ValidationError::InvalidHeight;
       }
-      if (refresh_rate_millihz < kMinRefreshRateMilliHz ||
-          refresh_rate_millihz > kMaxRefreshRateMilliHz) {
+      if (refresh_rate_millihz < kMinRefreshRateMilliHz) {
         return ValidationError::InvalidRefreshRate;
       }
 
       const auto pixels = static_cast<std::uint64_t>(width) * height;
       if (pixels == 0 || pixels > kMaxModePixels) {
         return ValidationError::InvalidWidth;
-      }
-      if (pixels > kMaxPixelRateMilliHz / refresh_rate_millihz) {
-        return ValidationError::InvalidRefreshRate;
       }
 
       return ValidationError::None;
