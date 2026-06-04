@@ -103,6 +103,8 @@ namespace {
   struct HdrProfileRetentionWorkItemContext {
     vdd::DisplayDescriptor descriptor {};
     std::uint32_t target_id {};
+    DWORD retained_dpi_value {};
+    bool has_retained_dpi_value {};
   };
 
   WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(AdapterContext, GetAdapterContext);
@@ -804,7 +806,7 @@ namespace {
     if (!WTSQueryUserToken(session_id, &token)) {
       TraceLoggingWrite(
         g_trace_provider,
-        "HdrProfileRetentionUserTokenUnavailable",
+        "UserSettingsRetentionUserTokenUnavailable",
         TraceLoggingUInt32(GetLastError(), "NativeError"),
         TraceLoggingUInt32(session_id, "SessionId")
       );
@@ -841,6 +843,164 @@ namespace {
     wchar_t text[8] {};
     std::swprintf(text, std::size(text), L"SDD%04X", static_cast<unsigned int>(vdd::read_product_code(descriptor.edid)));
     return text;
+  }
+
+  std::wstring temporary_per_monitor_settings_prefix(const vdd::DisplayDescriptor &descriptor) {
+    return temporary_monitor_hardware_id(descriptor) + std::to_wstring(vdd::read_serial_number(descriptor.edid));
+  }
+
+  std::optional<DWORD> read_retained_temporary_dpi_value(
+    HKEY per_monitor_settings_key,
+    const std::wstring &settings_prefix
+  ) {
+    for (DWORD index = 0;; ++index) {
+      wchar_t settings_key_name[256] {};
+      DWORD settings_key_name_size = static_cast<DWORD>(std::size(settings_key_name));
+      const auto enum_status = RegEnumKeyExW(
+        per_monitor_settings_key,
+        index,
+        settings_key_name,
+        &settings_key_name_size,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+      );
+      if (enum_status == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      if (enum_status != ERROR_SUCCESS || wcsncmp(settings_key_name, settings_prefix.c_str(), settings_prefix.size()) != 0) {
+        continue;
+      }
+
+      NativeRegistryKey settings_key;
+      if (RegOpenKeyExW(per_monitor_settings_key, settings_key_name, 0, KEY_QUERY_VALUE, settings_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      DWORD dpi_value {};
+      if (read_registry_dword(settings_key.get(), L"DpiValue", dpi_value)) {
+        return dpi_value;
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<DWORD> read_retained_temporary_dpi_value(const vdd::DisplayDescriptor &descriptor) {
+    if (!descriptor.retain_identity) {
+      return std::nullopt;
+    }
+
+    const auto sid = active_console_user_sid_string();
+    if (!sid) {
+      return std::nullopt;
+    }
+
+    NativeRegistryKey per_monitor_settings_key;
+    const auto per_monitor_settings_path = *sid + L"\\Control Panel\\Desktop\\PerMonitorSettings";
+    if (RegOpenKeyExW(
+          HKEY_USERS,
+          per_monitor_settings_path.c_str(),
+          0,
+          KEY_ENUMERATE_SUB_KEYS,
+          per_monitor_settings_key.put()
+        ) != ERROR_SUCCESS) {
+      return std::nullopt;
+    }
+
+    const auto settings_prefix = temporary_per_monitor_settings_prefix(descriptor);
+    return read_retained_temporary_dpi_value(per_monitor_settings_key.get(), settings_prefix);
+  }
+
+  bool apply_retained_temporary_dpi_value(
+    const vdd::DisplayDescriptor &descriptor,
+    const DWORD dpi_value
+  ) {
+    if (!descriptor.retain_identity) {
+      return false;
+    }
+
+    const auto sid = active_console_user_sid_string();
+    if (!sid) {
+      return false;
+    }
+
+    NativeRegistryKey per_monitor_settings_key;
+    const auto per_monitor_settings_path = *sid + L"\\Control Panel\\Desktop\\PerMonitorSettings";
+    if (RegOpenKeyExW(
+          HKEY_USERS,
+          per_monitor_settings_path.c_str(),
+          0,
+          KEY_ENUMERATE_SUB_KEYS,
+          per_monitor_settings_key.put()
+        ) != ERROR_SUCCESS) {
+      return false;
+    }
+
+    const auto settings_prefix = temporary_per_monitor_settings_prefix(descriptor);
+    std::uint32_t applied_count {};
+    for (DWORD index = 0;; ++index) {
+      wchar_t settings_key_name[256] {};
+      DWORD settings_key_name_size = static_cast<DWORD>(std::size(settings_key_name));
+      const auto enum_status = RegEnumKeyExW(
+        per_monitor_settings_key.get(),
+        index,
+        settings_key_name,
+        &settings_key_name_size,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
+      );
+      if (enum_status == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      if (enum_status != ERROR_SUCCESS || wcsncmp(settings_key_name, settings_prefix.c_str(), settings_prefix.size()) != 0) {
+        continue;
+      }
+
+      NativeRegistryKey settings_key;
+      if (RegOpenKeyExW(per_monitor_settings_key.get(), settings_key_name, 0, KEY_SET_VALUE, settings_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      if (RegSetValueExW(
+            settings_key.get(),
+            L"DpiValue",
+            0,
+            REG_DWORD,
+            reinterpret_cast<const BYTE *>(&dpi_value),
+            sizeof(dpi_value)
+          ) == ERROR_SUCCESS) {
+        ++applied_count;
+      }
+    }
+
+    if (applied_count == 0) {
+      return false;
+    }
+
+    TraceLoggingWrite(
+      g_trace_provider,
+      "TemporaryDpiSettingsRetained",
+      TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+      TraceLoggingUInt32(dpi_value, "DpiValue"),
+      TraceLoggingUInt32(applied_count, "AppliedCount")
+    );
+    return true;
+  }
+
+  bool retain_temporary_display_dpi_settings(
+    const vdd::DisplayDescriptor &descriptor,
+    const std::optional<DWORD> retained_dpi_value = std::nullopt
+  ) {
+    if (retained_dpi_value) {
+      return apply_retained_temporary_dpi_value(descriptor, *retained_dpi_value);
+    }
+
+    const auto dpi_value = read_retained_temporary_dpi_value(descriptor);
+    return dpi_value && apply_retained_temporary_dpi_value(descriptor, *dpi_value);
   }
 
   std::wstring guid_registry_string(const vdd::Guid &guid) {
@@ -1092,7 +1252,11 @@ namespace {
   void hdr_profile_retention_work_item(WDFWORKITEM work_item) {
     const auto *context = GetHdrProfileRetentionWorkItemContext(work_item);
     if (context) {
+      const auto retained_dpi_value = context->has_retained_dpi_value ?
+        std::optional<DWORD> {context->retained_dpi_value} :
+        std::nullopt;
       for (std::uint32_t attempt = 0; attempt < 20; ++attempt) {
+        (void) retain_temporary_display_dpi_settings(context->descriptor, retained_dpi_value);
         migrate_hdr_profile_association_for_monitor(context->descriptor, context->target_id);
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
       }
@@ -1103,7 +1267,8 @@ namespace {
   void schedule_hdr_profile_association_retention(
     WDFDEVICE device,
     const vdd::DisplayDescriptor &descriptor,
-    const std::uint32_t target_id
+    const std::uint32_t target_id,
+    const std::optional<DWORD> retained_dpi_value
   ) {
     if (!descriptor.retain_identity) {
       return;
@@ -1124,6 +1289,10 @@ namespace {
     auto *context = GetHdrProfileRetentionWorkItemContext(work_item);
     context->descriptor = descriptor;
     context->target_id = target_id;
+    if (retained_dpi_value) {
+      context->retained_dpi_value = *retained_dpi_value;
+      context->has_retained_dpi_value = true;
+    }
     WdfWorkItemEnqueue(work_item);
   }
 
@@ -2314,11 +2483,25 @@ namespace {
     }
 
     vdd::BackendError reserve_temporary_display_identity(const vdd::DisplayDescriptor &descriptor) override {
-      return save_temporary_display_profile(driver_, device_, descriptor);
+      const auto dpi_value = read_retained_temporary_dpi_value(descriptor);
+      const auto result = save_temporary_display_profile(driver_, device_, descriptor);
+      {
+        std::lock_guard lock {mutex_};
+        if (result == vdd::BackendError::None && dpi_value) {
+          retained_dpi_values_by_display_id_[descriptor.display_id] = *dpi_value;
+        } else {
+          retained_dpi_values_by_display_id_.erase(descriptor.display_id);
+        }
+      }
+      return result;
     }
 
     vdd::BackendError unreserve_temporary_display_identity(const std::uint64_t display_id) override {
       const auto result = remove_temporary_display_profile(driver_, device_, display_id);
+      {
+        std::lock_guard lock {mutex_};
+        retained_dpi_values_by_display_id_.erase(display_id);
+      }
       if (result != vdd::BackendError::None) {
         TraceLoggingWrite(g_trace_provider, "TemporaryIdentityUnreserveFailed", TraceLoggingUInt64(display_id, "DisplayId"));
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "TemporaryIdentityUnreserveFailed");
@@ -2327,7 +2510,12 @@ namespace {
     }
 
     vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
-      return depart_display(display_id);
+      const auto result = depart_display(display_id);
+      if (result == vdd::BackendError::None) {
+        std::lock_guard lock {mutex_};
+        retained_dpi_values_by_display_id_.erase(display_id);
+      }
+      return result;
     }
 
     vdd::BackendError set_permanent_display_count(const vdd::PermanentDisplayCountRequest &request) override {
@@ -2767,7 +2955,15 @@ namespace {
       );
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorArrived");
       if (!permanent) {
-        schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId);
+        std::optional<DWORD> retained_dpi_value;
+        {
+          std::lock_guard lock {mutex_};
+          if (const auto dpi = retained_dpi_values_by_display_id_.find(descriptor.display_id);
+              dpi != retained_dpi_values_by_display_id_.end()) {
+            retained_dpi_value = dpi->second;
+          }
+        }
+        schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId, retained_dpi_value);
       }
       return {
         vdd::BackendError::None,
@@ -3101,6 +3297,7 @@ namespace {
     bool shutting_down_ {};
     NTSTATUS adapter_init_status_ {STATUS_DEVICE_NOT_READY};
     std::map<std::uint64_t, MonitorRecord> monitors_ {};
+    std::map<std::uint64_t, DWORD> retained_dpi_values_by_display_id_ {};
   };
 
   class DeviceState {

@@ -888,8 +888,35 @@ TEST(VirtualDisplayWindowsDriverContract, RetainsHdrProfileAssociationForStableT
   EXPECT_NE(source.find("HKEY_USERS"), std::string::npos);
   EXPECT_NE(source.find("ICMProfileAC"), std::string::npos);
   EXPECT_NE(source.find("monitor_driver_value_for_identity"), std::string::npos);
-  EXPECT_NE(source.find("schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId);"), std::string::npos);
+  EXPECT_NE(source.find("schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId"), std::string::npos);
   EXPECT_NE(cmake.find("wtsapi32"), std::string::npos);
+}
+
+TEST(VirtualDisplayWindowsDriverContract, RetainsDpiSettingsForStableTemporaryIdentity) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("temporary_per_monitor_settings_prefix"), std::string::npos);
+  EXPECT_NE(source.find("Control Panel\\\\Desktop\\\\PerMonitorSettings"), std::string::npos);
+  EXPECT_NE(source.find("read_retained_temporary_dpi_value"), std::string::npos);
+  EXPECT_NE(source.find("RegSetValueExW("), std::string::npos);
+  EXPECT_NE(source.find("L\"DpiValue\""), std::string::npos);
+  EXPECT_NE(source.find("TemporaryDpiSettingsRetained"), std::string::npos);
+  EXPECT_NE(source.find("retained_dpi_values_by_display_id_"), std::string::npos);
+
+  const auto reserve = source.find("vdd::BackendError reserve_temporary_display_identity");
+  ASSERT_NE(reserve, std::string::npos);
+  EXPECT_NE(source.find("const auto dpi_value = read_retained_temporary_dpi_value(descriptor);", reserve), std::string::npos);
+
+  const auto work_item = source.find("void hdr_profile_retention_work_item");
+  ASSERT_NE(work_item, std::string::npos);
+  const auto dpi_retain = source.find("retain_temporary_display_dpi_settings(context->descriptor, retained_dpi_value)", work_item);
+  ASSERT_NE(dpi_retain, std::string::npos);
+  const auto hdr_retain = source.find("migrate_hdr_profile_association_for_monitor(context->descriptor, context->target_id)", work_item);
+  ASSERT_NE(hdr_retain, std::string::npos);
+  EXPECT_LT(dpi_retain, hdr_retain);
+
+  const auto schedule = source.find("schedule_hdr_profile_association_retention(device_, descriptor, arrival_out.OsTargetId, retained_dpi_value)");
+  ASSERT_NE(schedule, std::string::npos);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, RegistersGammaRampIndependentOfHdrCallbacks) {
