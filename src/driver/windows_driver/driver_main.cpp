@@ -2128,8 +2128,22 @@ namespace {
       }
     }
 
+    void mark_assign_succeeded() {
+      complete_assign(true);
+    }
+
+    void mark_assign_abandoned() {
+      complete_assign(false);
+    }
+
     void abandon_swapchain() {
-      swapchain_ = nullptr;
+      {
+        std::lock_guard lock {assignment_mutex_};
+        assign_completed_ = true;
+        driver_owns_swapchain_ = false;
+        swapchain_ = nullptr;
+      }
+      assignment_changed_.notify_all();
     }
 
   private:
@@ -2153,14 +2167,49 @@ namespace {
       HANDLE handle_ {};
     };
 
+    void complete_assign(const bool driver_owns_swapchain) {
+      {
+        std::lock_guard lock {assignment_mutex_};
+        assign_completed_ = true;
+        driver_owns_swapchain_ = driver_owns_swapchain;
+      }
+      assignment_changed_.notify_all();
+    }
+
+    IDDCX_SWAPCHAIN claim_owned_swapchain_for_delete() {
+      std::unique_lock lock {assignment_mutex_};
+      assignment_changed_.wait(lock, [this]() {
+        return assign_completed_;
+      });
+
+      if (!driver_owns_swapchain_) {
+        swapchain_ = nullptr;
+        return nullptr;
+      }
+
+      driver_owns_swapchain_ = false;
+      return std::exchange(swapchain_, nullptr);
+    }
+
     void delete_swapchain() {
-      if (swapchain_) {
+      if (const auto swapchain = claim_owned_swapchain_for_delete()) {
         // Match the IddCx sample by closing the swapchain when processing
         // stops. Waiting until after monitor departure can leave us deleting
         // a UMDF object that IddCx has already invalidated.
-        WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapchain_));
-        swapchain_ = nullptr;
+        WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapchain));
       }
+    }
+
+    void log_render_device_lost(const char *operation, const HRESULT hr) const {
+      const HRESULT removed_reason = device_ ? device_->GetDeviceRemovedReason() : E_FAIL;
+      TraceLoggingWrite(
+        g_trace_provider,
+        "RenderDeviceLost",
+        TraceLoggingString(operation, "Operation"),
+        TraceLoggingUInt32(static_cast<std::uint32_t>(hr), "HResult"),
+        TraceLoggingUInt32(static_cast<std::uint32_t>(removed_reason), "DeviceRemovedReason")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "RenderDeviceLost");
     }
 
     HRESULT assign_swapchain_device() {
@@ -2264,17 +2313,9 @@ namespace {
               return;
             }
             if (is_device_lost_hresult(acquire_result)) {
-              TraceLoggingWrite(
-                g_trace_provider,
-                "RenderDeviceLost",
-                TraceLoggingUInt32(static_cast<std::uint32_t>(acquire_result), "HResult")
-              );
-              TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "RenderDeviceLost");
-              if (FAILED(reset_render_device(render_adapter_luid))) {
-                delete_swapchain();
-                return;
-              }
-              continue;
+              log_render_device_lost("ReleaseAndAcquireBuffer", acquire_result);
+              delete_swapchain();
+              return;
             }
             TraceLoggingWrite(
               g_trace_provider,
@@ -2302,20 +2343,9 @@ namespace {
               return;
             }
             if (is_device_lost_hresult(finished_result)) {
-              TraceLoggingWrite(
-                g_trace_provider,
-                "RenderDeviceLost",
-                TraceLoggingUInt32(static_cast<std::uint32_t>(finished_result), "HResult")
-              );
-              TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "RenderDeviceLost");
-              if (FAILED(reset_render_device(render_adapter_luid))) {
-                delete_swapchain();
-                return;
-              }
-              finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
-              if (SUCCEEDED(finished_result)) {
-                continue;
-              }
+              log_render_device_lost("FinishedProcessingFrame", finished_result);
+              delete_swapchain();
+              return;
             }
             TraceLoggingWrite(
               g_trace_provider,
@@ -2338,6 +2368,10 @@ namespace {
     HANDLE next_surface_available_ {};
     std::atomic<bool> stop_requested_ {false};
     std::thread worker_ {};
+    std::mutex assignment_mutex_ {};
+    std::condition_variable assignment_changed_ {};
+    bool assign_completed_ {};
+    bool driver_owns_swapchain_ {};
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
@@ -3091,6 +3125,7 @@ namespace {
       }
 
       std::unique_ptr<SwapChainProcessor> previous_processor;
+      SwapChainProcessor *assigned_processor = nullptr;
       bool abandon_new_processor = false;
       {
         std::lock_guard lock {mutex_};
@@ -3099,15 +3134,19 @@ namespace {
           abandon_new_processor = true;
         } else {
           previous_processor = std::move(record->second.swapchain_processor);
+          assigned_processor = processor.get();
           record->second.swapchain_processor = std::move(processor);
         }
       }
 
       if (abandon_new_processor) {
+        processor->mark_assign_abandoned();
         processor->stop();
         processor->abandon_swapchain();
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
+
+      assigned_processor->mark_assign_succeeded();
 
       if (previous_processor) {
         // IddCx rotates swapchains inside HandleNewSwapChain. Request the old
