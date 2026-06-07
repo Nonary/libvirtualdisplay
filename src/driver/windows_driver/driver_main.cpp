@@ -1815,8 +1815,11 @@ namespace {
     return hr == DXGI_ERROR_DEVICE_REMOVED ||
            hr == DXGI_ERROR_DEVICE_RESET ||
            hr == DXGI_ERROR_DEVICE_HUNG ||
-           hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR ||
-           hr == DXGI_ERROR_ACCESS_LOST;
+           hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+  }
+
+  bool is_access_lost_hresult(const HRESULT hr) {
+    return hr == DXGI_ERROR_ACCESS_LOST;
   }
 
   class UniqueHandle {
@@ -2312,6 +2315,14 @@ namespace {
               TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainAcquireStoppedDuringTeardown");
               return;
             }
+            if (is_access_lost_hresult(acquire_result)) {
+              log_render_device_lost("ReleaseAndAcquireBuffer", acquire_result);
+              if (FAILED(reset_render_device(render_adapter_luid))) {
+                delete_swapchain();
+                return;
+              }
+              continue;
+            }
             if (is_device_lost_hresult(acquire_result)) {
               log_render_device_lost("ReleaseAndAcquireBuffer", acquire_result);
               delete_swapchain();
@@ -2341,6 +2352,17 @@ namespace {
               );
               TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainFinishedStoppedDuringTeardown");
               return;
+            }
+            if (is_access_lost_hresult(finished_result)) {
+              log_render_device_lost("FinishedProcessingFrame", finished_result);
+              if (FAILED(reset_render_device(render_adapter_luid))) {
+                delete_swapchain();
+                return;
+              }
+              finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
+              if (SUCCEEDED(finished_result)) {
+                continue;
+              }
             }
             if (is_device_lost_hresult(finished_result)) {
               log_render_device_lost("FinishedProcessingFrame", finished_result);

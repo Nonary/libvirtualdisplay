@@ -493,6 +493,33 @@ TEST(VirtualDisplayWindowsDriverContract, ClosesSwapChainOnFrameCompletionDevice
   EXPECT_EQ(device_lost_body.find("IddCxSwapChainFinishedProcessingFrame(swapchain_)"), std::string::npos);
 }
 
+TEST(VirtualDisplayWindowsDriverContract, RecoversRenderDeviceOnFrameCompletionAccessLoss) {
+  const auto source = read_windows_driver_source();
+
+  EXPECT_NE(source.find("bool is_access_lost_hresult(const HRESULT hr)"), std::string::npos);
+  EXPECT_NE(source.find("return hr == DXGI_ERROR_ACCESS_LOST;"), std::string::npos);
+
+  const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
+  ASSERT_NE(process_frames, std::string::npos);
+  const auto finished = source.find("HRESULT finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);", process_frames);
+  ASSERT_NE(finished, std::string::npos);
+  const auto finished_failure = source.find("if (FAILED(finished_result))", finished);
+  ASSERT_NE(finished_failure, std::string::npos);
+  const auto access_lost = source.find("is_access_lost_hresult(finished_result)", finished_failure);
+  ASSERT_NE(access_lost, std::string::npos);
+  const auto reset = source.find("reset_render_device(render_adapter_luid)", access_lost);
+  ASSERT_NE(reset, std::string::npos);
+  const auto retry_finished = source.find("finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);", reset);
+  ASSERT_NE(retry_finished, std::string::npos);
+  const auto retry_success = source.find("if (SUCCEEDED(finished_result))", retry_finished);
+  ASSERT_NE(retry_success, std::string::npos);
+  const auto continue_processing = source.find("continue;", retry_success);
+  ASSERT_NE(continue_processing, std::string::npos);
+  const auto hard_loss = source.find("is_device_lost_hresult(finished_result)", continue_processing);
+  ASSERT_NE(hard_loss, std::string::npos);
+  EXPECT_LT(continue_processing, hard_loss);
+}
+
 TEST(VirtualDisplayWindowsDriverContract, RegistersSwapChainWorkerWithMmcss) {
   const auto source = read_windows_driver_source();
 
@@ -570,6 +597,7 @@ TEST(VirtualDisplayWindowsDriverContract, ClosesSwapChainOnAcquireDeviceLoss) {
 
   EXPECT_NE(source.find("D3D_DRIVER_TYPE_WARP"), std::string::npos);
   EXPECT_NE(source.find("is_device_lost_hresult"), std::string::npos);
+  EXPECT_NE(source.find("is_access_lost_hresult"), std::string::npos);
   EXPECT_NE(source.find("DXGI_ERROR_DEVICE_REMOVED"), std::string::npos);
   EXPECT_NE(source.find("DXGI_ERROR_DEVICE_RESET"), std::string::npos);
   EXPECT_NE(source.find("DXGI_ERROR_ACCESS_LOST"), std::string::npos);
@@ -600,6 +628,24 @@ TEST(VirtualDisplayWindowsDriverContract, ClosesSwapChainOnAcquireDeviceLoss) {
     source.substr(assign_swapchain, unassign_swapchain - assign_swapchain).find("return STATUS_UNSUCCESSFUL;"),
     std::string::npos
   );
+}
+
+TEST(VirtualDisplayWindowsDriverContract, RecoversRenderDeviceOnAcquireAccessLoss) {
+  const auto source = read_windows_driver_source();
+
+  const auto process_frames = source.find("void process_frames(const LUID render_adapter_luid)");
+  ASSERT_NE(process_frames, std::string::npos);
+  const auto acquire_failure = source.find("if (FAILED(acquire_result))", process_frames);
+  ASSERT_NE(acquire_failure, std::string::npos);
+  const auto access_lost = source.find("is_access_lost_hresult(acquire_result)", acquire_failure);
+  ASSERT_NE(access_lost, std::string::npos);
+  const auto reset = source.find("reset_render_device(render_adapter_luid)", access_lost);
+  ASSERT_NE(reset, std::string::npos);
+  const auto continue_processing = source.find("continue;", reset);
+  ASSERT_NE(continue_processing, std::string::npos);
+  const auto hard_loss = source.find("is_device_lost_hresult(acquire_result)", continue_processing);
+  ASSERT_NE(hard_loss, std::string::npos);
+  EXPECT_LT(continue_processing, hard_loss);
 }
 
 TEST(VirtualDisplayWindowsDriverContract, SetsReleaseAndAcquireBuffer2MetadataSize) {
