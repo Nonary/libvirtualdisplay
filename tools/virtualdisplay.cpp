@@ -40,6 +40,7 @@ namespace {
     std::cout
       << "virtualdisplay commands:\n"
       << "  driver install [--inf PATH]\n"
+      << "  vulkan-layer install [--json PATH] | uninstall | status\n"
       << "  broker install|start|stop|status|uninstall\n"
       << "  broker protocol|query-state|query-manifest|helper-diagnose|helper-apply-extended-topology|helper-apply-manifest-topology|helper-query-color-profiles\n"
       << "  broker helper-associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]\n"
@@ -1137,6 +1138,128 @@ namespace {
     return reboot_required ? 3 : 0;
   }
 
+  constexpr wchar_t kVulkanImplicitLayersKey[] = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
+  constexpr wchar_t kVulkanLayerJsonFileName[] = L"VkLayer_sunshine_hdr.json";
+
+  std::optional<std::filesystem::path> resolve_vulkan_layer_json(const std::vector<std::string> &args) {
+    for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+      if (args[i] == "--json") {
+        return std::filesystem::path {args[i + 1]};
+      }
+    }
+
+    wchar_t executable[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    if (length == 0 || length >= std::size(executable)) {
+      return std::nullopt;
+    }
+    const auto exe_dir = std::filesystem::path {executable}.parent_path();
+    const std::filesystem::path candidates[] = {
+      exe_dir / kVulkanLayerJsonFileName,
+      exe_dir.parent_path() / "vulkan-layer" / kVulkanLayerJsonFileName,
+    };
+    for (const auto &candidate : candidates) {
+      std::error_code error;
+      if (std::filesystem::exists(candidate, error) && !error) {
+        return candidate;
+      }
+    }
+    return std::nullopt;
+  }
+
+  int vulkan_layer_install(const std::vector<std::string> &args) {
+    if (!is_process_elevated()) {
+      return relaunch_elevated(args);
+    }
+
+    const auto json = resolve_vulkan_layer_json(args);
+    if (!json) {
+      std::cerr << "Vulkan layer manifest not found; pass --json PATH\n";
+      return 2;
+    }
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(*json, error);
+    if (error || !std::filesystem::exists(absolute, error) || error) {
+      std::cerr << "Vulkan layer manifest not found: " << json->string() << '\n';
+      return 1;
+    }
+
+    HKEY key {};
+    LSTATUS status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersKey, 0, nullptr, 0,
+                                     KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (status != ERROR_SUCCESS) {
+      std::cerr << "open implicit layer registry key failed native_error=" << status << '\n';
+      return 1;
+    }
+    const DWORD zero = 0;
+    status = RegSetValueExW(key, absolute.wstring().c_str(), 0, REG_DWORD,
+                            reinterpret_cast<const BYTE *>(&zero), sizeof(zero));
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS) {
+      std::cerr << "register implicit layer failed native_error=" << status << '\n';
+      return 1;
+    }
+    std::cout << "vulkan_layer_installed=1\n";
+    std::cout << "vulkan_layer_json=" << absolute.string() << '\n';
+    return 0;
+  }
+
+  std::vector<std::wstring> enumerate_layer_registrations() {
+    std::vector<std::wstring> matches;
+    HKEY key {};
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+      return matches;
+    }
+    for (DWORD index = 0;; ++index) {
+      wchar_t name[1024] {};
+      DWORD name_length = static_cast<DWORD>(std::size(name));
+      const LSTATUS status = RegEnumValueW(key, index, name, &name_length, nullptr, nullptr, nullptr, nullptr);
+      if (status != ERROR_SUCCESS) {
+        break;
+      }
+      const std::filesystem::path entry {name};
+      if (entry.filename().wstring() == kVulkanLayerJsonFileName) {
+        matches.emplace_back(name);
+      }
+    }
+    RegCloseKey(key);
+    return matches;
+  }
+
+  int vulkan_layer_uninstall(const std::vector<std::string> &args) {
+    if (!is_process_elevated()) {
+      return relaunch_elevated(args);
+    }
+
+    const auto matches = enumerate_layer_registrations();
+    HKEY key {};
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kVulkanImplicitLayersKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+      std::cout << "vulkan_layer_removed=0\n";
+      return 0;
+    }
+    int removed = 0;
+    for (const auto &value : matches) {
+      if (RegDeleteValueW(key, value.c_str()) == ERROR_SUCCESS) {
+        ++removed;
+      }
+    }
+    RegCloseKey(key);
+    std::cout << "vulkan_layer_removed=" << removed << '\n';
+    return 0;
+  }
+
+  int vulkan_layer_status() {
+    const auto matches = enumerate_layer_registrations();
+    std::cout << "vulkan_layer_registrations=" << matches.size() << '\n';
+    for (const auto &value : matches) {
+      const std::filesystem::path entry {value};
+      std::error_code error;
+      const bool exists = std::filesystem::exists(entry, error) && !error;
+      std::wcout << L"vulkan_layer_json=" << value << L" present=" << (exists ? 1 : 0) << L'\n';
+    }
+    return 0;
+  }
+
   BrokerResponse request_broker(const std::string_view command) {
     LocalHandle pipe {CreateFileW(
       kBrokerPipeName,
@@ -1742,6 +1865,25 @@ int main(int argc, char **argv) {
       return install_driver(args);
     }
 
+    print_usage();
+    return 2;
+  }
+
+  if (args[0] == "vulkan-layer") {
+#ifdef _WIN32
+    if (args.size() >= 2 && args[1] == "install") {
+      return vulkan_layer_install(args);
+    }
+    if (args.size() == 2 && args[1] == "uninstall") {
+      return vulkan_layer_uninstall(args);
+    }
+    if (args.size() == 2 && args[1] == "status") {
+      return vulkan_layer_status();
+    }
+#else
+    std::cerr << "Vulkan layer management is only supported on Windows.\n";
+    return 1;
+#endif
     print_usage();
     return 2;
   }

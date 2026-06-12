@@ -65,6 +65,7 @@ The ZIP contains:
 - `tools/virtualdisplay.exe`
 - `tools/virtualdisplay_broker.exe`
 - `tools/virtualdisplay_probe.exe`
+- `vulkan-layer/VkLayer_sunshine_hdr.dll` and `vulkan-layer/VkLayer_sunshine_hdr.json`
 - `README.md` and `LICENSE`
 
 GitHub Actions publishes the same Windows x64 ZIP when a `v*` tag is pushed,
@@ -174,6 +175,37 @@ The driver validates modes against the protocol range:
 - height: `200` through `16384`
 - physical width and height: `10 mm` through `2550 mm`
 - refresh: any positive millihertz value accepted by the protocol; the driver no longer applies a policy refresh-rate ceiling
+
+### Vulkan HDR layer
+
+Vendor Vulkan ICDs (NVIDIA, Intel) only advertise HDR surface formats for
+displays driven by their own display pipeline. Indirect (IddCx) displays are
+owned by the virtual display adapter, so windowed Vulkan applications never
+see `VK_COLOR_SPACE_HDR10_ST2084_EXT` or
+`VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` on a virtual display even when
+Windows runs it in HDR mode — while the same ICDs present those colorspaces
+correctly when asked (verified by reading back DWM's FP16 scRGB composition
+through Desktop Duplication). DirectX HDR is unaffected; this gap is specific
+to Vulkan surface-format enumeration.
+
+`VK_LAYER_SUNSHINE_virtual_hdr` is an implicit Vulkan layer that closes the
+gap: it appends the two missing HDR format pairs to
+`vkGetPhysicalDeviceSurfaceFormats(2)KHR` results when the surface's monitor
+reports HDR support in Windows and the ICD did not already advertise them.
+Register it system-wide with:
+
+```powershell
+.\tools\virtualdisplay.exe vulkan-layer install
+.\tools\virtualdisplay.exe vulkan-layer status
+.\tools\virtualdisplay.exe vulkan-layer uninstall
+```
+
+`vulkan-layer install` self-elevates and registers the manifest from the
+`vulkan-layer` directory of the extracted release (or next to the CLI in a
+build tree); pass `--json PATH` to register a different manifest. Set
+`DISABLE_SUNSHINE_VIRTUAL_HDR=1` to disable the layer per-process, or
+`SUNSHINE_VHDR_FORCE=1` to inject the formats regardless of the monitor's
+reported HDR support.
 
 Use `virtualdisplay_probe.exe` for diagnostics and runtime validation rather
 than normal display management. Common commands are:

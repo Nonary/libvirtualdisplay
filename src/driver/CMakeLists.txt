@@ -22,6 +22,7 @@ else()
 endif()
 option(BUILD_VIRTUALDISPLAY_TOOLS "Build virtualdisplay CLI and broker executables" ${_libvirtualdisplay_tool_default})
 option(BUILD_VIRTUALDISPLAY_PROBE "Build virtual display driver probe executable" ${_libvirtualdisplay_tool_default})
+option(BUILD_VIRTUALDISPLAY_VULKAN_LAYER "Build the Vulkan implicit layer that exposes HDR surface formats on virtual displays" ${_libvirtualdisplay_tool_default})
 unset(_libvirtualdisplay_tool_default)
 
 if(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER)
@@ -50,6 +51,20 @@ if(WIN32 AND BUILD_VIRTUALDISPLAY_TOOLS)
     target_compile_features(virtualdisplay_broker PRIVATE cxx_std_20)
     install(TARGETS virtualdisplay_broker RUNTIME DESTINATION tools)
     list(APPEND _libvirtualdisplay_tool_targets virtualdisplay_broker)
+endif()
+
+if(WIN32 AND BUILD_VIRTUALDISPLAY_VULKAN_LAYER)
+    add_library(vk_layer_sunshine_hdr SHARED vulkan_layer/vk_layer_sunshine_hdr.cpp)
+    set_target_properties(vk_layer_sunshine_hdr PROPERTIES OUTPUT_NAME "VkLayer_sunshine_hdr" PREFIX "")
+    target_link_libraries(vk_layer_sunshine_hdr PRIVATE user32)
+    target_compile_features(vk_layer_sunshine_hdr PRIVATE cxx_std_20)
+    add_custom_command(TARGET vk_layer_sunshine_hdr POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_layer/VkLayer_sunshine_hdr.json"
+            "$<TARGET_FILE_DIR:vk_layer_sunshine_hdr>/VkLayer_sunshine_hdr.json")
+    install(TARGETS vk_layer_sunshine_hdr RUNTIME DESTINATION vulkan-layer)
+    install(FILES vulkan_layer/VkLayer_sunshine_hdr.json DESTINATION vulkan-layer)
+    list(APPEND _libvirtualdisplay_tool_targets vk_layer_sunshine_hdr)
 endif()
 
 if(_libvirtualdisplay_tool_targets)
