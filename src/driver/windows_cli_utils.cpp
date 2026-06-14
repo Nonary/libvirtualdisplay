@@ -55,6 +55,9 @@ namespace virtual_display::driver {
         return {DriverInstallInfPathStatus::MissingInfValue, {}, arg};
       }
       const auto &inf_value = args[++index];
+      if (inf_value.empty()) {
+        return {DriverInstallInfPathStatus::InvalidInfPath, {}, inf_value};
+      }
       std::error_code path_error;
       inf_path = std::filesystem::absolute(inf_value, path_error);
       if (path_error || inf_path.empty()) {

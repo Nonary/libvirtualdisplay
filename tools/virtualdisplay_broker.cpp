@@ -1,4 +1,5 @@
 #include "virtual_display/driver/control_client.h"
+#include "virtual_display/driver/broker_commands.h"
 #include "virtual_display/driver/display_identity.h"
 #include "virtual_display/driver/lease_store.h"
 #include "virtual_display/driver/windows_control_client.h"
@@ -6,17 +7,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <charconv>
-#include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -62,16 +59,6 @@ namespace {
       << "  --service\n";
   }
 
-  std::string trim_command(std::string value) {
-    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' || value.back() == ' ')) {
-      value.pop_back();
-    }
-    while (!value.empty() && value.front() == ' ') {
-      value.erase(value.begin());
-    }
-    return value;
-  }
-
   std::string format_status(const vdd::ControlOperationResult &result) {
     std::string text {vdd::to_string(result.status)};
     if (result.native_error != 0) {
@@ -83,331 +70,6 @@ namespace {
   template<class T>
   std::string format_status(const vdd::ControlResult<T> &result) {
     return format_status(vdd::ControlOperationResult {result.status, result.native_error});
-  }
-
-  bool parse_u32(const std::string_view value, std::uint32_t &parsed) {
-    std::uint32_t output {};
-    const auto *begin = value.data();
-    const auto *end = value.data() + value.size();
-    const auto result = std::from_chars(begin, end, output);
-    if (result.ec != std::errc {} || result.ptr != end) {
-      return false;
-    }
-    parsed = output;
-    return true;
-  }
-
-  bool parse_i32(const std::string_view value, std::int32_t &parsed) {
-    std::int32_t output {};
-    const auto *begin = value.data();
-    const auto *end = value.data() + value.size();
-    const auto result = std::from_chars(begin, end, output);
-    if (result.ec != std::errc {} || result.ptr != end) {
-      return false;
-    }
-    parsed = output;
-    return true;
-  }
-
-  bool is_luid_text(const std::string_view value) {
-    const auto separator = value.find(':');
-    if (separator == std::string_view::npos || separator == 0 || separator + 1 >= value.size()) {
-      return false;
-    }
-
-    std::int32_t high {};
-    std::uint32_t low {};
-    return parse_i32(value.substr(0, separator), high) && parse_u32(value.substr(separator + 1), low);
-  }
-
-  bool is_u32_text(const std::string_view value) {
-    std::uint32_t parsed {};
-    return parse_u32(value, parsed);
-  }
-
-  std::vector<std::string_view> split_words(const std::string_view text, const std::size_t max_words) {
-    std::vector<std::string_view> words;
-    std::size_t cursor = 0;
-    while (cursor < text.size() && words.size() < max_words) {
-      while (cursor < text.size() && text[cursor] == ' ') {
-        ++cursor;
-      }
-      if (cursor >= text.size()) {
-        break;
-      }
-
-      const auto begin = cursor;
-      while (cursor < text.size() && text[cursor] != ' ') {
-        ++cursor;
-      }
-      words.emplace_back(text.substr(begin, cursor - begin));
-    }
-    return words;
-  }
-
-  std::string display_name(const char (&value)[vdd::kDisplayNameChars]) {
-    return std::string {vdd::trim_display_name(value)};
-  }
-
-  std::string escape_key_value(const std::string_view value) {
-    constexpr char kHex[] = "0123456789ABCDEF";
-    std::string output;
-    output.reserve(value.size());
-    for (const unsigned char ch : value) {
-      if (ch == '\\') {
-        output += "\\\\";
-      } else if (ch == '\n') {
-        output += "\\n";
-      } else if (ch == '\r') {
-        output += "\\r";
-      } else if (ch == '\t') {
-        output += "\\t";
-      } else if (ch < 0x20 || ch == 0x7f) {
-        output += "\\x";
-        output += kHex[ch >> 4];
-        output += kHex[ch & 0x0f];
-      } else {
-        output += static_cast<char>(ch);
-      }
-    }
-    return output;
-  }
-
-  std::string output_display_name(const char (&value)[vdd::kDisplayNameChars]) {
-    return escape_key_value(display_name(value));
-  }
-
-  std::string guid_string(const vdd::Guid &guid) {
-    char text[37] {};
-    std::snprintf(
-      text,
-      sizeof(text),
-      "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-      static_cast<unsigned int>(guid.data1),
-      static_cast<unsigned int>(guid.data2),
-      static_cast<unsigned int>(guid.data3),
-      static_cast<unsigned int>(guid.data4[0]),
-      static_cast<unsigned int>(guid.data4[1]),
-      static_cast<unsigned int>(guid.data4[2]),
-      static_cast<unsigned int>(guid.data4[3]),
-      static_cast<unsigned int>(guid.data4[4]),
-      static_cast<unsigned int>(guid.data4[5]),
-      static_cast<unsigned int>(guid.data4[6]),
-      static_cast<unsigned int>(guid.data4[7])
-    );
-    return text;
-  }
-
-  const char *display_kind(const std::uint32_t kind) {
-    if (kind == vdd::kDisplayStateKindPermanent) {
-      return "permanent";
-    }
-    if (kind == vdd::kDisplayStateKindTemporary) {
-      return "temporary";
-    }
-    return "unknown";
-  }
-
-  void set_display_name(char (&target)[vdd::kDisplayNameChars], const std::string_view name) {
-    std::fill(std::begin(target), std::end(target), '\0');
-    std::memcpy(target, name.data(), (std::min)(name.size(), static_cast<std::size_t>(vdd::kDisplayNameChars - 1)));
-  }
-
-  std::string format_permanent_state(const vdd::PermanentDisplayCountResult &state) {
-    std::ostringstream output;
-    output
-      << "permanent_displays=" << state.current_display_count << '\n'
-      << "max_permanent_displays=" << state.max_display_count << '\n'
-      << "temporary_displays=" << state.temporary_display_count << '\n'
-      << "mode=" << state.width << 'x' << state.height << '@'
-      << (state.refresh_rate_millihz / 1000.0) << "Hz\n"
-      << "physical_size_mm=" << state.physical_width_mm << 'x' << state.physical_height_mm << '\n'
-      << "name=" << output_display_name(state.display_name) << '\n';
-    return output.str();
-  }
-
-  std::string format_display_state(const vdd::QueryDisplayStateResult &state) {
-    std::ostringstream output;
-    output
-      << "permanent_displays=" << state.permanent_display_count << '\n'
-      << "temporary_displays=" << state.temporary_display_count << '\n'
-      << "display_entries=" << state.entry_count << '\n';
-
-    for (std::uint32_t index = 0; index < state.entry_count && index < vdd::kMaxDisplayStateEntries; ++index) {
-      const auto &entry = state.entries[index];
-      output
-        << "display." << index << ".kind=" << display_kind(entry.kind) << '\n'
-        << "display." << index << ".display_id=" << entry.display_id << '\n'
-        << "display." << index << ".lease_id=" << entry.lease_id << '\n'
-        << "display." << index << ".connector_index=" << entry.connector_index << '\n'
-        << "display." << index << ".container_id=" << guid_string(entry.container_id) << '\n'
-        << "display." << index << ".product_code=" << entry.product_code << '\n'
-        << "display." << index << ".serial_number=" << entry.serial_number << '\n'
-        << "display." << index << ".mode=" << entry.width << 'x' << entry.height << '@'
-        << (entry.refresh_rate_millihz / 1000.0) << "Hz\n"
-        << "display." << index << ".physical_size_mm=" << entry.physical_width_mm << 'x'
-        << entry.physical_height_mm << '\n'
-        << "display." << index << ".hdr_supported="
-        << ((entry.flags & vdd::kDisplayStateFlagHdrSupported) ? 1 : 0) << '\n'
-        << "display." << index << ".retain_identity="
-        << ((entry.flags & vdd::kDisplayStateFlagRetainIdentity) ? 1 : 0) << '\n'
-        << "display." << index << ".name=" << output_display_name(entry.display_name) << '\n';
-    }
-
-    return output.str();
-  }
-
-  std::string format_display_manifest(const vdd::DisplayManifest &manifest) {
-    std::ostringstream output;
-    output
-      << "manifest_version=" << manifest.version << '\n'
-      << "manifest_profiles=" << manifest.profile_count << '\n'
-      << "manifest_max_profiles=" << manifest.max_profile_count << '\n';
-
-    for (std::uint32_t index = 0; index < manifest.profile_count && index < vdd::kMaxPermanentDisplayProfiles; ++index) {
-      const auto &profile = manifest.profiles[index];
-      const bool mode_valid =
-        profile.allowed_mode_count > 0 &&
-        profile.allowed_mode_count <= vdd::kMaxAllowedModesPerProfile &&
-        profile.native_mode_index < profile.allowed_mode_count;
-      const auto mode = mode_valid ? profile.allowed_modes[profile.native_mode_index] : vdd::DisplayMode {};
-      output
-        << "profile." << index << ".connector_index=" << profile.connector_index << '\n'
-        << "profile." << index << ".display_id=" << profile.display_id << '\n'
-        << "profile." << index << ".container_id=" << guid_string(profile.container_id) << '\n'
-        << "profile." << index << ".product_code=" << profile.product_code << '\n'
-        << "profile." << index << ".serial_number=" << profile.serial_number << '\n'
-        << "profile." << index << ".mode=";
-      if (mode_valid) {
-        output << mode.width << 'x' << mode.height << '@'
-               << (mode.refresh_rate_millihz / 1000.0) << "Hz\n";
-      } else {
-        output << "invalid\n";
-      }
-      output
-        << "profile." << index << ".physical_size_mm=" << profile.physical_width_mm << 'x'
-        << profile.physical_height_mm << '\n'
-        << "profile." << index << ".hdr_supported="
-        << ((profile.flags & vdd::kDisplayManifestProfileFlagHdrSupported) ? 1 : 0) << '\n'
-        << "profile." << index << ".retain_identity="
-        << ((profile.flags & vdd::kDisplayManifestProfileFlagRetainIdentity) ? 1 : 0) << '\n'
-        << "profile." << index << ".layout_policy=" << profile.layout_policy << '\n'
-        << "profile." << index << ".position=" << profile.position_x << ',' << profile.position_y << '\n'
-        << "profile." << index << ".name=" << output_display_name(profile.display_name) << '\n';
-    }
-
-    return output.str();
-  }
-
-  std::optional<vdd::PermanentDisplayCountRequest> parse_permanent_set_command(const std::string_view command) {
-    constexpr std::string_view prefix {"permanent-set "};
-    if (!command.starts_with(prefix)) {
-      return std::nullopt;
-    }
-
-    const auto payload = command.substr(prefix.size());
-    const auto fields = split_words(payload, 6);
-    if (fields.size() != 6) {
-      return std::nullopt;
-    }
-
-    std::size_t name_offset = 0;
-    for (const auto field: fields) {
-      name_offset = static_cast<std::size_t>((field.data() + field.size()) - payload.data());
-    }
-    while (name_offset < payload.size() && payload[name_offset] == ' ') {
-      ++name_offset;
-    }
-    if (name_offset >= payload.size()) {
-      return std::nullopt;
-    }
-
-    vdd::PermanentDisplayCountRequest request {};
-    if (!parse_u32(fields[0], request.display_count) ||
-        !parse_u32(fields[1], request.width) ||
-        !parse_u32(fields[2], request.height) ||
-        !parse_u32(fields[3], request.physical_width_mm) ||
-        !parse_u32(fields[4], request.physical_height_mm) ||
-        !parse_u32(fields[5], request.refresh_rate_millihz)) {
-      return std::nullopt;
-    }
-    set_display_name(request.display_name, payload.substr(name_offset));
-    return request;
-  }
-
-  std::optional<vdd::DisplayManifestProfile> parse_manifest_profile_set_command(const std::string_view command) {
-    constexpr std::string_view prefix {"manifest-profile-set "};
-    if (!command.starts_with(prefix)) {
-      return std::nullopt;
-    }
-
-    const auto payload = command.substr(prefix.size());
-    const auto fields = split_words(payload, 10);
-    if (fields.size() != 10) {
-      return std::nullopt;
-    }
-
-    std::size_t name_offset = 0;
-    for (const auto field: fields) {
-      name_offset = static_cast<std::size_t>((field.data() + field.size()) - payload.data());
-    }
-    while (name_offset < payload.size() && payload[name_offset] == ' ') {
-      ++name_offset;
-    }
-    if (name_offset >= payload.size()) {
-      return std::nullopt;
-    }
-
-    std::uint32_t slot {};
-    std::uint32_t width {};
-    std::uint32_t height {};
-    std::uint32_t physical_width_mm {};
-    std::uint32_t physical_height_mm {};
-    std::uint32_t refresh_rate_millihz {};
-    std::uint32_t hdr_supported {};
-    std::uint32_t layout_policy {};
-    std::int32_t position_x {};
-    std::int32_t position_y {};
-    if (!parse_u32(fields[0], slot) ||
-        !parse_u32(fields[1], width) ||
-        !parse_u32(fields[2], height) ||
-        !parse_u32(fields[3], physical_width_mm) ||
-        !parse_u32(fields[4], physical_height_mm) ||
-        !parse_u32(fields[5], refresh_rate_millihz) ||
-        !parse_u32(fields[6], hdr_supported) ||
-        !parse_u32(fields[7], layout_policy) ||
-        !parse_i32(fields[8], position_x) ||
-        !parse_i32(fields[9], position_y)) {
-      return std::nullopt;
-    }
-
-    vdd::DisplayManifestProfile profile {};
-    profile.flags = vdd::kDisplayManifestProfileFlagRetainIdentity |
-      vdd::kDisplayManifestProfileFlagPermanentIdentity;
-    if (hdr_supported != 0) {
-      profile.flags |= vdd::kDisplayManifestProfileFlagHdrSupported;
-    }
-    profile.connector_index = slot;
-    profile.display_id = vdd::permanent_display_id(slot);
-    profile.container_id = vdd::container_guid_from_display_id(profile.display_id);
-    std::copy(
-      std::begin(vdd::kSunshineDriverManufacturerId),
-      std::end(vdd::kSunshineDriverManufacturerId),
-      std::begin(profile.manufacturer_id)
-    );
-    profile.product_code = vdd::permanent_product_code(slot);
-    profile.serial_number = vdd::serial_number_from_display_id(profile.display_id);
-    profile.physical_width_mm = physical_width_mm;
-    profile.physical_height_mm = physical_height_mm;
-    profile.native_mode_index = 0;
-    profile.allowed_mode_count = 1;
-    profile.layout_policy = layout_policy;
-    profile.position_x = position_x;
-    profile.position_y = position_y;
-    profile.orientation = vdd::kDisplayManifestOrientationDefault;
-    profile.allowed_modes[0] = vdd::DisplayMode {width, height, refresh_rate_millihz};
-    set_display_name(profile.display_name, payload.substr(name_offset));
-    return profile;
   }
 
 #ifdef _WIN32
@@ -771,15 +433,6 @@ namespace {
     }
   }
 
-  std::wstring widen_ascii(const std::string_view text) {
-    std::wstring wide;
-    wide.reserve(text.size());
-    for (const unsigned char ch: text) {
-      wide.push_back(static_cast<wchar_t>(ch));
-    }
-    return wide;
-  }
-
   void report_event_log(const WORD type, const DWORD event_id, const std::wstring_view text) {
     HANDLE source = RegisterEventSourceW(nullptr, kServiceName);
     if (!source) {
@@ -803,7 +456,7 @@ namespace {
   }
 
   void report_event_log(const WORD type, const DWORD event_id, const std::string_view text) {
-    report_event_log(type, event_id, widen_ascii(text));
+    report_event_log(type, event_id, vdd::widen_ascii(text));
   }
 
   void report_service_status(const DWORD state, const DWORD win32_exit_code = NO_ERROR) {
@@ -835,31 +488,6 @@ namespace {
     }
     value.resize(slash);
     return value;
-  }
-
-  std::wstring quote_argument(const std::wstring &value) {
-    std::wstring quoted {L"\""};
-    std::size_t backslashes = 0;
-    for (wchar_t ch: value) {
-      if (ch == L'"') {
-        quoted.append(backslashes * 2 + 1, L'\\');
-        quoted += ch;
-        backslashes = 0;
-        continue;
-      }
-      if (ch == L'\\') {
-        ++backslashes;
-        continue;
-      }
-      if (backslashes != 0) {
-        quoted.append(backslashes, L'\\');
-        backslashes = 0;
-      }
-      quoted += ch;
-    }
-    quoted.append(backslashes * 2, L'\\');
-    quoted += L'"';
-    return quoted;
   }
 
   std::optional<DWORD> pipe_client_session_id(HANDLE pipe) {
@@ -943,7 +571,7 @@ namespace {
     }
 
     const std::wstring helper_path = directory + L"\\" + kSessionHelperExecutable;
-    std::wstring command_line = quote_argument(helper_path);
+    std::wstring command_line = vdd::quote_broker_argument(helper_path);
     if (!arguments.empty()) {
       command_line += L" ";
       command_line += arguments;
@@ -1009,87 +637,6 @@ namespace {
     return {exit_code, output};
   }
 
-  std::optional<std::wstring> helper_arguments_for_broker_command(const std::string_view command) {
-    if (command == "helper-diagnose") {
-      return L"--diagnose";
-    }
-    if (command == "helper-apply-extended-topology") {
-      return L"--apply-extended-topology";
-    }
-    if (command == "helper-apply-manifest-topology") {
-      return L"--apply-manifest-topology";
-    }
-    if (command == "helper-query-color-profiles") {
-      return L"--query-color-profiles";
-    }
-    if (command == "helper-stress-capture-remove") {
-      return L"--stress-capture-remove";
-    }
-    constexpr std::string_view stress_prefix {"helper-stress-capture-remove "};
-    if (command.starts_with(stress_prefix)) {
-      const auto payload = command.substr(stress_prefix.size());
-      const auto fields = split_words(payload, 5);
-      if (fields.size() != 4) {
-        return std::nullopt;
-      }
-      for (const auto field: fields) {
-        if (!is_u32_text(field)) {
-          return std::nullopt;
-        }
-      }
-
-      std::wstring arguments = quote_argument(L"--stress-capture-remove");
-      for (const auto field: fields) {
-        arguments += L" ";
-        arguments += quote_argument(widen_ascii(field));
-      }
-      return arguments;
-    }
-    constexpr std::string_view associate_prefix {"helper-associate-color-profile "};
-    if (command.starts_with(associate_prefix)) {
-      const auto payload = command.substr(associate_prefix.size());
-      const auto fields = split_words(payload, 4);
-      if (fields.size() != 4) {
-        return std::nullopt;
-      }
-
-      std::size_t profile_offset = 0;
-      for (const auto field: fields) {
-        profile_offset = static_cast<std::size_t>((field.data() + field.size()) - payload.data());
-      }
-      while (profile_offset < payload.size() && payload[profile_offset] == ' ') {
-        ++profile_offset;
-      }
-      if (profile_offset >= payload.size()) {
-        return std::nullopt;
-      }
-
-      if (!is_luid_text(fields[0]) || !is_u32_text(fields[1])) {
-        return std::nullopt;
-      }
-
-      std::wstring arguments = quote_argument(L"--associate-color-profile");
-      arguments += L" ";
-      arguments += quote_argument(widen_ascii(fields[0]));
-      arguments += L" ";
-      arguments += quote_argument(widen_ascii(fields[1]));
-      arguments += L" ";
-      arguments += quote_argument(widen_ascii(payload.substr(profile_offset)));
-      if (fields[2] == "advanced") {
-        arguments += L" --advanced-color";
-      } else if (fields[2] != "standard") {
-        return std::nullopt;
-      }
-      if (fields[3] == "default") {
-        arguments += L" --default";
-      } else if (fields[3] != "nodefault") {
-        return std::nullopt;
-      }
-      return arguments;
-    }
-    return std::nullopt;
-  }
-
   std::string handle_command(vdd::ControlClient &client, HANDLE pipe, const std::string_view command) {
     if (command == "protocol") {
       const auto result = client.query_protocol_version();
@@ -1116,7 +663,7 @@ namespace {
       if (!result.ok()) {
         return "error " + format_status(result) + "\n";
       }
-      return "ok\n" + format_display_state(result.value);
+      return "ok\n" + vdd::format_display_state(result.value);
     }
 
     if (command == "query-manifest") {
@@ -1124,7 +671,7 @@ namespace {
       if (!result.ok()) {
         return "error " + format_status(result) + "\n";
       }
-      return "ok\n" + format_display_manifest(result.value);
+      return "ok\n" + vdd::format_display_manifest(result.value);
     }
 
     if (command == "permanent-query") {
@@ -1132,11 +679,11 @@ namespace {
       if (!result.ok()) {
         return "error " + format_status(result) + "\n";
       }
-      return "ok\n" + format_permanent_state(result.value);
+      return "ok\n" + vdd::format_permanent_state(result.value);
     }
 
     if (command.starts_with("manifest-profile-set ")) {
-      const auto profile = parse_manifest_profile_set_command(command);
+      const auto profile = vdd::parse_manifest_profile_set_command(command);
       if (!profile) {
         return "error invalid_manifest_profile_set\n";
       }
@@ -1183,11 +730,11 @@ namespace {
         (void) save_display_manifest(original_manifest, current.value.max_display_count);
         return "error " + format_status(applied) + "\n";
       }
-      return "ok\n" + format_display_manifest(applied.value);
+      return "ok\n" + vdd::format_display_manifest(applied.value);
     }
 
     if (command.starts_with("permanent-set ")) {
-      const auto request = parse_permanent_set_command(command);
+      const auto request = vdd::parse_permanent_set_command(command);
       if (!request) {
         return "error invalid_permanent_set\n";
       }
@@ -1211,10 +758,10 @@ namespace {
       if (!result.ok()) {
         return "error " + format_status(result) + "\n";
       }
-      return "ok\n" + format_permanent_state(result.value);
+      return "ok\n" + vdd::format_permanent_state(result.value);
     }
 
-    if (const auto helper_arguments = helper_arguments_for_broker_command(command)) {
+    if (const auto helper_arguments = vdd::helper_arguments_for_broker_command(command)) {
       const auto session_id = pipe_client_session_id(pipe);
       if (!session_id) {
         return "error client_session_failed\n";
@@ -1284,7 +831,7 @@ namespace {
       response = "error read_failed\n";
     } else {
       input[(std::min<DWORD>)(bytes_read, sizeof(input) - 1)] = '\0';
-      response = handle_command(client, pipe, trim_command(input));
+      response = handle_command(client, pipe, vdd::trim_broker_command(input));
     }
 
     DWORD bytes_written = 0;
@@ -1372,10 +919,12 @@ namespace {
     }
 
     while (!g_context.stop_requested.load(std::memory_order_acquire)) {
+      const auto pipe_policy = vdd::broker_pipe_server_policy();
+      const DWORD pipe_mode = static_cast<DWORD>(vdd::broker_pipe_mode(pipe_policy));
       HANDLE pipe = CreateNamedPipeW(
         kPipeName,
         PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        pipe_mode,
         1,
         kPipeBufferBytes,
         kPipeBufferBytes,
@@ -1394,12 +943,19 @@ namespace {
 
       const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : GetLastError() == ERROR_PIPE_CONNECTED;
       if (connected && !g_context.stop_requested.load(std::memory_order_acquire)) {
-        if (authorize_pipe_client(pipe)) {
+        const bool client_authorized = !pipe_policy.require_client_authorization || authorize_pipe_client(pipe);
+        if (vdd::broker_pipe_should_serve_client(pipe_policy, client_authorized)) {
           serve_pipe_client(pipe, client);
         } else {
-          const char response[] = "error access_denied\n";
+          const auto response = vdd::broker_pipe_rejection_response(pipe_policy);
           DWORD bytes_written = 0;
-          (void) WriteFile(pipe, response, sizeof(response) - 1, &bytes_written, nullptr);
+          (void) WriteFile(
+            pipe,
+            response.data(),
+            static_cast<DWORD>(response.size()),
+            &bytes_written,
+            nullptr
+          );
           FlushFileBuffers(pipe);
         }
       }

@@ -1,17 +1,12 @@
 #include "virtual_display/driver/control_client.h"
+#include "virtual_display/driver/cli_commands.h"
 #include "virtual_display/driver/windows_control_client.h"
 #include "virtual_display/driver/windows_cli_utils.h"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
-#include <cerrno>
-#include <cctype>
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cwchar>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -37,21 +32,7 @@ namespace {
   constexpr std::string_view kDriverInstallSubcommand {"install"};
 
   void print_usage() {
-    std::cout
-      << "virtualdisplay commands:\n"
-      << "  driver install [--inf PATH]\n"
-      << "  vulkan-layer install [--json PATH] | uninstall | status\n"
-      << "  broker install|start|stop|status|uninstall\n"
-      << "  broker protocol|query-state|query-manifest|helper-diagnose|helper-apply-extended-topology|helper-apply-manifest-topology|helper-query-color-profiles\n"
-      << "  broker helper-associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]\n"
-      << "  broker helper-stress-capture-remove [iterations width height refresh_hz]\n"
-      << "  status\n"
-      << "  display query\n"
-      << "  spawn [--width N] [--height N] [--physical-width-mm N] [--physical-height-mm N] [--refresh HZ] [--name TEXT]\n"
-      << "  permanent query\n"
-      << "  permanent set --count N [--width N] [--height N] [--physical-width-mm N] [--physical-height-mm N] [--refresh HZ] [--name TEXT]\n"
-      << "  permanent profile set --slot N [--width N] [--height N] [--physical-width-mm N] [--physical-height-mm N] [--refresh HZ] [--name TEXT] [--layout none|apply|persist] [--x N] [--y N] [--hdr 0|1]\n"
-      << "  permanent off\n";
+    std::cout << vdd::cli_usage_text();
   }
 
   int fail(const std::string &message, const vdd::ControlOperationResult &result) {
@@ -1363,71 +1344,6 @@ namespace {
     return fail(message, {result.status, result.native_error});
   }
 
-  bool parse_u32(const std::string_view value, std::uint32_t &parsed) {
-    std::uint32_t output {};
-    const auto *begin = value.data();
-    const auto *end = value.data() + value.size();
-    const auto result = std::from_chars(begin, end, output);
-    if (result.ec != std::errc {} || result.ptr != end) {
-      return false;
-    }
-    parsed = output;
-    return true;
-  }
-
-  bool parse_i32(const std::string_view value, std::int32_t &parsed) {
-    std::int32_t output {};
-    const auto *begin = value.data();
-    const auto *end = value.data() + value.size();
-    const auto result = std::from_chars(begin, end, output);
-    if (result.ec != std::errc {} || result.ptr != end) {
-      return false;
-    }
-    parsed = output;
-    return true;
-  }
-
-  bool parse_refresh_millihz(const std::string_view value, std::uint32_t &parsed) {
-    std::string text {value};
-    if (text.empty() || std::any_of(text.begin(), text.end(), [](const unsigned char ch) {
-          return std::isspace(ch) != 0;
-        })) {
-      return false;
-    }
-
-    errno = 0;
-    char *end = nullptr;
-    const double refresh = std::strtod(text.c_str(), &end);
-    if (errno == ERANGE || end != text.c_str() + text.size() || !std::isfinite(refresh) || refresh <= 0.0) {
-      return false;
-    }
-
-    const double millihz = refresh <= 1000.0 ? refresh * 1000.0 : refresh;
-    if (!std::isfinite(millihz) ||
-        millihz < 1.0 ||
-        millihz > static_cast<double>((std::numeric_limits<std::uint32_t>::max)())) {
-      return false;
-    }
-
-    parsed = static_cast<std::uint32_t>(millihz);
-    return true;
-  }
-
-  void set_display_name(char (&target)[vdd::kDisplayNameChars], const std::string &name) {
-    std::fill(std::begin(target), std::end(target), '\0');
-    std::memcpy(target, name.data(), (std::min)(name.size(), static_cast<std::size_t>(vdd::kDisplayNameChars - 1)));
-  }
-
-  bool is_safe_display_name(const std::string_view value) {
-    if (value.empty() || value.size() >= vdd::kDisplayNameChars) {
-      return false;
-    }
-
-    return std::none_of(value.begin(), value.end(), [](const unsigned char ch) {
-      return ch < 0x20 || ch == 0x7f;
-    });
-  }
-
   std::string display_name(const char (&value)[vdd::kDisplayNameChars]) {
     return std::string {vdd::trim_display_name(value)};
   }
@@ -1535,308 +1451,8 @@ namespace {
     }
   }
 
-  struct PermanentOptions {
-    std::uint32_t count {1};
-    std::uint32_t width {1920};
-    std::uint32_t height {1080};
-    std::uint32_t physical_width_mm {vdd::kDefaultPhysicalWidthMillimeters};
-    std::uint32_t physical_height_mm {vdd::kDefaultPhysicalHeightMillimeters};
-    std::uint32_t refresh_rate_millihz {60'000};
-    std::string name {"Sunshine Display"};
-  };
-
-  struct ProfileOptions: PermanentOptions {
-    std::uint32_t slot {};
-    std::uint32_t hdr_supported {1};
-    std::uint32_t layout_policy {vdd::kDisplayManifestLayoutPolicyNone};
-    std::int32_t position_x {};
-    std::int32_t position_y {};
-  };
-
-#ifdef _WIN32
-  std::string permanent_set_broker_command(const PermanentOptions &options) {
-    std::ostringstream command;
-    command
-      << "permanent-set " << options.count
-      << ' ' << options.width
-      << ' ' << options.height
-      << ' ' << options.physical_width_mm
-      << ' ' << options.physical_height_mm
-      << ' ' << options.refresh_rate_millihz
-      << ' ' << options.name;
-    return command.str();
-  }
-
-  std::string manifest_profile_set_broker_command(const ProfileOptions &options) {
-    std::ostringstream command;
-    command
-      << "manifest-profile-set " << options.slot
-      << ' ' << options.width
-      << ' ' << options.height
-      << ' ' << options.physical_width_mm
-      << ' ' << options.physical_height_mm
-      << ' ' << options.refresh_rate_millihz
-      << ' ' << options.hdr_supported
-      << ' ' << options.layout_policy
-      << ' ' << options.position_x
-      << ' ' << options.position_y
-      << ' ' << options.name;
-    return command.str();
-  }
-
-  std::optional<std::string> color_profile_association_broker_command(const std::vector<std::string> &args) {
-    if (args.size() < 5) {
-      return std::nullopt;
-    }
-
-    bool advanced_color = false;
-    bool set_default = false;
-    for (std::size_t index = 5; index < args.size(); ++index) {
-      if (args[index] == "--advanced-color") {
-        advanced_color = true;
-      } else if (args[index] == "--default") {
-        set_default = true;
-      } else {
-        return std::nullopt;
-      }
-    }
-
-    std::ostringstream command;
-    command
-      << "helper-associate-color-profile "
-      << args[2] << ' '
-      << args[3] << ' '
-      << (advanced_color ? "advanced" : "standard") << ' '
-      << (set_default ? "default" : "nodefault") << ' '
-      << args[4];
-    return command.str();
-  }
-
-  std::optional<std::string> stress_capture_remove_broker_command(const std::vector<std::string> &args) {
-    if (args.size() == 2) {
-      return std::string {"helper-stress-capture-remove"};
-    }
-    if (args.size() != 6) {
-      return std::nullopt;
-    }
-
-    for (std::size_t index = 2; index < args.size(); ++index) {
-      std::uint32_t parsed {};
-      if (!parse_u32(args[index], parsed)) {
-        return std::nullopt;
-      }
-      if (index == 2 && parsed == 0) {
-        return std::nullopt;
-      }
-    }
-
-    std::ostringstream command;
-    command
-      << "helper-stress-capture-remove "
-      << args[2] << ' '
-      << args[3] << ' '
-      << args[4] << ' '
-      << args[5];
-    return command.str();
-  }
-#endif
-
-  std::optional<PermanentOptions> parse_permanent_options(
-    const std::vector<std::string> &args,
-    const std::size_t first,
-    const bool require_count
-  ) {
-    PermanentOptions options {};
-    bool saw_count = false;
-
-    for (std::size_t index = first; index < args.size(); ++index) {
-      const auto &arg = args[index];
-      const auto need_value = [&]() -> std::optional<std::string> {
-        if (index + 1 >= args.size()) {
-          std::cerr << arg << " requires a value\n";
-          return std::nullopt;
-        }
-        return args[++index];
-      };
-
-      if (arg == "--count") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.count)) {
-          std::cerr << "invalid --count value\n";
-          return std::nullopt;
-        }
-        saw_count = true;
-      } else if (arg == "--width") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.width)) {
-          std::cerr << "invalid --width value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--height") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.height)) {
-          std::cerr << "invalid --height value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--physical-width-mm") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.physical_width_mm)) {
-          std::cerr << "invalid --physical-width-mm value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--physical-height-mm") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.physical_height_mm)) {
-          std::cerr << "invalid --physical-height-mm value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--refresh") {
-        const auto value = need_value();
-        if (!value || !parse_refresh_millihz(*value, options.refresh_rate_millihz)) {
-          std::cerr << "invalid --refresh value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--name") {
-        const auto value = need_value();
-        if (!value || !is_safe_display_name(*value)) {
-          std::cerr << "invalid --name value\n";
-          return std::nullopt;
-        }
-        options.name = *value;
-      } else {
-        std::cerr << "unknown option: " << arg << '\n';
-        return std::nullopt;
-      }
-    }
-
-    if (require_count && !saw_count) {
-      std::cerr << "permanent set requires --count\n";
-      return std::nullopt;
-    }
-    return options;
-  }
-
-  std::optional<ProfileOptions> parse_profile_options(
-    const std::vector<std::string> &args,
-    const std::size_t first
-  ) {
-    ProfileOptions options {};
-    bool saw_slot = false;
-
-    for (std::size_t index = first; index < args.size(); ++index) {
-      const auto &arg = args[index];
-      const auto need_value = [&]() -> std::optional<std::string> {
-        if (index + 1 >= args.size()) {
-          std::cerr << arg << " requires a value\n";
-          return std::nullopt;
-        }
-        return args[++index];
-      };
-
-      if (arg == "--slot") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.slot)) {
-          std::cerr << "invalid --slot value\n";
-          return std::nullopt;
-        }
-        saw_slot = true;
-      } else if (arg == "--width") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.width)) {
-          std::cerr << "invalid --width value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--height") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.height)) {
-          std::cerr << "invalid --height value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--physical-width-mm") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.physical_width_mm)) {
-          std::cerr << "invalid --physical-width-mm value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--physical-height-mm") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.physical_height_mm)) {
-          std::cerr << "invalid --physical-height-mm value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--refresh") {
-        const auto value = need_value();
-        if (!value || !parse_refresh_millihz(*value, options.refresh_rate_millihz)) {
-          std::cerr << "invalid --refresh value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--name") {
-        const auto value = need_value();
-        if (!value || !is_safe_display_name(*value)) {
-          std::cerr << "invalid --name value\n";
-          return std::nullopt;
-        }
-        options.name = *value;
-      } else if (arg == "--layout") {
-        const auto value = need_value();
-        if (!value) {
-          return std::nullopt;
-        }
-        if (*value == "none") {
-          options.layout_policy = vdd::kDisplayManifestLayoutPolicyNone;
-        } else if (*value == "apply") {
-          options.layout_policy = vdd::kDisplayManifestLayoutPolicyApply;
-        } else if (*value == "persist") {
-          options.layout_policy = vdd::kDisplayManifestLayoutPolicyApplyAndPersist;
-        } else {
-          std::cerr << "invalid --layout value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--x") {
-        const auto value = need_value();
-        if (!value || !parse_i32(*value, options.position_x)) {
-          std::cerr << "invalid --x value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--y") {
-        const auto value = need_value();
-        if (!value || !parse_i32(*value, options.position_y)) {
-          std::cerr << "invalid --y value\n";
-          return std::nullopt;
-        }
-      } else if (arg == "--hdr") {
-        const auto value = need_value();
-        if (!value || !parse_u32(*value, options.hdr_supported) || options.hdr_supported > 1) {
-          std::cerr << "invalid --hdr value\n";
-          return std::nullopt;
-        }
-      } else {
-        std::cerr << "unknown option: " << arg << '\n';
-        return std::nullopt;
-      }
-    }
-
-    if (!saw_slot) {
-      std::cerr << "permanent profile set requires --slot\n";
-      return std::nullopt;
-    }
-    return options;
-  }
-
-  vdd::PermanentDisplayCountRequest make_request(const PermanentOptions &options) {
-    vdd::PermanentDisplayCountRequest request {};
-    request.display_count = options.count;
-    request.width = options.width;
-    request.height = options.height;
-    request.physical_width_mm = options.physical_width_mm;
-    request.physical_height_mm = options.physical_height_mm;
-    request.refresh_rate_millihz = options.refresh_rate_millihz;
-    set_display_name(request.display_name, options.name);
-    return request;
-  }
-
-  int set_permanent(vdd::ControlClient &client, const PermanentOptions &options) {
-    auto request = make_request(options);
+  int set_permanent(vdd::ControlClient &client, const vdd::PermanentOptions &options) {
+    auto request = vdd::make_permanent_count_request(options);
     const auto validation = vdd::validate_permanent_display_count(request, 64);
     if (validation != vdd::ValidationError::None && validation != vdd::ValidationError::PermanentDisplayCountTooHigh) {
       std::cerr << "invalid display settings: " << vdd::to_string(validation) << '\n';
@@ -1929,47 +1545,18 @@ int main(int argc, char **argv) {
       return 1;
 #endif
     }
-    if (args.size() == 2 &&
-        (args[1] == "protocol" ||
-         args[1] == "query-state" ||
-         args[1] == "query-manifest" ||
-         args[1] == "helper-diagnose" ||
-         args[1] == "helper-apply-extended-topology" ||
-         args[1] == "helper-apply-manifest-topology" ||
-         args[1] == "helper-query-color-profiles" ||
-         args[1] == "helper-stress-capture-remove")) {
+    const auto route = vdd::cli_broker_route_for_args(args);
+    if (route.action == vdd::CliBrokerRouteAction::QueryBrokerCommand) {
 #ifdef _WIN32
-      return query_broker(args[1]);
+      return query_broker(route.command);
 #else
       std::cerr << "broker queries are only supported on Windows.\n";
       return 1;
 #endif
     }
-    if (args.size() >= 5 && args[1] == "helper-associate-color-profile") {
-#ifdef _WIN32
-      const auto command = color_profile_association_broker_command(args);
-      if (!command) {
-        print_usage();
-        return 2;
-      }
-      return query_broker(*command);
-#else
-      std::cerr << "broker queries are only supported on Windows.\n";
-      return 1;
-#endif
-    }
-    if ((args.size() == 2 || args.size() == 6) && args[1] == "helper-stress-capture-remove") {
-#ifdef _WIN32
-      const auto command = stress_capture_remove_broker_command(args);
-      if (!command) {
-        print_usage();
-        return 2;
-      }
-      return query_broker(*command);
-#else
-      std::cerr << "broker queries are only supported on Windows.\n";
-      return 1;
-#endif
+    if (route.action == vdd::CliBrokerRouteAction::InvalidArguments) {
+      print_usage();
+      return 2;
     }
 
     print_usage();
@@ -1977,46 +1564,12 @@ int main(int argc, char **argv) {
   }
 
 #ifdef _WIN32
-  if (args[0] == "status" && args.size() == 1) {
-    return require_broker_command("permanent-query", true);
+  const auto route = vdd::cli_broker_route_for_args(args);
+  if (route.action == vdd::CliBrokerRouteAction::RequireBrokerCommand) {
+    return require_broker_command(route.command, route.print_payload);
   }
-
-  if (args[0] == "permanent" && args.size() == 2 && args[1] == "query") {
-    return require_broker_command("permanent-query", true);
-  }
-
-  if (args[0] == "display" && args.size() == 2 && args[1] == "query") {
-    return require_broker_command("display-query", true);
-  }
-
-  if (args[0] == "spawn") {
-    const auto options = parse_permanent_options(args, 1, false);
-    if (!options) {
-      return 2;
-    }
-    return require_broker_command(permanent_set_broker_command(*options), true);
-  }
-
-  if (args[0] == "permanent" && args.size() == 2 && args[1] == "off") {
-    PermanentOptions options {};
-    options.count = 0;
-    return require_broker_command(permanent_set_broker_command(options), true);
-  }
-
-  if (args[0] == "permanent" && args.size() >= 2 && args[1] == "set") {
-    const auto options = parse_permanent_options(args, 2, true);
-    if (!options) {
-      return 2;
-    }
-    return require_broker_command(permanent_set_broker_command(*options), true);
-  }
-
-  if (args[0] == "permanent" && args.size() >= 3 && args[1] == "profile" && args[2] == "set") {
-    const auto options = parse_profile_options(args, 3);
-    if (!options) {
-      return 2;
-    }
-    return require_broker_command(manifest_profile_set_broker_command(*options), true);
+  if (route.action == vdd::CliBrokerRouteAction::InvalidArguments) {
+    return 2;
   }
 #endif
 

@@ -1,4 +1,5 @@
 #include "virtual_display/driver/control_client.h"
+#include "virtual_display/driver/probe_commands.h"
 #include "virtual_display/driver/windows_control_client.h"
 
 #include <array>
@@ -121,24 +122,6 @@ namespace {
     return value;
   }
 
-  std::uint64_t saturating_mul_u64(const std::uint64_t lhs, const std::uint64_t rhs) {
-    if (lhs != 0 && rhs > (std::numeric_limits<std::uint64_t>::max)() / lhs) {
-      return (std::numeric_limits<std::uint64_t>::max)();
-    }
-    return lhs * rhs;
-  }
-
-  std::uint32_t saturating_u32(const std::uint64_t value) {
-    return static_cast<std::uint32_t>((std::min<std::uint64_t>)(
-      value,
-      (std::numeric_limits<std::uint32_t>::max)()
-    ));
-  }
-
-  std::uint32_t refresh_millihz_from_hz(const std::uint32_t refresh_hz) {
-    return saturating_u32(static_cast<std::uint64_t>(refresh_hz) * 1000ull);
-  }
-
 #ifdef _WIN32
   bool valid_display_mode_dimensions(const std::uint32_t width, const std::uint32_t height) {
     constexpr auto kMaxLong = static_cast<std::uint32_t>((std::numeric_limits<LONG>::max)());
@@ -156,7 +139,7 @@ namespace {
       return 0;
     }
 
-    return saturating_u32(
+    return vdd::saturating_u32(
       (static_cast<std::uint64_t>(rate.Numerator) * 1000ull) /
       rate.Denominator
     );
@@ -173,7 +156,7 @@ namespace {
     request.display_id = transient_id(0x51dd15c0);
     request.width = width;
     request.height = height;
-    request.refresh_rate_millihz = refresh_millihz_from_hz(refresh_hz);
+    request.refresh_rate_millihz = vdd::refresh_millihz_from_hz(refresh_hz);
     request.requested_timeout_ms = 10'000;
     std::strncpy(request.display_name, "Sunshine Probe", sizeof(request.display_name) - 1);
     return request;
@@ -193,28 +176,6 @@ namespace {
     return fail(message, {result.status, result.native_error});
   }
 
-  std::optional<std::uint32_t> parse_u32_token(const std::string_view text) {
-    std::uint32_t value {};
-    const auto *begin = text.data();
-    const auto *end = text.data() + text.size();
-    const auto result = std::from_chars(begin, end, value);
-    if (text.empty() || result.ec != std::errc {} || result.ptr != end) {
-      return std::nullopt;
-    }
-    return value;
-  }
-
-  std::optional<std::int32_t> parse_i32_token(const std::string_view text) {
-    std::int32_t value {};
-    const auto *begin = text.data();
-    const auto *end = text.data() + text.size();
-    const auto result = std::from_chars(begin, end, value);
-    if (text.empty() || result.ec != std::errc {} || result.ptr != end) {
-      return std::nullopt;
-    }
-    return value;
-  }
-
   bool read_u32_arg(
     const int argc,
     char **argv,
@@ -228,7 +189,7 @@ namespace {
       return true;
     }
 
-    const auto parsed = parse_u32_token(argv[index]);
+    const auto parsed = vdd::parse_probe_u32_token(argv[index]);
     if (!parsed) {
       std::cerr << "invalid " << label << '\n';
       return false;
@@ -237,8 +198,8 @@ namespace {
     return true;
   }
 
-  bool require_arg_count(const int argc, const int minimum, const int maximum) {
-    if (argc < minimum || argc > maximum) {
+  bool require_command_arg_count(const std::string_view command, const int argc) {
+    if (!vdd::probe_command_arg_count_valid(command, argc)) {
       print_usage();
       return false;
     }
@@ -385,28 +346,8 @@ namespace {
     LONG native_error = ERROR_SUCCESS;
   };
 
-  constexpr UINT32 kMaxDisplayConfigPaths = 128;
-  constexpr UINT32 kMaxDisplayConfigModes = 256;
-
-  bool display_config_counts_are_reasonable(const UINT32 path_count, const UINT32 mode_count) {
-    return path_count <= kMaxDisplayConfigPaths && mode_count <= kMaxDisplayConfigModes;
-  }
-
   bool same_luid(const LUID &left, const LUID &right) {
     return left.LowPart == right.LowPart && left.HighPart == right.HighPart;
-  }
-
-  bool command_uses_display_config(const std::string_view command) {
-    return command == "--apply-extended-topology" ||
-           command == "--apply-manifest-topology" ||
-           command == "--query-color-profiles" ||
-           command == "--associate-color-profile" ||
-           command == "--self-test-4k240" ||
-           command == "--self-test-hdr" ||
-           command == "--qa-temp-identity-retention" ||
-           command == "--qa-temp-lease" ||
-           command == "--stress-capture-remove" ||
-           command == "--debug-temp-config";
   }
 
   int require_active_console_session(const std::string_view command) {
@@ -441,7 +382,7 @@ namespace {
       return {std::nullopt, result};
     }
 
-    if (!display_config_counts_are_reasonable(path_count, mode_count)) {
+    if (!vdd::display_config_counts_are_reasonable(path_count, mode_count)) {
       return {std::nullopt, ERROR_INVALID_DATA};
     }
 
@@ -461,7 +402,7 @@ namespace {
         );
 
         if (result == ERROR_SUCCESS) {
-          if (!display_config_counts_are_reasonable(query_path_count, query_mode_count)) {
+          if (!vdd::display_config_counts_are_reasonable(query_path_count, query_mode_count)) {
             return {std::nullopt, ERROR_INVALID_DATA};
           }
           paths.resize(query_path_count);
@@ -475,7 +416,7 @@ namespace {
 
         const auto next_path_count = (std::max)(query_path_count, static_cast<UINT32>(paths.size() + 1));
         const auto next_mode_count = (std::max)(query_mode_count, static_cast<UINT32>(modes.size() + 1));
-        if (!display_config_counts_are_reasonable(next_path_count, next_mode_count)) {
+        if (!vdd::display_config_counts_are_reasonable(next_path_count, next_mode_count)) {
           return {std::nullopt, ERROR_INVALID_DATA};
         }
         paths.resize(next_path_count);
@@ -1043,17 +984,17 @@ namespace {
     const std::uint32_t refresh_hz
   ) {
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal {};
-    const auto total_width = saturating_u32(static_cast<std::uint64_t>(width) + width / 5u);
-    const auto total_height = saturating_u32(static_cast<std::uint64_t>(height) + height / 20u);
-    signal.pixelRate = saturating_mul_u64(
-      saturating_mul_u64(total_width, total_height),
+    const auto total_width = vdd::saturating_u32(static_cast<std::uint64_t>(width) + width / 5u);
+    const auto total_height = vdd::saturating_u32(static_cast<std::uint64_t>(height) + height / 20u);
+    signal.pixelRate = vdd::saturating_mul_u64(
+      vdd::saturating_mul_u64(total_width, total_height),
       refresh_hz
     );
-    signal.hSyncFreq.Numerator = saturating_u32(signal.pixelRate);
+    signal.hSyncFreq.Numerator = vdd::saturating_u32(signal.pixelRate);
     signal.hSyncFreq.Denominator = total_width == 0 ? 1 : total_width;
-    signal.vSyncFreq.Numerator = saturating_u32(signal.pixelRate);
-    signal.vSyncFreq.Denominator = saturating_u32(
-      (std::max<std::uint64_t>)(1, saturating_mul_u64(total_width, total_height))
+    signal.vSyncFreq.Numerator = vdd::saturating_u32(signal.pixelRate);
+    signal.vSyncFreq.Denominator = vdd::saturating_u32(
+      (std::max<std::uint64_t>)(1, vdd::saturating_mul_u64(total_width, total_height))
     );
     signal.activeSize.cx = width;
     signal.activeSize.cy = height;
@@ -1071,11 +1012,11 @@ namespace {
     const std::uint32_t refresh_hz
   ) {
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal {};
-    signal.pixelRate = saturating_mul_u64(
-      saturating_mul_u64(width, height),
+    signal.pixelRate = vdd::saturating_mul_u64(
+      vdd::saturating_mul_u64(width, height),
       refresh_hz
     );
-    signal.hSyncFreq.Numerator = saturating_u32(static_cast<std::uint64_t>(refresh_hz) * height);
+    signal.hSyncFreq.Numerator = vdd::saturating_u32(static_cast<std::uint64_t>(refresh_hz) * height);
     signal.hSyncFreq.Denominator = 1;
     signal.vSyncFreq.Numerator = refresh_hz;
     signal.vSyncFreq.Denominator = 1;
@@ -1174,7 +1115,7 @@ namespace {
     const std::uint32_t height,
     const std::uint32_t refresh_hz
   ) {
-    const auto requested_refresh = refresh_millihz_from_hz(refresh_hz);
+    const auto requested_refresh = vdd::refresh_millihz_from_hz(refresh_hz);
     const auto refresh_delta = path.refresh_millihz > requested_refresh ?
       path.refresh_millihz - requested_refresh :
       requested_refresh - path.refresh_millihz;
@@ -1639,8 +1580,8 @@ namespace {
       return std::nullopt;
     }
 
-    const auto high = parse_i32_token(text.substr(0, separator));
-    const auto low = parse_u32_token(text.substr(separator + 1));
+    const auto high = vdd::parse_probe_i32_token(text.substr(0, separator));
+    const auto low = vdd::parse_probe_u32_token(text.substr(separator + 1));
     if (!high || !low) {
       return std::nullopt;
     }
@@ -1943,18 +1884,20 @@ int main(const int argc, char **argv) {
 
   const std::string command {argv[1]};
   if (command == "--diagnose") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     return diagnose_control_devices();
   }
 
   if (command == "--apply-extended-topology") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
-    if (const int session_status = require_active_console_session(command); session_status != 0) {
-      return session_status;
+    if (vdd::probe_command_execution_stage(command) == vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice) {
+      if (const int session_status = require_active_console_session(command); session_status != 0) {
+        return session_status;
+      }
     }
 
     const LONG result = apply_extended_topology_result();
@@ -1968,22 +1911,26 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--query-color-profiles") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
-    if (const int session_status = require_active_console_session(command); session_status != 0) {
-      return session_status;
+    if (vdd::probe_command_execution_stage(command) == vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice) {
+      if (const int session_status = require_active_console_session(command); session_status != 0) {
+        return session_status;
+      }
     }
     return query_color_profiles();
   }
 
   if (command == "--associate-color-profile") {
-    if (argc < 5) {
+    if (!require_command_arg_count(command, argc)) {
       print_usage();
       return 2;
     }
-    if (const int session_status = require_active_console_session(command); session_status != 0) {
-      return session_status;
+    if (vdd::probe_command_execution_stage(command) == vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice) {
+      if (const int session_status = require_active_console_session(command); session_status != 0) {
+        return session_status;
+      }
     }
 
     const auto source_luid = parse_luid(argv[2]);
@@ -2026,7 +1973,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--check") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::cout << "protocol=" << protocol.value.major << '.'
@@ -2034,14 +1981,14 @@ int main(const int argc, char **argv) {
     return 0;
   }
 
-  if (command_uses_display_config(command)) {
+  if (vdd::probe_command_execution_stage(command) == vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession) {
     if (const int session_status = require_active_console_session(command); session_status != 0) {
       return session_status;
     }
   }
 
   if (command == "--query-permanent") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     const auto result = client.query_permanent_display_count();
@@ -2055,14 +2002,14 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--apply-manifest-topology") {
-    if (!require_arg_count(argc, 2, 2)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     return apply_manifest_topology(client);
   }
 
   if (command == "--set-permanent") {
-    if (!require_arg_count(argc, 3, 3)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     vdd::PermanentDisplayCountRequest request {};
@@ -2080,7 +2027,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--self-test-permanent") {
-    if (!require_arg_count(argc, 2, 3)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     const auto before = client.query_permanent_display_count();
@@ -2165,7 +2112,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--self-test-temp") {
-    if (!require_arg_count(argc, 2, 5)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};
@@ -2211,7 +2158,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--self-test-4k240") {
-    if (!require_arg_count(argc, 2, 3)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t timeout_ms {};
@@ -2222,7 +2169,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--self-test-hdr") {
-    if (!require_arg_count(argc, 2, 5)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};
@@ -2309,7 +2256,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--self-test-lease-expiry") {
-    if (!require_arg_count(argc, 2, 6)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};
@@ -2374,7 +2321,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--qa-multi-temp-lease") {
-    if (!require_arg_count(argc, 2, 4)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t count {};
@@ -2480,7 +2427,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--qa-temp-identity-retention") {
-    if (!require_arg_count(argc, 2, 6)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};
@@ -2721,7 +2668,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--debug-temp-config") {
-    if (!require_arg_count(argc, 2, 6)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};
@@ -2809,7 +2756,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--stress-capture-remove") {
-    if (!require_arg_count(argc, 2, 6)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t iterations {};
@@ -2945,7 +2892,7 @@ int main(const int argc, char **argv) {
   }
 
   if (command == "--qa-temp-lease") {
-    if (!require_arg_count(argc, 2, 6)) {
+    if (!require_command_arg_count(command, argc)) {
       return 2;
     }
     std::uint32_t width {};

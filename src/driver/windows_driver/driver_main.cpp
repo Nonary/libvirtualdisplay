@@ -6,6 +6,8 @@
 #include "virtual_display/driver/hdr_capabilities.h"
 #include "virtual_display/driver/lease_store.h"
 #include "virtual_display/driver/windows_control_protocol.h"
+#include "virtual_display/driver/windows_driver_modes.h"
+#include "virtual_display/driver/windows_driver_state.h"
 
 #include <Windows.h>
 #include <avrt.h>
@@ -26,11 +28,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <new>
-#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -65,9 +65,8 @@ TRACELOGGING_DEFINE_PROVIDER(
 #include "driver_main.tmh"
 
 namespace {
-  constexpr std::uint32_t kMaxPermanentDisplays = 4;
-  constexpr std::uint32_t kMaxTemporaryDisplays = 8;
-  constexpr std::uint32_t kPersistentStateSchemaVersion = 1;
+  constexpr std::uint32_t kMaxPermanentDisplays = vdd::kWindowsDriverMaxPermanentDisplays;
+  constexpr std::uint32_t kMaxTemporaryDisplays = vdd::kWindowsDriverMaxTemporaryDisplays;
   constexpr wchar_t kSwapchainMmcssTask[] = L"DisplayPostProcessing";
   constexpr auto kSwapchainProcessorTeardownTimeout = std::chrono::milliseconds(500);
   constexpr std::uint32_t kHardwareCursorMaxWidth = 256;
@@ -77,10 +76,6 @@ namespace {
     static_cast<std::size_t>(kHardwareCursorMaxHeight) *
     sizeof(std::uint32_t);
   constexpr wchar_t kTemporaryDisplayProfilesValue[] = L"TemporaryDisplayProfiles";
-  constexpr std::size_t kTemporaryDisplayProfileBytes = 36;
-  constexpr std::size_t kTemporaryDisplayProfilesHeaderBytes = 8;
-  constexpr std::size_t kTemporaryDisplayProfilesMaxBytes =
-    kTemporaryDisplayProfilesHeaderBytes + kTemporaryDisplayProfileBytes * kMaxTemporaryDisplays;
   const GUID kControlInterfaceGuid = vdd::to_windows_guid(vdd::kDeviceInterfaceGuid);
 
   class IddCxBackend;
@@ -127,299 +122,12 @@ namespace {
     UINT gamma_ramp_size {};
   };
 
-  struct ModeShape {
-    std::uint32_t width {1920};
-    std::uint32_t height {1080};
-    // Use standard 1080p CVT/CTA-ish totals for fallback paths. Requested
-    // per-monitor modes are normalized to active-only timings below for
-    // high-refresh target-mode reporting.
-    std::uint32_t total_width {2200};
-    std::uint32_t total_height {1125};
-    std::uint64_t pixel_rate {148'500'000ull};
-    std::uint32_t refresh_rate_millihz {60'000};
-  };
-
-  struct ModeSpec {
-    std::uint32_t width;
-    std::uint32_t height;
-    std::uint32_t refresh_rate_millihz;
-  };
-
-  constexpr std::array<ModeSpec, 55> kDefaultModes {{
-    {800, 600, 30'000},
-    {800, 600, 59'940},
-    {800, 600, 60'000},
-    {800, 600, 72'000},
-    {800, 600, 90'000},
-    {800, 600, 120'000},
-    {800, 600, 144'000},
-    {800, 600, 240'000},
-    {1280, 720, 30'000},
-    {1280, 720, 59'940},
-    {1280, 720, 60'000},
-    {1280, 720, 72'000},
-    {1280, 720, 90'000},
-    {1280, 720, 120'000},
-    {1280, 720, 144'000},
-    {1366, 768, 30'000},
-    {1366, 768, 59'940},
-    {1366, 768, 60'000},
-    {1366, 768, 72'000},
-    {1366, 768, 90'000},
-    {1366, 768, 120'000},
-    {1366, 768, 144'000},
-    {1366, 768, 240'000},
-    {1920, 1080, 30'000},
-    {1920, 1080, 59'940},
-    {1920, 1080, 60'000},
-    {1920, 1080, 72'000},
-    {1920, 1080, 90'000},
-    {1920, 1080, 120'000},
-    {1920, 1080, 144'000},
-    {1920, 1080, 240'000},
-    {2560, 1440, 30'000},
-    {2560, 1440, 59'940},
-    {2560, 1440, 60'000},
-    {2560, 1440, 72'000},
-    {2560, 1440, 90'000},
-    {2560, 1440, 120'000},
-    {2560, 1440, 144'000},
-    {2560, 1440, 240'000},
-    {3840, 2160, 30'000},
-    {3840, 2160, 59'940},
-    {3840, 2160, 60'000},
-    {3840, 2160, 72'000},
-    {3840, 2160, 90'000},
-    {3840, 2160, 120'000},
-    {3840, 2160, 144'000},
-    {3840, 2160, 240'000},
-    {5120, 1440, 30'000},
-    {5120, 1440, 59'940},
-    {5120, 1440, 60'000},
-    {5120, 1440, 120'000},
-    {5120, 1440, 144'000},
-    {5120, 1440, 175'000},
-    {5120, 1440, 240'000},
-    {5120, 1440, 480'000}
-  }};
-
-  constexpr std::array<std::uint32_t, 5> kPreferredModeScalePercent {{
-    100,
-    50,
-    75,
-    125,
-    150
-  }};
-
-  std::uint32_t clamp_u32(const std::uint64_t value) {
-    return static_cast<std::uint32_t>(
-      (std::min<std::uint64_t>)(value, (std::numeric_limits<std::uint32_t>::max)())
-    );
-  }
-
-  ModeShape active_mode_shape(
-    const std::uint32_t width,
-    const std::uint32_t height,
-    const std::uint32_t refresh_rate_millihz
-  ) {
-    return {
-      width,
-      height,
-      width,
-      height,
-      static_cast<std::uint64_t>(width) *
-        static_cast<std::uint64_t>(height) *
-        static_cast<std::uint64_t>((std::max)(refresh_rate_millihz, 1u)) /
-        1000ull,
-      refresh_rate_millihz
-    };
-  }
-
-  ModeShape mode_shape_from_spec(const ModeSpec &spec) {
-    return active_mode_shape(spec.width, spec.height, spec.refresh_rate_millihz);
-  }
-
-  std::uint32_t append_unique_mode(std::vector<ModeShape> &modes, const ModeShape &candidate) {
-    for (std::size_t index = 0; index < modes.size(); ++index) {
-      const auto &mode = modes[index];
-      if (mode.width == candidate.width &&
-          mode.height == candidate.height &&
-          mode.refresh_rate_millihz == candidate.refresh_rate_millihz) {
-        return static_cast<std::uint32_t>(index);
-      }
-    }
-
-    const auto index = static_cast<std::uint32_t>(modes.size());
-    modes.push_back(candidate);
-    return index;
-  }
-
-  std::optional<ModeShape> scaled_mode_shape(
-    const ModeShape &base,
-    const std::uint32_t scale_percent,
-    const std::uint32_t refresh_rate_millihz
-  ) {
-    const auto width = static_cast<std::uint32_t>(
-      static_cast<std::uint64_t>(base.width) * scale_percent / 100ull
-    );
-    const auto height = static_cast<std::uint32_t>(
-      static_cast<std::uint64_t>(base.height) * scale_percent / 100ull
-    );
-
-    if (width < vdd::kMinWidth || width > vdd::kMaxWidth ||
-        height < vdd::kMinHeight || height > vdd::kMaxHeight ||
-        refresh_rate_millihz < vdd::kMinRefreshRateMilliHz) {
-      return std::nullopt;
-    }
-
-    return active_mode_shape(width, height, refresh_rate_millihz);
-  }
-
-  std::uint32_t append_preferred_mode_variants(std::vector<ModeShape> &modes, const ModeShape &preferred) {
-    std::uint32_t preferred_index = static_cast<std::uint32_t>(modes.size());
-    bool preferred_index_set = false;
-
-    for (const auto scale_percent: kPreferredModeScalePercent) {
-      if (const auto scaled = scaled_mode_shape(preferred, scale_percent, preferred.refresh_rate_millihz)) {
-        const auto index = append_unique_mode(modes, *scaled);
-        if (scale_percent == 100) {
-          preferred_index = index;
-          preferred_index_set = true;
-        }
-      }
-
-      const auto doubled_refresh_rate_millihz =
-        clamp_u32(static_cast<std::uint64_t>(preferred.refresh_rate_millihz) * 2ull);
-      if (const auto doubled = scaled_mode_shape(preferred, scale_percent, doubled_refresh_rate_millihz)) {
-        (void) append_unique_mode(modes, *doubled);
-      }
-    }
-
-    if (!preferred_index_set) {
-      preferred_index = append_unique_mode(modes, preferred);
-    }
-    return preferred_index;
-  }
-
-  std::uint32_t default_preferred_mode_index(const std::vector<ModeShape> &modes) {
-    for (std::size_t index = 0; index < modes.size(); ++index) {
-      const auto &mode = modes[index];
-      if (mode.width == 1920 && mode.height == 1080 && mode.refresh_rate_millihz == 60'000) {
-        return static_cast<std::uint32_t>(index);
-      }
-    }
-
-    return 0;
-  }
-
-  std::pair<std::vector<ModeShape>, std::uint32_t> build_mode_shapes(
-    const std::optional<ModeShape> &preferred
-  ) {
-    std::vector<ModeShape> modes;
-    modes.reserve(kDefaultModes.size() + (preferred ? 1u : 0u));
-
-    for (const auto &spec: kDefaultModes) {
-      modes.push_back(mode_shape_from_spec(spec));
-    }
-
-    std::uint32_t preferred_index = default_preferred_mode_index(modes);
-    if (preferred) {
-      preferred_index = append_preferred_mode_variants(modes, *preferred);
-    }
-
-    return {std::move(modes), preferred_index};
-  }
+  using ModeShape = vdd::WindowsDriverModeShape;
 
   UNICODE_STRING unicode_string(const wchar_t *value) {
     UNICODE_STRING result {};
     RtlInitUnicodeString(&result, value);
     return result;
-  }
-
-  struct TemporaryDisplayProfile {
-    std::uint64_t display_id {};
-    std::uint32_t connector_index {};
-    GUID container_id {};
-    std::uint32_t edid_product_code {};
-    std::uint32_t edid_serial_number {};
-  };
-
-  void append_u32(std::vector<std::uint8_t> &blob, const std::uint32_t value) {
-    blob.push_back(static_cast<std::uint8_t>(value & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>((value >> 8u) & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>((value >> 16u) & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>((value >> 24u) & 0xffu));
-  }
-
-  void append_u64(std::vector<std::uint8_t> &blob, const std::uint64_t value) {
-    append_u32(blob, static_cast<std::uint32_t>(value & 0xffffffffull));
-    append_u32(blob, static_cast<std::uint32_t>((value >> 32ull) & 0xffffffffull));
-  }
-
-  void append_guid(std::vector<std::uint8_t> &blob, const GUID &value) {
-    append_u32(blob, value.Data1);
-    blob.push_back(static_cast<std::uint8_t>(value.Data2 & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>((value.Data2 >> 8u) & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>(value.Data3 & 0xffu));
-    blob.push_back(static_cast<std::uint8_t>((value.Data3 >> 8u) & 0xffu));
-    blob.insert(blob.end(), std::begin(value.Data4), std::end(value.Data4));
-  }
-
-  bool has_bytes(const std::vector<std::uint8_t> &blob, const std::size_t offset, const std::size_t count) {
-    return offset <= blob.size() && count <= blob.size() - offset;
-  }
-
-  bool read_u32(const std::vector<std::uint8_t> &blob, std::size_t &offset, std::uint32_t &value) {
-    if (!has_bytes(blob, offset, sizeof(std::uint32_t))) {
-      return false;
-    }
-
-    value =
-      static_cast<std::uint32_t>(blob[offset]) |
-      (static_cast<std::uint32_t>(blob[offset + 1]) << 8u) |
-      (static_cast<std::uint32_t>(blob[offset + 2]) << 16u) |
-      (static_cast<std::uint32_t>(blob[offset + 3]) << 24u);
-    offset += sizeof(std::uint32_t);
-    return true;
-  }
-
-  bool read_u64(const std::vector<std::uint8_t> &blob, std::size_t &offset, std::uint64_t &value) {
-    std::uint32_t low {};
-    std::uint32_t high {};
-    if (!read_u32(blob, offset, low) || !read_u32(blob, offset, high)) {
-      return false;
-    }
-
-    value = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32ull);
-    return true;
-  }
-
-  bool read_guid(const std::vector<std::uint8_t> &blob, std::size_t &offset, GUID &value) {
-    if (!has_bytes(blob, offset, sizeof(GUID))) {
-      return false;
-    }
-
-    std::uint32_t data1 {};
-    std::uint32_t data2 {};
-    std::uint32_t data3 {};
-    if (!read_u32(blob, offset, data1)) {
-      return false;
-    }
-    if (!has_bytes(blob, offset, 12)) {
-      return false;
-    }
-
-    data2 = static_cast<std::uint32_t>(blob[offset]) | (static_cast<std::uint32_t>(blob[offset + 1]) << 8u);
-    offset += sizeof(std::uint16_t);
-    data3 = static_cast<std::uint32_t>(blob[offset]) | (static_cast<std::uint32_t>(blob[offset + 1]) << 8u);
-    offset += sizeof(std::uint16_t);
-
-    value.Data1 = data1;
-    value.Data2 = static_cast<unsigned short>(data2);
-    value.Data3 = static_cast<unsigned short>(data3);
-    std::copy_n(blob.begin() + static_cast<std::ptrdiff_t>(offset), std::size(value.Data4), std::begin(value.Data4));
-    offset += std::size(value.Data4);
-    return true;
   }
 
   class RegistryKey {
@@ -529,20 +237,14 @@ namespace {
     );
   }
 
-  bool valid_temporary_profile(const std::uint64_t display_id, const std::uint32_t connector_index) {
-    return display_id != 0 &&
-           connector_index >= kMaxPermanentDisplays &&
-           connector_index < kMaxPermanentDisplays + kMaxTemporaryDisplays;
-  }
-
-  std::vector<TemporaryDisplayProfile> load_temporary_display_profiles(WDFDRIVER driver, WDFDEVICE device) {
-    std::vector<TemporaryDisplayProfile> profiles;
+  std::vector<vdd::TemporaryDisplayProfile> load_temporary_display_profiles(WDFDRIVER driver, WDFDEVICE device) {
+    std::vector<vdd::TemporaryDisplayProfile> profiles;
     RegistryKey state_key;
     if (!NT_SUCCESS(open_driver_state_key(driver, device, KEY_READ, state_key))) {
       return profiles;
     }
 
-    std::vector<std::uint8_t> blob(kTemporaryDisplayProfilesMaxBytes);
+    std::vector<std::uint8_t> blob(vdd::kTemporaryDisplayProfilesMaxBytes);
     auto value_name = unicode_string(kTemporaryDisplayProfilesValue);
     ULONG value_length {};
     ULONG value_type {};
@@ -554,48 +256,19 @@ namespace {
       &value_length,
       &value_type
     );
-    if (!NT_SUCCESS(status) || value_type != REG_BINARY || value_length < kTemporaryDisplayProfilesHeaderBytes ||
+    if (!NT_SUCCESS(status) || value_type != REG_BINARY || value_length < vdd::kTemporaryDisplayProfilesHeaderBytes ||
         value_length > blob.size()) {
       return profiles;
     }
 
     blob.resize(value_length);
-
-    std::size_t offset {};
-    std::uint32_t schema_version {};
-    std::uint32_t profile_count {};
-    if (!read_u32(blob, offset, schema_version) ||
-        !read_u32(blob, offset, profile_count) ||
-        schema_version != kPersistentStateSchemaVersion ||
-        profile_count > kMaxTemporaryDisplays ||
-        blob.size() != kTemporaryDisplayProfilesHeaderBytes + profile_count * kTemporaryDisplayProfileBytes) {
-      return {};
-    }
-
-    profiles.reserve(profile_count);
-    for (std::uint32_t index = 0; index < profile_count; ++index) {
-      TemporaryDisplayProfile profile {};
-      if (!read_u64(blob, offset, profile.display_id) ||
-          !read_u32(blob, offset, profile.connector_index) ||
-          !read_guid(blob, offset, profile.container_id) ||
-          !read_u32(blob, offset, profile.edid_product_code) ||
-          !read_u32(blob, offset, profile.edid_serial_number) ||
-          !valid_temporary_profile(profile.display_id, profile.connector_index)) {
-        return {};
-      }
-
-      profiles.push_back(profile);
-    }
-
-    return profiles;
+    const auto parsed = vdd::parse_temporary_display_profiles_blob(blob);
+    return parsed.value_or(std::vector<vdd::TemporaryDisplayProfile> {});
   }
 
   std::map<std::uint64_t, std::uint32_t> load_temporary_connector_reservations(WDFDRIVER driver, WDFDEVICE device) {
-    std::map<std::uint64_t, std::uint32_t> reservations;
-    for (const auto &profile: load_temporary_display_profiles(driver, device)) {
-      reservations.emplace(profile.display_id, profile.connector_index);
-    }
-    return reservations;
+    const auto profiles = load_temporary_display_profiles(driver, device);
+    return vdd::temporary_connector_reservations(profiles);
   }
 
   template <typename T>
@@ -625,10 +298,6 @@ namespace {
     WDFDEVICE device,
     const vdd::DisplayDescriptor &descriptor
   ) {
-    if (!valid_temporary_profile(descriptor.display_id, descriptor.connector_index)) {
-      return vdd::BackendError::Failed;
-    }
-
     RegistryKey state_key;
     auto status = open_driver_state_key(driver, device, KEY_READ | KEY_SET_VALUE, state_key);
     if (!NT_SUCCESS(status)) {
@@ -636,56 +305,18 @@ namespace {
     }
 
     auto profiles = load_temporary_display_profiles(driver, device);
-    const TemporaryDisplayProfile profile {
+    const vdd::TemporaryDisplayProfile profile {
       descriptor.display_id,
       descriptor.connector_index,
-      vdd::to_windows_guid(descriptor.container_id),
+      descriptor.container_id,
       vdd::read_product_code(descriptor.edid),
       vdd::read_serial_number(descriptor.edid)
     };
-
-    profiles.erase(
-      std::remove_if(
-        profiles.begin(),
-        profiles.end(),
-        [&](const TemporaryDisplayProfile &entry) {
-          return entry.connector_index == descriptor.connector_index &&
-                 entry.display_id != descriptor.display_id;
-        }
-      ),
-      profiles.end()
-    );
-
-    const auto existing = std::find_if(
-      profiles.begin(),
-      profiles.end(),
-      [&](const TemporaryDisplayProfile &entry) {
-        return entry.display_id == descriptor.display_id;
-      }
-    );
-    if (existing != profiles.end()) {
-      *existing = profile;
-    } else {
-      if (profiles.size() >= kMaxTemporaryDisplays) {
-        return vdd::BackendError::Failed;
-      }
-      profiles.push_back(profile);
+    const auto updated_profiles = vdd::upsert_temporary_display_profile(std::move(profiles), profile);
+    if (!updated_profiles) {
+      return vdd::BackendError::Failed;
     }
-
-    std::vector<std::uint8_t> blob;
-    blob.reserve(kTemporaryDisplayProfilesHeaderBytes + profiles.size() * kTemporaryDisplayProfileBytes);
-    append_u32(blob, kPersistentStateSchemaVersion);
-    append_u32(blob, static_cast<std::uint32_t>(profiles.size()));
-    for (const auto &entry: profiles) {
-      if (!valid_temporary_profile(entry.display_id, entry.connector_index)) {
-        return vdd::BackendError::Failed;
-      }
-      append_u64(blob, entry.display_id);
-      append_u32(blob, entry.connector_index);
-      append_guid(blob, entry.container_id);
-      append_u32(blob, entry.edid_product_code);
-      append_u32(blob, entry.edid_serial_number);
-    }
+    auto blob = vdd::serialize_temporary_display_profiles(*updated_profiles);
 
     auto value_name = unicode_string(kTemporaryDisplayProfilesValue);
     status = WdfRegistryAssignValue(
@@ -712,31 +343,12 @@ namespace {
 
     auto profiles = load_temporary_display_profiles(driver, device);
     const auto original_size = profiles.size();
-    profiles.erase(
-      std::remove_if(
-        profiles.begin(),
-        profiles.end(),
-        [display_id](const TemporaryDisplayProfile &entry) {
-          return entry.display_id == display_id;
-        }
-      ),
-      profiles.end()
-    );
+    profiles = vdd::remove_temporary_display_profile(std::move(profiles), display_id);
     if (profiles.size() == original_size) {
       return vdd::BackendError::None;
     }
 
-    std::vector<std::uint8_t> blob;
-    blob.reserve(kTemporaryDisplayProfilesHeaderBytes + profiles.size() * kTemporaryDisplayProfileBytes);
-    append_u32(blob, kPersistentStateSchemaVersion);
-    append_u32(blob, static_cast<std::uint32_t>(profiles.size()));
-    for (const auto &entry: profiles) {
-      append_u64(blob, entry.display_id);
-      append_u32(blob, entry.connector_index);
-      append_guid(blob, entry.container_id);
-      append_u32(blob, entry.edid_product_code);
-      append_u32(blob, entry.edid_serial_number);
-    }
+    auto blob = vdd::serialize_temporary_display_profiles(profiles);
 
     auto value_name = unicode_string(kTemporaryDisplayProfilesValue);
     status = WdfRegistryAssignValue(
@@ -1400,7 +1012,7 @@ namespace {
       static_cast<std::uint64_t>((std::max)(shape.total_height, 1u));
     const auto derived_refresh_millihz =
       total_pixels == 0 ? 0 : (shape.pixel_rate * 1000ull) / total_pixels;
-    shape.refresh_rate_millihz = clamp_u32(derived_refresh_millihz);
+    shape.refresh_rate_millihz = vdd::clamp_windows_driver_u32(derived_refresh_millihz);
 
     return shape;
   }
@@ -1410,16 +1022,11 @@ namespace {
       return {};
     }
 
-    return active_mode_shape(descriptor.width, descriptor.height, descriptor.refresh_rate_millihz);
+    return vdd::active_windows_driver_mode_shape(descriptor.width, descriptor.height, descriptor.refresh_rate_millihz);
   }
 
-  struct RegisteredMonitorDescriptionMode {
-    ModeShape mode;
-    std::uint32_t references {};
-  };
-
   std::mutex g_monitor_description_modes_mutex;
-  std::map<std::array<std::byte, vdd::kEdidSize>, RegisteredMonitorDescriptionMode> g_monitor_description_modes;
+  vdd::WindowsDriverRegisteredModeStore g_monitor_description_modes;
 
   std::optional<std::array<std::byte, vdd::kEdidSize>> monitor_description_key(
     const IDDCX_MONITOR_DESCRIPTION &description
@@ -1443,24 +1050,12 @@ namespace {
     }
 
     std::lock_guard lock {g_monitor_description_modes_mutex};
-    auto &entry = g_monitor_description_modes[descriptor.edid];
-    entry.mode = mode;
-    ++entry.references;
+    (void) g_monitor_description_modes.register_mode(descriptor.edid, mode);
   }
 
   void unregister_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
     std::lock_guard lock {g_monitor_description_modes_mutex};
-    const auto entry = g_monitor_description_modes.find(descriptor.edid);
-    if (entry == g_monitor_description_modes.end()) {
-      return;
-    }
-
-    if (entry->second.references <= 1) {
-      g_monitor_description_modes.erase(entry);
-      return;
-    }
-
-    --entry->second.references;
+    g_monitor_description_modes.unregister_mode(descriptor.edid);
   }
 
   std::optional<ModeShape> registered_mode_shape_from_description(
@@ -1472,12 +1067,7 @@ namespace {
     }
 
     std::lock_guard lock {g_monitor_description_modes_mutex};
-    const auto entry = g_monitor_description_modes.find(*key);
-    if (entry == g_monitor_description_modes.end()) {
-      return std::nullopt;
-    }
-
-    return entry->second.mode;
+    return g_monitor_description_modes.registered_mode(*key);
   }
 
   std::optional<ModeShape> preferred_mode_shape_from_description(const IDDCX_MONITOR_DESCRIPTION &description) {
@@ -1505,22 +1095,6 @@ namespace {
     bits.YCbCr444 = IDDCX_BITS_PER_COMPONENT_NONE;
     bits.YCbCr422 = IDDCX_BITS_PER_COMPONENT_NONE;
     bits.YCbCr420 = IDDCX_BITS_PER_COMPONENT_NONE;
-  }
-
-  DISPLAYCONFIG_RATIONAL make_frequency_rational(
-    std::uint64_t numerator,
-    std::uint32_t denominator
-  ) {
-    denominator = (std::max)(denominator, 1u);
-    if (numerator == 0) {
-      return {0, 1};
-    }
-
-    const auto divisor = std::gcd(numerator, static_cast<std::uint64_t>(denominator));
-    numerator /= divisor;
-    denominator = static_cast<std::uint32_t>(denominator / divisor);
-
-    return {clamp_u32(numerator), denominator};
   }
 
   vdd::DisplayDescriptor descriptor_with_runtime_hdr_policy(const vdd::DisplayDescriptor &descriptor) {
@@ -1556,12 +1130,9 @@ namespace {
     signal.activeSize.cy = shape.height;
     signal.totalSize.cx = (std::max)(shape.total_width, shape.width);
     signal.totalSize.cy = (std::max)(shape.total_height, shape.height);
-    signal.vSyncFreq = make_frequency_rational((std::max)(shape.refresh_rate_millihz, 1u), 1000);
-    signal.hSyncFreq = make_frequency_rational(
-      static_cast<std::uint64_t>((std::max)(shape.refresh_rate_millihz, 1u)) *
-        static_cast<std::uint64_t>((std::max)(signal.totalSize.cy, 1u)),
-      1000
-    );
+    const auto frequencies = vdd::windows_driver_signal_frequencies(shape);
+    signal.vSyncFreq = {frequencies.vertical.numerator, frequencies.vertical.denominator};
+    signal.hSyncFreq = {frequencies.horizontal.numerator, frequencies.horizontal.denominator};
     // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY_OTHER is not accepted here; 255 is
     // the documented "not initialized" value Windows itself uses for EDID modes.
     signal.AdditionalSignalInfo.videoStandard = 255;
@@ -1616,7 +1187,8 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = build_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
+    const auto [modes, preferred_index] =
+      vdd::build_windows_driver_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
     output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->MonitorModeBufferInputCount == 0) {
@@ -1640,7 +1212,8 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = build_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
+    const auto [modes, preferred_index] =
+      vdd::build_windows_driver_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
     output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->MonitorModeBufferInputCount == 0) {
@@ -1664,7 +1237,7 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = build_mode_shapes(std::nullopt);
+    const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(std::nullopt);
     output->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->DefaultMonitorModeBufferInputCount == 0) {
@@ -1689,8 +1262,9 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = build_mode_shapes(
-      requested_shape ? std::optional<ModeShape> {*requested_shape} : mode_shape_from_description(input->MonitorDescription)
+    const auto [modes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
+      mode_shape_from_description(input->MonitorDescription),
+      requested_shape
     );
     (void) preferred_index;
     output->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
@@ -1716,8 +1290,9 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = build_mode_shapes(
-      requested_shape ? std::optional<ModeShape> {*requested_shape} : mode_shape_from_description(input->MonitorDescription)
+    const auto [modes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
+      mode_shape_from_description(input->MonitorDescription),
+      requested_shape
     );
     (void) preferred_index;
     output->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
