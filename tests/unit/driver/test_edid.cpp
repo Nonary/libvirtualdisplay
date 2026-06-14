@@ -273,19 +273,27 @@ TEST(VirtualDisplayDriverEdid, EmitsWindowsHdrClassifiedCtaMetadata) {
   const auto edid = vdd::create_edid(default_options());
   const auto cta = vdd::kEdidBlockSize;
 
+  // One labeled structural pin: the CTA-861 extension header Windows reads to find and
+  // classify the data block collection -- DTD offset (0x44) and the descriptor flags (0xf0).
   EXPECT_EQ(edid[cta + 2], std::byte {0x44});
   EXPECT_EQ(edid[cta + 3], std::byte {0xf0});
-  EXPECT_EQ(edid[cta + 52], std::byte {0xe3});
-  EXPECT_EQ(edid[cta + 53], std::byte {0x05});
-  EXPECT_EQ(edid[cta + 54], std::byte {0xe0});
-  EXPECT_EQ(edid[cta + 55], std::byte {0x01});
-  EXPECT_EQ(edid[cta + 61], std::byte {0xe6});
-  EXPECT_EQ(edid[cta + 62], std::byte {0x06});
-  EXPECT_EQ(edid[cta + 63], std::byte {0x0f});
-  EXPECT_EQ(edid[cta + 64], std::byte {0x01});
-  EXPECT_EQ(edid[cta + 65], std::byte {0x8b});
-  EXPECT_EQ(edid[cta + 66], std::byte {0x8b});
-  EXPECT_EQ(edid[cta + 67], std::byte {0x00});
+
+  // Decode the HDR Static Metadata Data Block by meaning instead of pinning its raw bytes:
+  // PQ EOTF + ST2086 metadata are the prerequisites Windows checks to classify the EDID as
+  // HDR-capable, and the maximum luminance must clear the 1000-nit floor it expects.
+  const auto hdr = vdd::read_hdr_static_metadata(edid);
+  ASSERT_TRUE(hdr.has_value());
+  EXPECT_TRUE((hdr->supported_eotfs & vdd::kHdrEotfSmpte2084) != 0);
+  EXPECT_TRUE((hdr->supported_static_metadata_types & vdd::kHdrStaticMetadataType1) != 0);
+  EXPECT_GE(vdd::hdr_luminance_nits_from_code(hdr->max_luminance_code), 1000.0);
+  EXPECT_EQ(hdr->max_frame_average_luminance_code, hdr->max_luminance_code);
+  EXPECT_EQ(hdr->min_luminance_code, 0u);
+
+  // Decode the Colorimetry Data Block: BT.2020 RGB + YCC must be advertised for HDR.
+  const auto colorimetry = vdd::read_supported_colorimetry(edid);
+  ASSERT_TRUE(colorimetry.has_value());
+  EXPECT_TRUE(colorimetry->bt2020_rgb);
+  EXPECT_TRUE(colorimetry->bt2020_ycc);
 }
 
 TEST(VirtualDisplayDriverEdid, DefaultsHdrStaticMetadataToAtLeastThousandNitMaximum) {

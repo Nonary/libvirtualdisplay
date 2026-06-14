@@ -343,59 +343,93 @@ namespace virtual_display::driver {
     return true;
   }
 
-  bool has_hdr_static_metadata(const std::span<const std::byte, kEdidSize> edid) {
-    const auto extension = edid.subspan(kEdidBlockSize, kEdidBlockSize);
-    if (extension[0] != std::byte {0x02}) {
-      return false;
-    }
+  namespace {
+    constexpr std::size_t kCtaBlockNotFound = static_cast<std::size_t>(-1);
 
-    const auto data_end = std::clamp<std::size_t>(to_u8(extension[2]), 4, kEdidBlockSize - 1);
-    for (std::size_t offset = 4; offset < data_end;) {
-      const auto header = to_u8(extension[offset]);
-      const auto tag = header >> 5;
-      const auto length = header & 0x1f;
-      if (length == 0 || offset >= data_end || length > data_end - offset - 1) {
-        break;
+    // Offset of the first CTA-861 extended-tag data block (tag 7) matching extended_tag with
+    // at least min_length bytes after its header, or kCtaBlockNotFound. Shared by every CTA
+    // decoder so the bounds-checked walk lives in one place.
+    std::size_t find_cta_data_block(
+      const std::span<const std::byte> extension,
+      const unsigned extended_tag,
+      const std::size_t min_length
+    ) {
+      if (extension.empty() || extension[0] != std::byte {0x02}) {
+        return kCtaBlockNotFound;
       }
 
-      if (tag == 0x07 && length >= 3 && extension[offset + 1] == std::byte {0x06}) {
-        const auto eotf = to_u8(extension[offset + 2]);
-        const auto metadata = to_u8(extension[offset + 3]);
-        if ((eotf & 0x04u) != 0 && (metadata & 0x01u) != 0) {
-          return true;
+      const auto data_end = std::clamp<std::size_t>(to_u8(extension[2]), 4, kEdidBlockSize - 1);
+      for (std::size_t offset = 4; offset < data_end;) {
+        const auto header = to_u8(extension[offset]);
+        const auto tag = header >> 5;
+        const std::size_t length = header & 0x1fu;
+        if (length == 0 || offset >= data_end || length > data_end - offset - 1) {
+          break;
         }
+
+        if (tag == 0x07 && length >= min_length && to_u8(extension[offset + 1]) == extended_tag) {
+          return offset;
+        }
+
+        offset += length + 1;
       }
 
-      offset += length + 1;
+      return kCtaBlockNotFound;
+    }
+  }  // namespace
+
+  std::optional<HdrStaticMetadata> read_hdr_static_metadata(const std::span<const std::byte, kEdidSize> edid) {
+    const auto extension = edid.subspan(kEdidBlockSize, kEdidBlockSize);
+    const auto offset = find_cta_data_block(extension, 0x06, 3);
+    if (offset == kCtaBlockNotFound) {
+      return std::nullopt;
     }
 
-    return false;
+    const std::size_t length = to_u8(extension[offset]) & 0x1fu;
+    HdrStaticMetadata metadata {};
+    metadata.supported_eotfs = to_u8(extension[offset + 2]);
+    metadata.supported_static_metadata_types = to_u8(extension[offset + 3]);
+    if (length >= 4) {
+      metadata.max_luminance_code = to_u8(extension[offset + 4]);
+    }
+    if (length >= 5) {
+      metadata.max_frame_average_luminance_code = to_u8(extension[offset + 5]);
+    }
+    if (length >= 6) {
+      metadata.min_luminance_code = to_u8(extension[offset + 6]);
+    }
+    return metadata;
+  }
+
+  std::optional<SupportedColorimetry> read_supported_colorimetry(const std::span<const std::byte, kEdidSize> edid) {
+    const auto extension = edid.subspan(kEdidBlockSize, kEdidBlockSize);
+    const auto offset = find_cta_data_block(extension, 0x05, 2);
+    if (offset == kCtaBlockNotFound) {
+      return std::nullopt;
+    }
+
+    const auto colorimetry = to_u8(extension[offset + 2]);
+    SupportedColorimetry result {};
+    result.bt2020_rgb = (colorimetry & 0x80u) != 0;
+    result.bt2020_ycc = (colorimetry & 0x40u) != 0;
+    result.bt2020_cycc = (colorimetry & 0x20u) != 0;
+    return result;
+  }
+
+  double hdr_luminance_nits_from_code(const std::uint8_t code) {
+    return 50.0 * std::pow(2.0, static_cast<double>(code) / 32.0);
+  }
+
+  bool has_hdr_static_metadata(const std::span<const std::byte, kEdidSize> edid) {
+    const auto metadata = read_hdr_static_metadata(edid);
+    return metadata.has_value() &&
+           (metadata->supported_eotfs & kHdrEotfSmpte2084) != 0 &&
+           (metadata->supported_static_metadata_types & kHdrStaticMetadataType1) != 0;
   }
 
   bool has_bt2020_colorimetry(const std::span<const std::byte, kEdidSize> edid) {
-    const auto extension = edid.subspan(kEdidBlockSize, kEdidBlockSize);
-    if (extension[0] != std::byte {0x02}) {
-      return false;
-    }
-
-    const auto data_end = std::clamp<std::size_t>(to_u8(extension[2]), 4, kEdidBlockSize - 1);
-    for (std::size_t offset = 4; offset < data_end;) {
-      const auto header = to_u8(extension[offset]);
-      const auto tag = header >> 5;
-      const auto length = header & 0x1f;
-      if (length == 0 || offset >= data_end || length > data_end - offset - 1) {
-        break;
-      }
-
-      if (tag == 0x07 && extension[offset + 1] == std::byte {0x05} && length >= 2) {
-        const auto colorimetry = to_u8(extension[offset + 2]);
-        return (colorimetry & 0xc0u) == 0xc0u;
-      }
-
-      offset += length + 1;
-    }
-
-    return false;
+    const auto colorimetry = read_supported_colorimetry(edid);
+    return colorimetry.has_value() && colorimetry->bt2020_rgb && colorimetry->bt2020_ycc;
   }
 
   std::optional<std::array<char, 3>> read_manufacturer_id(const std::span<const std::byte, kEdidSize> edid) {

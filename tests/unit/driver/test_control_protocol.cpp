@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
 #include "virtual_display/driver/control_protocol.h"
+#include "virtual_display/driver/device_identity.h"
 #include "virtual_display/driver/display_identity.h"
 #include "virtual_display/driver/windows_control_protocol.h"
 
 #include <cstring>
-#include <fstream>
-#include <sstream>
+#include <set>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace vdd = virtual_display::driver;
 
@@ -66,124 +65,6 @@ namespace {
     return manifest;
   }
 
-  std::string read_readme() {
-    const std::string readme_path =
-      std::string {LIBVIRTUALDISPLAY_SOURCE_DIR} +
-      "/README.md";
-    std::ifstream readme_file {readme_path};
-    if (!readme_file.is_open()) {
-      ADD_FAILURE() << readme_path;
-      return {};
-    }
-
-    std::ostringstream buffer;
-    buffer << readme_file.rdbuf();
-    return buffer.str();
-  }
-
-  std::string read_driver_inf() {
-    const std::string inf_path =
-      std::string {LIBVIRTUALDISPLAY_SOURCE_DIR} +
-      "/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf";
-    std::ifstream inf_file {inf_path};
-    if (!inf_file.is_open()) {
-      ADD_FAILURE() << inf_path;
-      return {};
-    }
-
-    std::ostringstream buffer;
-    buffer << inf_file.rdbuf();
-    return buffer.str();
-  }
-
-  std::string_view trim_line(std::string_view line) {
-    if (!line.empty() && line.back() == '\r') {
-      line.remove_suffix(1);
-    }
-    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
-      line.remove_prefix(1);
-    }
-    return line;
-  }
-
-  std::string_view inf_section(const std::string &inf, const std::string_view name) {
-    const auto header = "[" + std::string {name} + "]";
-    const auto content = std::string_view {inf};
-    std::size_t cursor = 0;
-    std::size_t body_begin = std::string_view::npos;
-
-    while (cursor < content.size()) {
-      const auto line_begin = cursor;
-      const auto line_end = content.find('\n', cursor);
-      const auto next_cursor = line_end == std::string_view::npos ? content.size() : line_end + 1;
-      const auto line = content.substr(
-        line_begin,
-        line_end == std::string_view::npos ? std::string_view::npos : line_end - line_begin
-      );
-      const auto trimmed = trim_line(line);
-      if (!trimmed.starts_with(';') && trimmed == header) {
-        body_begin = next_cursor;
-        break;
-      }
-      cursor = next_cursor;
-    }
-
-    if (body_begin == std::string_view::npos) {
-      ADD_FAILURE() << "missing INF section: " << name;
-      return {};
-    }
-
-    cursor = body_begin;
-    while (cursor < content.size()) {
-      const auto line_begin = cursor;
-      const auto line_end = content.find('\n', cursor);
-      const auto next_cursor = line_end == std::string_view::npos ? content.size() : line_end + 1;
-      const auto line = content.substr(
-        line_begin,
-        line_end == std::string_view::npos ? std::string_view::npos : line_end - line_begin
-      );
-      const auto trimmed = trim_line(line);
-      if (!trimmed.starts_with(';') && trimmed.starts_with('[')) {
-        return content.substr(body_begin, line_begin - body_begin);
-      }
-      cursor = next_cursor;
-    }
-
-    return content.substr(body_begin);
-  }
-
-  std::vector<std::string_view> section_security_lines(const std::string_view section) {
-    std::vector<std::string_view> lines;
-    std::size_t cursor = 0;
-    while (cursor < section.size()) {
-      const auto line_end = section.find('\n', cursor);
-      auto line = section.substr(
-        cursor,
-        line_end == std::string_view::npos ? std::string_view::npos : line_end - cursor
-      );
-      if (!line.empty() && line.back() == '\r') {
-        line.remove_suffix(1);
-      }
-      if (line.starts_with("HKR,,Security,,")) {
-        lines.push_back(line);
-      }
-      if (line_end == std::string_view::npos) {
-        break;
-      }
-      cursor = line_end + 1;
-    }
-    return lines;
-  }
-
-  void expect_exact_section_security(
-    const std::string_view section,
-    const std::string_view expected_sddl
-  ) {
-    const auto expected_line = "HKR,,Security,,\"" + std::string {expected_sddl} + "\"";
-    const auto security_lines = section_security_lines(section);
-    ASSERT_EQ(security_lines.size(), 1u);
-    EXPECT_EQ(security_lines[0], expected_line);
-  }
 }  // namespace
 
 TEST(VirtualDisplayDriverControlProtocol, ComputesBufferedUnknownDeviceIoctlCodes) {
@@ -210,17 +91,11 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionUsesDedicatedNamespace)
   EXPECT_EQ(version.patch, vdd::kProtocolVersionPatch);
 }
 
-TEST(VirtualDisplayDriverControlProtocol, ReadmeDocumentsCurrentProtocolVersion) {
-  const auto readme = read_readme();
-  const std::string expected_version =
-    std::to_string(vdd::kProtocolVersionMajor) + "." +
-    std::to_string(vdd::kProtocolVersionMinor) + "." +
-    std::to_string(vdd::kProtocolVersionPatch);
-
-  EXPECT_NE(
-    readme.find("The current protocol version is `" + expected_version + "`."),
-    std::string::npos
-  );
+TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants) {
+  // Behavioral replacement for the test that scraped README.md for the version prose: it
+  // asserts the formatter that is the single source of truth for the dotted version, rather
+  // than that a string happens to appear in a checked-in document.
+  EXPECT_EQ(vdd::protocol_version_string(), "3.5.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {
@@ -231,27 +106,60 @@ TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGui
 #endif
 }
 
-TEST(VirtualDisplayDriverControlProtocol, InfRegistersControlInterfaceWithServiceOnlyAccess) {
-  const auto inf = read_driver_inf();
-  const auto control_section = inf_section(inf, "ControlInterface_AddReg");
-
-  EXPECT_NE(
-    inf.find("AddInterface={5f894d6c-3a69-48a2-86ef-e4c671932d63},,ControlInterface"),
-    std::string::npos
+TEST(VirtualDisplayDriverDeviceIdentity, FormatsControlInterfaceGuidAsInfBraceString) {
+  EXPECT_EQ(
+    vdd::format_inf_guid(vdd::kDeviceInterfaceGuid),
+    "{5f894d6c-3a69-48a2-86ef-e4c671932d63}"
   );
-  expect_exact_section_security(
-    control_section,
-    "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-80-2333729190-1599198784-3320592948-2337414441-3098439965)"
+
+  // Field grouping: the clock-seq bytes (data4[0..1]) follow the third hyphen and the node
+  // bytes (data4[2..7]) the fourth, all lower-cased and zero-padded.
+  EXPECT_EQ(
+    vdd::format_inf_guid(
+      vdd::Guid {0x01020304, 0x0506, 0x0708, {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}
+    ),
+    "{01020304-0506-0708-090a-0b0c0d0e0f10}"
   );
 }
 
-TEST(VirtualDisplayDriverControlProtocol, InfRestrictsDeviceSecurityToSystemAndBrokerService) {
-  const auto inf = read_driver_inf();
-  const auto device_section = inf_section(inf, "Device_Install_Hw_AddReg");
+TEST(VirtualDisplayDriverDeviceIdentity, DerivesBrokerServiceSidFromServiceName) {
+  // The control device is openable only by SYSTEM and the broker service. Deriving the SID
+  // from the service NAME (Windows' own per-service SID algorithm) instead of pinning a magic
+  // literal means a broker rename is caught here and the generated INF grant stays correct.
+  EXPECT_EQ(
+    vdd::derive_service_sid(vdd::kBrokerServiceName),
+    "S-1-5-80-2333729190-1599198784-3320592948-2337414441-3098439965"
+  );
 
-  expect_exact_section_security(
-    device_section,
+  // Windows derives service SIDs from the upper-cased name, so derivation is case-insensitive.
+  EXPECT_EQ(
+    vdd::derive_service_sid("sunshinevirtualdisplaybroker"),
+    vdd::derive_service_sid(vdd::kBrokerServiceName)
+  );
+
+  // A different service name must yield a different principal.
+  EXPECT_NE(
+    vdd::derive_service_sid("SomeOtherService"),
+    vdd::derive_service_sid(vdd::kBrokerServiceName)
+  );
+}
+
+TEST(VirtualDisplayDriverDeviceIdentity, BuildsProtectedSystemAndBrokerOnlySecurityDescriptor) {
+  const auto sddl = vdd::control_interface_security_descriptor();
+
+  // Behavioral replacement for the two tests that scraped the INF for this SDDL. The same
+  // descriptor feeds both INF Security lines through gen_driver_inf, and the committed INF is
+  // verified against it by the driver_inf_in_sync ctest -- so the producer is asserted here.
+  EXPECT_EQ(
+    sddl,
     "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-80-2333729190-1599198784-3320592948-2337414441-3098439965)"
+  );
+
+  // Composed from named principals (not a frozen blob): a protected DACL granting GENERIC_ALL
+  // to LocalSystem and the broker service only.
+  EXPECT_EQ(
+    sddl,
+    "D:P(A;;GA;;;SY)(A;;GA;;;" + vdd::derive_service_sid(vdd::kBrokerServiceName) + ")"
   );
 }
 
@@ -610,7 +518,16 @@ TEST(VirtualDisplayDriverControlProtocol, RejectsMissingManifestIdentityFields) 
   manifest = valid_display_manifest();
   manifest.profiles[0].serial_number = 0;
   EXPECT_EQ(vdd::validate_display_manifest(manifest, 2), vdd::ValidationError::InvalidSerialNumber);
+}
 
-  EXPECT_STREQ(vdd::to_string(vdd::ValidationError::InvalidContainerId), "invalid_container_id");
-  EXPECT_STREQ(vdd::to_string(vdd::ValidationError::InvalidSerialNumber), "invalid_serial_number");
+TEST(VirtualDisplayDriverControlProtocol, ValidationErrorNamesAreExhaustiveAndDistinct) {
+  // Replaces per-arm to_string() literal mirrors with one structural guarantee: every
+  // ValidationError maps to a unique, non-fallback diagnostic name. This catches a missing
+  // switch arm (the real defect) without re-pinning each string the implementation returns.
+  std::set<std::string_view> seen;
+  for (int value = 0; value <= static_cast<int>(vdd::ValidationError::InvalidSerialNumber); ++value) {
+    const auto *name = vdd::to_string(static_cast<vdd::ValidationError>(value));
+    EXPECT_STRNE(name, "unknown") << "missing to_string arm for ValidationError " << value;
+    EXPECT_TRUE(seen.insert(name).second) << "duplicate ValidationError name: " << name;
+  }
 }

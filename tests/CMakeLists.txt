@@ -25,8 +25,13 @@ target_link_libraries(test_libvirtualdisplay
         PRIVATE
         gmock_main
         libvirtualdisplay::driver)
-target_compile_definitions(test_libvirtualdisplay
-        PRIVATE
-        LIBVIRTUALDISPLAY_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 gtest_discover_tests(test_libvirtualdisplay)
+
+# The driver INF is a generated artifact: its security-critical values come from the
+# device_identity source of truth via gen_driver_inf. Verify the committed INF stays in
+# sync instead of scraping its text from a unit test.
+add_test(NAME driver_inf_in_sync
+        COMMAND gen_driver_inf --check
+            "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf.in"
+            "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")

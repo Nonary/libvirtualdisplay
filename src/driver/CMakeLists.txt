@@ -14,6 +14,28 @@ if(WIN32)
     target_link_libraries(${MODULE} PRIVATE setupapi)
 endif()
 
+# Host tool that renders the committed driver INF from its template by substituting the
+# security-critical values (control interface GUID, SDDL) from the device_identity single
+# source of truth. It is pure C++ (no Win32), so it builds and runs in the normal/test
+# build. `regen_driver_inf` rewrites the committed INF; the test suite runs it in --check
+# mode (see tests/CMakeLists.txt) so the shipped INF can never drift from the C++ constants.
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(SUNSHINE_DRIVER_INF_TEMPLATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/windows_driver/SunshineVirtualDisplayDriver.inf.in")
+    set(SUNSHINE_DRIVER_INF_COMMITTED
+            "${CMAKE_CURRENT_SOURCE_DIR}/windows_driver/SunshineVirtualDisplayDriver.inf")
+
+    add_executable(gen_driver_inf "${PROJECT_SOURCE_DIR}/tools/gen_driver_inf.cpp")
+    target_link_libraries(gen_driver_inf PRIVATE libvirtualdisplay::driver)
+    target_compile_features(gen_driver_inf PRIVATE cxx_std_20)
+
+    add_custom_target(regen_driver_inf
+            COMMAND gen_driver_inf
+                "${SUNSHINE_DRIVER_INF_TEMPLATE}"
+                "${SUNSHINE_DRIVER_INF_COMMITTED}"
+            COMMENT "Regenerating SunshineVirtualDisplayDriver.inf from device_identity")
+endif()
+
 option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     set(_libvirtualdisplay_tool_default ON)

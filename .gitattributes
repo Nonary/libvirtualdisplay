@@ -1,0 +1,5 @@
+# The Windows driver INF and its generator template are CRLF artifacts. Pin their line
+# endings so gen_driver_inf's in-sync check (it compares the generated INF against the
+# committed one byte-for-byte) is deterministic regardless of platform or core.autocrlf.
+*.inf      text eol=crlf
+*.inf.in   text eol=crlf

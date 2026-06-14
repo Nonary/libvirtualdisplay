@@ -1,0 +1,79 @@
+; SunshineVirtualDisplayDriver.inf
+; Clean-room UMDF/IddCx virtual display driver for Sunshine.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+; Indirect display drivers need the WDDM display class version so Windows
+; publishes arrived monitors into the desktop display topology.
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=SunshineVirtualDisplayDriver.cat
+DriverVer=06/06/2026,1.3.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=Device_Install, Root\SunshineVirtualDisplay
+
+[SourceDisksNames]
+1=%DiskName%,,,""
+
+[SourceDisksFiles]
+SunshineVirtualDisplayDriver.dll=1
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[Device_Install.NT]
+CopyFiles=UMDriverCopy
+
+[Device_Install.NT.hw]
+AddReg=Device_Install_Hw_AddReg
+
+[Device_Install_Hw_AddReg]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",0x00000000,"SunshineVirtualDisplayGroup"
+HKR,,Security,,"@VDD_CONTROL_SECURITY_DESCRIPTOR@"
+HKR,,"ConfigVersion",0x00010001,1
+
+[Device_Install.NT.Interfaces]
+AddInterface=@VDD_CONTROL_INTERFACE_GUID@,,ControlInterface
+
+[ControlInterface]
+AddReg=ControlInterface_AddReg
+
+[ControlInterface_AddReg]
+HKR,,Security,,"@VDD_CONTROL_SECURITY_DESCRIPTOR@"
+
+[Device_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[Device_Install.NT.Wdf]
+UmdfService=SunshineVirtualDisplayDriver,SunshineVirtualDisplayDriver_Install
+UmdfServiceOrder=SunshineVirtualDisplayDriver
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[SunshineVirtualDisplayDriver_Install]
+UmdfLibraryVersion=2.25.0
+ServiceBinary=%12%\UMDF\SunshineVirtualDisplayDriver.dll
+UmdfExtensions=IddCx0102
+
+[UMDriverCopy]
+SunshineVirtualDisplayDriver.dll
+
+[Strings]
+ManufacturerName="Sunshine"
+DeviceName="Sunshine Virtual Display Driver"
+DiskName="Sunshine Virtual Display Driver Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"

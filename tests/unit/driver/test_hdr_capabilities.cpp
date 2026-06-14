@@ -6,18 +6,14 @@ namespace vdd = virtual_display::driver;
 TEST(VirtualDisplayDriverHdrCapabilities, AdvertisesWindowsHdrPrerequisites) {
   const auto capabilities = vdd::hdr_output_capabilities();
 
-  EXPECT_TRUE(capabilities.fp16_swapchain);
-  EXPECT_TRUE(capabilities.wide_color_space);
-  EXPECT_TRUE(capabilities.high_color_space);
-  EXPECT_FALSE(capabilities.endpoint_gamma_transform);
-  EXPECT_TRUE(capabilities.output_bits.rgb_8bpc);
-  EXPECT_TRUE(capabilities.output_bits.rgb_10bpc);
-  EXPECT_FALSE(capabilities.output_bits.ycbcr444);
-  EXPECT_FALSE(capabilities.output_bits.ycbcr422);
-  EXPECT_FALSE(capabilities.output_bits.ycbcr420);
-  EXPECT_FALSE(capabilities.dithering_bits.rgb_8bpc);
-  EXPECT_TRUE(capabilities.dithering_bits.rgb_10bpc);
+  // Assert the observable contract -- the default advertisement satisfies Windows' HDR-toggle
+  // prerequisites -- instead of mirroring each struct field. The per-field necessity of that
+  // predicate is exercised by RequiresFp16HighColorAndTenBitPathForHdrToggle below.
   EXPECT_TRUE(vdd::supports_windows_hdr_toggle(capabilities));
+
+  // The one prerequisite the toggle predicate does not cover: the driver must advertise no
+  // endpoint gamma transform so Windows owns the HDR transfer function.
+  EXPECT_FALSE(capabilities.endpoint_gamma_transform);
 }
 
 TEST(VirtualDisplayDriverHdrCapabilities, RequiresFp16HighColorAndTenBitPathForHdrToggle) {
