@@ -14,7 +14,9 @@ Sunshine virtual display stack.
 Keep these artifacts with each release record:
 
 - Driver package with INF, CAT, DLL, and PDB.
-- Tool package with `virtualdisplay.exe` and `virtualdisplay_probe.exe`.
+- Tool package with `virtualdisplay.exe`, `virtualdisplay_broker.exe`, and
+  `virtualdisplay_probe.exe`, plus the Vulkan layer (`VkLayer_sunshine_hdr.dll`
+  and `VkLayer_sunshine_hdr.json`).
 - Exact commit SHA, tag, Windows SDK version, WDK version, and ZIP SHA256.
 - Generated evidence JSON attached to the GitHub release.
 

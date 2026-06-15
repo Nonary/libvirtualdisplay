@@ -171,8 +171,8 @@ Supported settings:
 
 The driver validates modes against the protocol range:
 
-- width: `320` through `16384`
-- height: `200` through `16384`
+- width: `320` through `7680`
+- height: `200` through `4320`
 - physical width and height: `10 mm` through `2550 mm`
 - refresh: any positive millihertz value accepted by the protocol; the driver no longer applies a policy refresh-rate ceiling
 
