@@ -603,7 +603,19 @@ namespace {
       }
 
       NativeRegistryKey settings_key;
-      if (RegOpenKeyExW(per_monitor_settings_key.get(), settings_key_name, 0, KEY_SET_VALUE, settings_key.put()) != ERROR_SUCCESS) {
+      if (RegOpenKeyExW(per_monitor_settings_key.get(), settings_key_name, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, settings_key.put()) != ERROR_SUCCESS) {
+        continue;
+      }
+
+      // Never clobber a slot that already holds a different user-customized
+      // value. That slot is either a sibling source we have no business
+      // rewriting, or the slot the user is actively adjusting while this
+      // 20x/5s retain loop runs - overwriting it would fight the user's live
+      // change. Slots that are absent, default (DpiValue == 0), or already
+      // equal are safe to (re)seed with the retained value.
+      DWORD existing_value {};
+      if (read_registry_dword(settings_key.get(), L"DpiValue", existing_value) &&
+          existing_value != 0 && existing_value != dpi_value) {
         continue;
       }
 
