@@ -1,5 +1,6 @@
 #include "virtual_display/driver/control_client.h"
 #include "virtual_display/driver/probe_commands.h"
+#include "virtual_display/driver/device_identity.h"
 #include "virtual_display/driver/windows_control_client.h"
 
 #include <array>
@@ -36,7 +37,7 @@ namespace vdd = virtual_display::driver;
 
 namespace {
 #ifdef _WIN32
-  constexpr wchar_t kHelperEventSource[] = L"SunshineVirtualDisplayBroker";
+  constexpr const wchar_t *kHelperEventSource = vdd::kBrokerServiceNameW.data();
   constexpr DWORD kEventHelperTopologyApplied = 0x3000;
   constexpr DWORD kEventHelperTopologyFailed = 0x3001;
   constexpr DWORD kEventHelperColorQueryCompleted = 0x3100;

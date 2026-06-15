@@ -395,9 +395,10 @@ if (!released.ok()) {
   want Windows to retain display identity across sessions; use a unique
   `LeaseId` for each active temporary-display owner.
 - Names are fixed-size protocol strings with a `32` byte limit.
-- Width must be `320` through `16384`, height must be `200` through `16384`,
-  physical width and height must be `10` through `2550` millimeters, and
-  refresh rate must be `23000` through `480000` millihertz.
+- Width must be `320` through `7680` and height `200` through `4320`, with the
+  total resolution not exceeding `7680`×`4320` pixels. Physical width and height
+  must be `10` through `2550` millimeters. The refresh rate is given in
+  millihertz and must be non-zero (for example `60000` for 60 Hz).
 - Lease timeouts are clamped to the protocol range and reported back as
   `effective_timeout_ms`.
 - Permanent-display settings are shared by the active permanent pool; setting

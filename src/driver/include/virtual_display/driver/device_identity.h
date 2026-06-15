@@ -22,6 +22,30 @@ namespace virtual_display::driver {
   // keep the INF security descriptor correct -- the SID below recomputes automatically.
   inline constexpr std::string_view kBrokerServiceName = "SunshineVirtualDisplayBroker";
 
+  // Wide spelling of the same name for the Win32 service / event-log APIs the tools call.
+  // The static_assert keeps the two forms from drifting: the narrow form drives the derived
+  // SID, the wide form names the actual running service they must agree on.
+  inline constexpr std::wstring_view kBrokerServiceNameW = L"SunshineVirtualDisplayBroker";
+
+  namespace detail {
+    constexpr bool same_ascii(const std::string_view narrow, const std::wstring_view wide) {
+      if (narrow.size() != wide.size()) {
+        return false;
+      }
+      for (std::size_t i = 0; i < narrow.size(); ++i) {
+        if (static_cast<unsigned char>(narrow[i]) != static_cast<unsigned long>(wide[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }  // namespace detail
+
+  static_assert(
+    detail::same_ascii(kBrokerServiceName, kBrokerServiceNameW),
+    "broker service name must be identical in narrow and wide forms"
+  );
+
   // The per-service SID that Windows assigns to a service of the given name. Service SIDs
   // are "S-1-5-80-" followed by the five little-endian 32-bit words of the SHA-1 digest of
   // the upper-cased, UTF-16LE service name. This reproduces Windows' own derivation, so the

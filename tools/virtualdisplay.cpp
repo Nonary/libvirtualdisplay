@@ -1,5 +1,6 @@
 #include "virtual_display/driver/control_client.h"
 #include "virtual_display/driver/cli_commands.h"
+#include "virtual_display/driver/device_identity.h"
 #include "virtual_display/driver/windows_control_client.h"
 #include "virtual_display/driver/windows_cli_utils.h"
 
@@ -46,7 +47,7 @@ namespace {
 
 #ifdef _WIN32
   constexpr wchar_t kBrokerPipeName[] = L"\\\\.\\pipe\\SunshineVirtualDisplayBroker";
-  constexpr wchar_t kBrokerServiceName[] = L"SunshineVirtualDisplayBroker";
+  constexpr const wchar_t *kBrokerServiceName = vdd::kBrokerServiceNameW.data();
   constexpr wchar_t kBrokerServiceDisplayName[] = L"Sunshine Virtual Display Broker";
   constexpr wchar_t kBrokerServiceSecurityDescriptor[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
   constexpr wchar_t kBrokerServiceRequiredPrivileges[] =
