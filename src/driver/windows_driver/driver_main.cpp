@@ -2157,14 +2157,24 @@ namespace {
 
     vdd::BackendError reserve_temporary_display_identity(const vdd::DisplayDescriptor &descriptor) override {
       const auto dpi_value = read_retained_temporary_dpi_value(descriptor);
+      // A nullopt dpi_value is ambiguous: it can mean "the user is on
+      // recommended scaling / has no retained value" or "the interactive
+      // console hive was momentarily unreachable" (no console user logged in
+      // yet, WTSQueryUserToken not ready). Only treat it as a real absence
+      // when we can actually reach the console user's hive; on a transient
+      // token failure, keep whatever value we already retained so the 20x
+      // retry loop can still re-apply it once the user finishes logging in.
+      const auto console_user_available = active_console_user_sid_string().has_value();
       const auto result = save_temporary_display_profile(driver_, device_, descriptor);
       {
         std::lock_guard lock {mutex_};
         if (result == vdd::BackendError::None && dpi_value) {
           retained_dpi_values_by_display_id_[descriptor.display_id] = *dpi_value;
-        } else {
+        } else if (result != vdd::BackendError::None || console_user_available) {
           retained_dpi_values_by_display_id_.erase(descriptor.display_id);
         }
+        // else: transient console-hive unavailability - preserve the existing
+        // entry rather than dropping a value we simply could not read.
       }
       return result;
     }
