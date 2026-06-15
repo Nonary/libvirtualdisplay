@@ -465,9 +465,23 @@ namespace {
     HKEY per_monitor_settings_key,
     const std::wstring &settings_prefix
   ) {
+    // A single virtual display accumulates several PerMonitorSettings subkeys
+    // over its lifetime - one per OS source slot it has ever been assigned
+    // (the slot churns whenever Windows hands the monitor a new OsTargetId).
+    // Windows seeds each freshly minted slot at the recommended scaling
+    // (DpiValue == 0), so the old "return the first prefix match" logic was a
+    // coin flip that could capture a default-seeded slot instead of the slot
+    // still holding the user's customized scaling - and then the apply step
+    // would broadcast that default over every sibling, permanently losing the
+    // user's value. Prefer the user-customized (non-zero) value, and when
+    // several disagree keep the most recently written one.
+    bool have_value = false;
+    DWORD best_value = 0;
+    FILETIME best_written {};
     for (DWORD index = 0;; ++index) {
       wchar_t settings_key_name[256] {};
       DWORD settings_key_name_size = static_cast<DWORD>(std::size(settings_key_name));
+      FILETIME last_written {};
       const auto enum_status = RegEnumKeyExW(
         per_monitor_settings_key,
         index,
@@ -476,7 +490,7 @@ namespace {
         nullptr,
         nullptr,
         nullptr,
-        nullptr
+        &last_written
       );
       if (enum_status == ERROR_NO_MORE_ITEMS) {
         break;
@@ -491,12 +505,28 @@ namespace {
       }
 
       DWORD dpi_value {};
-      if (read_registry_dword(settings_key.get(), L"DpiValue", dpi_value)) {
-        return dpi_value;
+      if (!read_registry_dword(settings_key.get(), L"DpiValue", dpi_value)) {
+        continue;
+      }
+
+      // DpiValue is a signed step relative to the monitor's recommended
+      // scaling; 0 means "use recommended" and is exactly what a default-seeded
+      // slot holds, so it carries no user intent worth restoring.
+      if (dpi_value == 0) {
+        continue;
+      }
+
+      if (!have_value || CompareFileTime(&last_written, &best_written) > 0) {
+        have_value = true;
+        best_value = dpi_value;
+        best_written = last_written;
       }
     }
 
-    return std::nullopt;
+    if (!have_value) {
+      return std::nullopt;
+    }
+    return best_value;
   }
 
   std::optional<DWORD> read_retained_temporary_dpi_value(const vdd::DisplayDescriptor &descriptor) {
