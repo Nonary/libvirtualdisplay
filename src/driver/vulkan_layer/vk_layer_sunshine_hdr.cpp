@@ -17,7 +17,6 @@
 // NVIDIA 596.49).
 //
 // Environment variables:
-//   ENABLE_SUNSHINE_VIRTUAL_HDR=1   enable the implicit layer for this process.
 //   DISABLE_SUNSHINE_VIRTUAL_HDR=1  disable the layer (loader-level).
 //   SUNSHINE_VHDR_FORCE=1           inject regardless of monitor HDR support.
 #include <windows.h>
@@ -145,6 +144,20 @@ bool instance_data(const void *handle, InstanceData &data) {
   return true;
 }
 
+bool sunshine_streaming_hdr_active() {
+  HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\SunshineVirtualHdrActive");
+  if (!event) {
+    event = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\SunshineVirtualHdrActive");
+  }
+  if (!event) {
+    return false;
+  }
+
+  const bool active = WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+  CloseHandle(event);
+  return active;
+}
+
 // ---- Windows advanced color query ----
 bool monitor_reports_hdr(HWND hwnd) {
   if (!hwnd) {
@@ -227,6 +240,10 @@ bool monitor_reports_hdr(HWND hwnd) {
 }
 
 bool should_inject(VkSurfaceKHR surface) {
+  if (!sunshine_streaming_hdr_active()) {
+    return false;
+  }
+
   HWND hwnd = nullptr;
   {
     std::lock_guard<std::mutex> hold {g_lock};
