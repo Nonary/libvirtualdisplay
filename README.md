@@ -203,7 +203,8 @@ Register it system-wide with:
 `vulkan-layer install` self-elevates and registers the manifest from the
 `vulkan-layer` directory of the extracted release (or next to the CLI in a
 build tree); pass `--json PATH` to register a different manifest. Set
-`DISABLE_SUNSHINE_VIRTUAL_HDR=1` to disable the layer per-process, or
+`ENABLE_SUNSHINE_VIRTUAL_HDR=1` to opt a process into the layer,
+`DISABLE_SUNSHINE_VIRTUAL_HDR=1` to disable it per-process, or
 `SUNSHINE_VHDR_FORCE=1` to inject the formats regardless of the monitor's
 reported HDR support.
 

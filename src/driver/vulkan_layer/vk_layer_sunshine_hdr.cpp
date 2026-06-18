@@ -17,6 +17,7 @@
 // NVIDIA 596.49).
 //
 // Environment variables:
+//   ENABLE_SUNSHINE_VIRTUAL_HDR=1   enable the implicit layer for this process.
 //   DISABLE_SUNSHINE_VIRTUAL_HDR=1  disable the layer (loader-level).
 //   SUNSHINE_VHDR_FORCE=1           inject regardless of monitor HDR support.
 #include <windows.h>
@@ -131,10 +132,17 @@ void *dispatch_key(const void *handle) {
   return *reinterpret_cast<void *const *>(handle);
 }
 
-InstanceData *instance_data(const void *handle) {
+bool instance_data(const void *handle, InstanceData &data) {
+  if (!handle) {
+    return false;
+  }
   std::lock_guard<std::mutex> hold {g_lock};
   const auto it = g_instances.find(dispatch_key(handle));
-  return it == g_instances.end() ? nullptr : &it->second;
+  if (it == g_instances.end()) {
+    return false;
+  }
+  data = it->second;
+  return true;
 }
 
 // ---- Windows advanced color query ----
@@ -253,11 +261,11 @@ void append_missing(std::vector<VkSurfaceFormatKHR> &formats) {
 // ---- intercepted entry points ----
 VkResult __stdcall layer_CreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *create_info,
                                                const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface) {
-  auto *data = instance_data(instance);
-  if (!data || !data->next_create_win32_surface) {
+  InstanceData data;
+  if (!instance_data(instance, data) || !data.next_create_win32_surface) {
     return kVkErrorInitializationFailed;
   }
-  const VkResult result = data->next_create_win32_surface(instance, create_info, allocator, surface);
+  const VkResult result = data.next_create_win32_surface(instance, create_info, allocator, surface);
   if (result == kVkSuccess && create_info) {
     std::lock_guard<std::mutex> hold {g_lock};
     g_surface_hwnd[*surface] = create_info->hwnd;
@@ -266,35 +274,36 @@ VkResult __stdcall layer_CreateWin32SurfaceKHR(VkInstance instance, const VkWin3
 }
 
 void __stdcall layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *allocator) {
-  auto *data = instance_data(instance);
+  InstanceData data;
+  const bool have_data = instance_data(instance, data);
   {
     std::lock_guard<std::mutex> hold {g_lock};
     g_surface_hwnd.erase(surface);
   }
-  if (data && data->next_destroy_surface) {
-    data->next_destroy_surface(instance, surface, allocator);
+  if (have_data && data.next_destroy_surface) {
+    data.next_destroy_surface(instance, surface, allocator);
   }
 }
 
 VkResult __stdcall layer_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
                                                             std::uint32_t *count, VkSurfaceFormatKHR *out) {
-  auto *data = instance_data(physical_device);
-  if (!data || !data->next_get_formats) {
+  InstanceData data;
+  if (!instance_data(physical_device, data) || !data.next_get_formats) {
     return kVkErrorInitializationFailed;
   }
   if (!should_inject(surface)) {
-    return data->next_get_formats(physical_device, surface, count, out);
+    return data.next_get_formats(physical_device, surface, count, out);
   }
 
   std::uint32_t base_count = 0;
-  VkResult result = data->next_get_formats(physical_device, surface, &base_count, nullptr);
+  VkResult result = data.next_get_formats(physical_device, surface, &base_count, nullptr);
   if (result != kVkSuccess) {
-    return data->next_get_formats(physical_device, surface, count, out);
+    return data.next_get_formats(physical_device, surface, count, out);
   }
   std::vector<VkSurfaceFormatKHR> formats(base_count);
-  result = data->next_get_formats(physical_device, surface, &base_count, formats.data());
+  result = data.next_get_formats(physical_device, surface, &base_count, formats.data());
   if (result != kVkSuccess && result != kVkIncomplete) {
-    return data->next_get_formats(physical_device, surface, count, out);
+    return data.next_get_formats(physical_device, surface, count, out);
   }
   formats.resize(base_count);
   append_missing(formats);
@@ -313,27 +322,27 @@ VkResult __stdcall layer_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice phy
 VkResult __stdcall layer_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physical_device,
                                                              const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
                                                              std::uint32_t *count, VkSurfaceFormat2KHR *out) {
-  auto *data = instance_data(physical_device);
-  if (!data || !data->next_get_formats2) {
+  InstanceData data;
+  if (!instance_data(physical_device, data) || !data.next_get_formats2) {
     return kVkErrorInitializationFailed;
   }
   if (!surface_info || !should_inject(surface_info->surface)) {
-    return data->next_get_formats2(physical_device, surface_info, count, out);
+    return data.next_get_formats2(physical_device, surface_info, count, out);
   }
 
   std::uint32_t base_count = 0;
-  VkResult result = data->next_get_formats2(physical_device, surface_info, &base_count, nullptr);
+  VkResult result = data.next_get_formats2(physical_device, surface_info, &base_count, nullptr);
   if (result != kVkSuccess) {
-    return data->next_get_formats2(physical_device, surface_info, count, out);
+    return data.next_get_formats2(physical_device, surface_info, count, out);
   }
   std::vector<VkSurfaceFormat2KHR> base(base_count);
   for (auto &entry : base) {
     entry.sType = kStructureTypeSurfaceFormat2;
     entry.pNext = nullptr;
   }
-  result = data->next_get_formats2(physical_device, surface_info, &base_count, base.data());
+  result = data.next_get_formats2(physical_device, surface_info, &base_count, base.data());
   if (result != kVkSuccess && result != kVkIncomplete) {
-    return data->next_get_formats2(physical_device, surface_info, count, out);
+    return data.next_get_formats2(physical_device, surface_info, count, out);
   }
   std::vector<VkSurfaceFormatKHR> formats;
   formats.reserve(base_count + 2);
@@ -437,6 +446,6 @@ extern "C" __declspec(dllexport) PFN_vkVoidFunction __stdcall vkGetInstanceProcA
   if (!instance) {
     return nullptr;
   }
-  auto *data = instance_data(instance);
-  return data && data->next_gipa ? data->next_gipa(instance, name) : nullptr;
+  InstanceData data;
+  return instance_data(instance, data) && data.next_gipa ? data.next_gipa(instance, name) : nullptr;
 }
