@@ -2016,16 +2016,31 @@ namespace {
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
 
-  void defer_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> processor) {
+  enum class DeferredSwapChainCleanup {
+    CloseOwned,
+    AbandonOwned
+  };
+
+  void defer_stop_swapchain_processor(
+    std::unique_ptr<SwapChainProcessor> processor,
+    const DeferredSwapChainCleanup cleanup = DeferredSwapChainCleanup::CloseOwned
+  ) {
     if (!processor) {
       return;
     }
 
+    if (cleanup == DeferredSwapChainCleanup::AbandonOwned) {
+      processor->mark_assign_abandoned();
+    }
+
     try {
-      std::thread {[processor = std::move(processor)]() mutable {
+      std::thread {[processor = std::move(processor), cleanup]() mutable {
         TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupStarted");
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupStarted");
         processor->stop();
+        if (cleanup == DeferredSwapChainCleanup::AbandonOwned) {
+          processor->abandon_swapchain();
+        }
         processor.reset();
         TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupComplete");
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupComplete");
@@ -2041,7 +2056,10 @@ namespace {
     }
   }
 
-  void stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
+  void stop_swapchain_processor(
+    std::unique_ptr<SwapChainProcessor> &processor,
+    const DeferredSwapChainCleanup deferred_cleanup = DeferredSwapChainCleanup::CloseOwned
+  ) {
     if (!processor) {
       return;
     }
@@ -2051,10 +2069,10 @@ namespace {
       return;
     }
 
-    // Keep teardown non-blocking for IddCx, but retain ownership so slow
-    // workers eventually release their D3D and swapchain resources instead of
-    // accumulating for the lifetime of the UMDF host.
-    defer_stop_swapchain_processor(std::move(processor));
+    // Keep teardown non-blocking for IddCx. Callers that can cross monitor
+    // departure clear ownership before deferred cleanup starts so neither the
+    // worker nor the destructor deletes a stale IddCx/WDF swapchain handle.
+    defer_stop_swapchain_processor(std::move(processor), deferred_cleanup);
   }
 
   void request_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
@@ -2063,9 +2081,12 @@ namespace {
     }
   }
 
-  void stop_swapchain_processors(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
+  void stop_swapchain_processors(
+    std::vector<std::unique_ptr<SwapChainProcessor>> &processors,
+    const DeferredSwapChainCleanup deferred_cleanup = DeferredSwapChainCleanup::CloseOwned
+  ) {
     for (auto &processor: processors) {
-      stop_swapchain_processor(processor);
+      stop_swapchain_processor(processor, deferred_cleanup);
     }
     processors.clear();
   }
@@ -2694,14 +2715,14 @@ namespace {
         cursor_processor_to_stop->stop();
       }
 
-      // Wake all frame workers first so stopped processors can close their
-      // owned swapchains before monitor departure. Closing the WDF swapchain
-      // object releases any final frame IddCx still attributes to the driver;
-      // slow workers move to deferred cleanup so monitor removal stays bounded.
+      // Wake all frame workers first so processors that stop within the
+      // teardown window can close their owned swapchains before monitor
+      // departure. Slow workers move to no-delete deferred cleanup because the
+      // cleanup thread may outlive the IddCx/WDF swapchain lifetime boundary.
       request_stop_swapchain_processor(processor_to_stop);
       request_stop_swapchain_processors(retired_processors_to_stop);
-      stop_swapchain_processor(processor_to_stop);
-      stop_swapchain_processors(retired_processors_to_stop);
+      stop_swapchain_processor(processor_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+      stop_swapchain_processors(retired_processors_to_stop, DeferredSwapChainCleanup::AbandonOwned);
 
       // IddCx can synchronously or asynchronously issue swapchain callbacks
       // during departure. Calling it outside the backend mutex keeps those
@@ -2772,9 +2793,9 @@ namespace {
         processor->abandon_swapchain();
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
+      processor->mark_assign_succeeded();
 
       std::unique_ptr<SwapChainProcessor> previous_processor;
-      SwapChainProcessor *assigned_processor = nullptr;
       bool abandon_new_processor = false;
       {
         std::lock_guard lock {mutex_};
@@ -2783,7 +2804,6 @@ namespace {
           abandon_new_processor = true;
         } else {
           previous_processor = std::move(record->second.swapchain_processor);
-          assigned_processor = processor.get();
           record->second.swapchain_processor = std::move(processor);
         }
       }
@@ -2795,25 +2815,26 @@ namespace {
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
 
-      assigned_processor->mark_assign_succeeded();
-
       if (previous_processor) {
         // IddCx rotates swapchains inside HandleNewSwapChain. Request the old
         // worker to stop, but keep the old WDF object alive until monitor
         // teardown so this callback never waits on a worker blocked in IddCx.
         previous_processor->request_stop();
         bool retired = false;
+        auto deferred_cleanup = DeferredSwapChainCleanup::CloseOwned;
         try {
           std::lock_guard lock {mutex_};
           const auto record = find_current_monitor_locked(context->display_id, monitor);
-          if (record != monitors_.end()) {
+          if (record != monitors_.end() && !record->second.departing) {
             record->second.retired_swapchain_processors.push_back(std::move(previous_processor));
             retired = true;
+          } else {
+            deferred_cleanup = DeferredSwapChainCleanup::AbandonOwned;
           }
         } catch (...) {
         }
         if (!retired && previous_processor) {
-          defer_stop_swapchain_processor(std::move(previous_processor));
+          defer_stop_swapchain_processor(std::move(previous_processor), deferred_cleanup);
         }
       }
 

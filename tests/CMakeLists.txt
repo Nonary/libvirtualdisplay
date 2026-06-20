@@ -25,6 +25,9 @@ target_link_libraries(test_libvirtualdisplay
         PRIVATE
         gmock_main
         libvirtualdisplay::driver)
+if(TARGET gen_driver_inf)
+    add_dependencies(test_libvirtualdisplay gen_driver_inf)
+endif()
 
 gtest_discover_tests(test_libvirtualdisplay)
 
