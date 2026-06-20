@@ -1813,9 +1813,10 @@ namespace {
 
     void delete_swapchain() {
       if (const auto swapchain = claim_owned_swapchain_for_delete()) {
-        // Match the IddCx sample by closing the swapchain when processing
-        // stops. Waiting until after monitor departure can leave us deleting
-        // a UMDF object that IddCx has already invalidated.
+        // A successful AssignSwapChain transfers hSwapChain ownership to the
+        // driver. Closing the WDF object is what releases any frame still owned
+        // after the worker exits; abandon_swapchain() is only for callbacks we
+        // return to IddCx as ABANDON_SWAPCHAIN.
         WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapchain));
       }
     }
@@ -2015,7 +2016,7 @@ namespace {
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
 
-  void defer_stop_swapchain_processor_without_delete(std::unique_ptr<SwapChainProcessor> processor) {
+  void defer_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> processor) {
     if (!processor) {
       return;
     }
@@ -2025,7 +2026,6 @@ namespace {
         TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupStarted");
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupStarted");
         processor->stop();
-        processor->abandon_swapchain();
         processor.reset();
         TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupComplete");
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupComplete");
@@ -2041,13 +2041,12 @@ namespace {
     }
   }
 
-  void stop_swapchain_processor_without_delete(std::unique_ptr<SwapChainProcessor> &processor) {
+  void stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
     if (!processor) {
       return;
     }
 
     if (processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)) {
-      processor->abandon_swapchain();
       processor.reset();
       return;
     }
@@ -2055,7 +2054,7 @@ namespace {
     // Keep teardown non-blocking for IddCx, but retain ownership so slow
     // workers eventually release their D3D and swapchain resources instead of
     // accumulating for the lifetime of the UMDF host.
-    defer_stop_swapchain_processor_without_delete(std::move(processor));
+    defer_stop_swapchain_processor(std::move(processor));
   }
 
   void request_stop_swapchain_processor(std::unique_ptr<SwapChainProcessor> &processor) {
@@ -2064,9 +2063,9 @@ namespace {
     }
   }
 
-  void stop_swapchain_processors_without_delete(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
+  void stop_swapchain_processors(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
     for (auto &processor: processors) {
-      stop_swapchain_processor_without_delete(processor);
+      stop_swapchain_processor(processor);
     }
     processors.clear();
   }
@@ -2695,18 +2694,19 @@ namespace {
         cursor_processor_to_stop->stop();
       }
 
-      // Wake frame processing before departure, but do not join here. If a
-      // worker is blocked inside IddCx swapchain processing, monitor departure
-      // is the state transition that can invalidate and release that wait.
+      // Wake all frame workers first so stopped processors can close their
+      // owned swapchains before monitor departure. Closing the WDF swapchain
+      // object releases any final frame IddCx still attributes to the driver;
+      // slow workers move to deferred cleanup so monitor removal stays bounded.
       request_stop_swapchain_processor(processor_to_stop);
       request_stop_swapchain_processors(retired_processors_to_stop);
+      stop_swapchain_processor(processor_to_stop);
+      stop_swapchain_processors(retired_processors_to_stop);
 
       // IddCx can synchronously or asynchronously issue swapchain callbacks
       // during departure. Calling it outside the backend mutex keeps those
       // callbacks from re-entering a locked monitor map.
       const auto status = IddCxMonitorDeparture(monitor_handle);
-      stop_swapchain_processor_without_delete(processor_to_stop);
-      stop_swapchain_processors_without_delete(retired_processors_to_stop);
       if (!NT_SUCCESS(status)) {
         TraceLoggingWrite(
           g_trace_provider,
@@ -2813,7 +2813,7 @@ namespace {
         } catch (...) {
         }
         if (!retired && previous_processor) {
-          previous_processor->abandon_swapchain();
+          defer_stop_swapchain_processor(std::move(previous_processor));
         }
       }
 
@@ -2853,10 +2853,11 @@ namespace {
         retired_processors_to_stop = std::move(record->second.retired_swapchain_processors);
       }
 
-      // IddCx calls UnassignSwapChain after the associated swapchain is no
-      // longer valid. Do not WdfObjectDelete that handle from our destructor.
-      stop_swapchain_processor_without_delete(processor_to_stop);
-      stop_swapchain_processors_without_delete(retired_processors_to_stop);
+      // IddCx unassign asks the driver to stop processing and close its owned
+      // swapchain object. The assignment ownership gate keeps abandoned
+      // swapchains from being deleted here.
+      stop_swapchain_processor(processor_to_stop);
+      stop_swapchain_processors(retired_processors_to_stop);
       TraceLoggingWrite(g_trace_provider, "SwapChainUnassigned", TraceLoggingUInt64(context->display_id, "DisplayId"));
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainUnassigned");
       return STATUS_SUCCESS;
