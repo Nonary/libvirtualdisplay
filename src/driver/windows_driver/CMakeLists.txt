@@ -6,7 +6,11 @@ set(SUNSHINE_DRIVER_TARGET SunshineVirtualDisplayDriver)
 set(SUNSHINE_DRIVER_WDF_VERSION "2.25" CACHE STRING "UMDF version for the Sunshine virtual display driver" FORCE)
 set(SUNSHINE_DRIVER_IDDCX_VERSION "1.10" CACHE STRING "IddCx include/library version for the Sunshine virtual display driver" FORCE)
 set(SUNSHINE_DRIVER_PLATFORM "${CMAKE_VS_PLATFORM_NAME}")
-set(SUNSHINE_DRIVER_INF "${CMAKE_CURRENT_SOURCE_DIR}/SunshineVirtualDisplayDriver.inf")
+if(SUNSHINE_DRIVER_INF_GENERATED)
+    set(SUNSHINE_DRIVER_INF "${SUNSHINE_DRIVER_INF_GENERATED}")
+else()
+    set(SUNSHINE_DRIVER_INF "${CMAKE_CURRENT_SOURCE_DIR}/SunshineVirtualDisplayDriver.inf")
+endif()
 
 if(NOT SUNSHINE_DRIVER_PLATFORM)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -122,6 +126,9 @@ unset(_sunshine_driver_candidate_root)
 add_library(${SUNSHINE_DRIVER_TARGET} SHARED
         driver_main.cpp
         "${SUNSHINE_DRIVER_INF}")
+if(TARGET gen_driver_package_inf)
+    add_dependencies(${SUNSHINE_DRIVER_TARGET} gen_driver_package_inf)
+endif()
 
 find_program(SUNSHINE_DRIVER_TRACEWPP
         NAMES TraceWPP.exe tracewpp.exe

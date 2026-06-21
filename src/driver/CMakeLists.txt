@@ -14,12 +14,23 @@ if(WIN32)
     target_link_libraries(${MODULE} PRIVATE setupapi)
 endif()
 
+option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    set(_libvirtualdisplay_tool_default ON)
+else()
+    set(_libvirtualdisplay_tool_default OFF)
+endif()
+option(BUILD_VIRTUALDISPLAY_TOOLS "Build virtualdisplay CLI and broker executables" ${_libvirtualdisplay_tool_default})
+option(BUILD_VIRTUALDISPLAY_PROBE "Build virtual display driver probe executable" ${_libvirtualdisplay_tool_default})
+option(BUILD_VIRTUALDISPLAY_VULKAN_LAYER "Build the Vulkan implicit layer that exposes HDR surface formats on virtual displays" ${_libvirtualdisplay_tool_default})
+unset(_libvirtualdisplay_tool_default)
+
 # Host tool that renders the committed driver INF from its template by substituting the
 # security-critical values (control interface GUID, SDDL) from the device_identity single
 # source of truth. It is pure C++ (no Win32), so it builds and runs in the normal/test
 # build. `regen_driver_inf` rewrites the committed INF; the test suite runs it in --check
 # mode (see tests/CMakeLists.txt) so the shipped INF can never drift from the C++ constants.
-if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER)
     set(SUNSHINE_DRIVER_INF_TEMPLATE
             "${CMAKE_CURRENT_SOURCE_DIR}/windows_driver/SunshineVirtualDisplayDriver.inf.in")
     set(SUNSHINE_DRIVER_INF_COMMITTED
@@ -34,18 +45,42 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
                 "${SUNSHINE_DRIVER_INF_TEMPLATE}"
                 "${SUNSHINE_DRIVER_INF_COMMITTED}"
             COMMENT "Regenerating SunshineVirtualDisplayDriver.inf from device_identity")
-endif()
 
-option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
-if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
-    set(_libvirtualdisplay_tool_default ON)
-else()
-    set(_libvirtualdisplay_tool_default OFF)
+    set(_libvirtualdisplay_driver_version_source "${LIBVIRTUALDISPLAY_PACKAGE_VERSION}")
+    string(REGEX REPLACE "^v" "" _libvirtualdisplay_driver_version_source "${_libvirtualdisplay_driver_version_source}")
+    string(REGEX REPLACE "[-+].*$" "" _libvirtualdisplay_driver_version_source "${_libvirtualdisplay_driver_version_source}")
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(\\.([0-9]+))?$" _libvirtualdisplay_driver_version_match "${_libvirtualdisplay_driver_version_source}")
+    if(NOT _libvirtualdisplay_driver_version_match)
+        message(FATAL_ERROR "LIBVIRTUALDISPLAY_PACKAGE_VERSION must start with a numeric version usable for DriverVer, got '${LIBVIRTUALDISPLAY_PACKAGE_VERSION}'")
+    endif()
+    if(CMAKE_MATCH_5 STREQUAL "")
+        set(_libvirtualdisplay_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}.0")
+    else()
+        set(_libvirtualdisplay_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}.${CMAKE_MATCH_5}")
+    endif()
+    set(LIBVIRTUALDISPLAY_DRIVER_VERSION "${_libvirtualdisplay_driver_version}" CACHE STRING "Four-part Windows DriverVer version for SunshineVirtualDisplayDriver.inf" FORCE)
+    set(LIBVIRTUALDISPLAY_DRIVER_DATE "" CACHE STRING "Windows DriverVer date for SunshineVirtualDisplayDriver.inf, formatted MM/DD/YYYY")
+    if(NOT LIBVIRTUALDISPLAY_DRIVER_DATE)
+        string(TIMESTAMP LIBVIRTUALDISPLAY_DRIVER_DATE "%m/%d/%Y" UTC)
+        set(LIBVIRTUALDISPLAY_DRIVER_DATE "${LIBVIRTUALDISPLAY_DRIVER_DATE}" CACHE STRING "Windows DriverVer date for SunshineVirtualDisplayDriver.inf, formatted MM/DD/YYYY" FORCE)
+    endif()
+    if(NOT LIBVIRTUALDISPLAY_DRIVER_DATE MATCHES "^[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]$")
+        message(FATAL_ERROR "LIBVIRTUALDISPLAY_DRIVER_DATE must be formatted MM/DD/YYYY, got '${LIBVIRTUALDISPLAY_DRIVER_DATE}'")
+    endif()
+
+    set(SUNSHINE_DRIVER_INF_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/windows_driver/SunshineVirtualDisplayDriver.inf")
+    add_custom_command(OUTPUT "${SUNSHINE_DRIVER_INF_GENERATED}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/windows_driver"
+            COMMAND gen_driver_inf
+                --driverver-date "${LIBVIRTUALDISPLAY_DRIVER_DATE}"
+                --driverver-version "${LIBVIRTUALDISPLAY_DRIVER_VERSION}"
+                "${SUNSHINE_DRIVER_INF_TEMPLATE}"
+                "${SUNSHINE_DRIVER_INF_GENERATED}"
+            DEPENDS gen_driver_inf "${SUNSHINE_DRIVER_INF_TEMPLATE}"
+            COMMENT "Generating SunshineVirtualDisplayDriver.inf with DriverVer ${LIBVIRTUALDISPLAY_DRIVER_DATE},${LIBVIRTUALDISPLAY_DRIVER_VERSION}"
+            VERBATIM)
+    add_custom_target(gen_driver_package_inf DEPENDS "${SUNSHINE_DRIVER_INF_GENERATED}")
 endif()
-option(BUILD_VIRTUALDISPLAY_TOOLS "Build virtualdisplay CLI and broker executables" ${_libvirtualdisplay_tool_default})
-option(BUILD_VIRTUALDISPLAY_PROBE "Build virtual display driver probe executable" ${_libvirtualdisplay_tool_default})
-option(BUILD_VIRTUALDISPLAY_VULKAN_LAYER "Build the Vulkan implicit layer that exposes HDR surface formats on virtual displays" ${_libvirtualdisplay_tool_default})
-unset(_libvirtualdisplay_tool_default)
 
 if(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER)
     add_subdirectory(windows_driver)
