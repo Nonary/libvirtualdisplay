@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace virtual_display::driver {
   enum class IoctlStatus {
@@ -35,7 +36,8 @@ namespace virtual_display::driver {
       std::size_t input_size,
       void *output,
       std::size_t output_size,
-      std::chrono::steady_clock::time_point now
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock = nullptr
     );
 
   private:

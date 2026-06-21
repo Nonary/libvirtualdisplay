@@ -41,6 +41,7 @@ namespace virtual_display::driver {
     std::chrono::steady_clock::time_point expires_at {};
     bool retain_identity {true};
     std::uint64_t identity_display_id {};
+    std::uint64_t generation {};
     bool pending_departure {};
   };
 
@@ -95,6 +96,7 @@ namespace virtual_display::driver {
     [[nodiscard]] std::optional<TemporaryDisplayRecord> find_temporary_display(std::uint64_t display_id) const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> temporary_displays() const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> temporary_displays_for_lease(std::uint64_t lease_id) const;
+    [[nodiscard]] std::vector<TemporaryDisplayRecord> pending_departure_temporary_displays() const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> expired_temporary_displays(std::chrono::steady_clock::time_point now) const;
 
   private:
@@ -113,6 +115,10 @@ namespace virtual_display::driver {
     std::uint32_t connector_index_for_display(std::uint64_t display_id, bool retain_identity);
     bool lease_has_displays(std::uint64_t lease_id) const;
     bool lease_has_pending_departure(std::uint64_t lease_id) const;
+    bool lease_has_expired_pending_departure(
+      std::uint64_t lease_id,
+      std::chrono::steady_clock::time_point now
+    ) const;
     void remove_lease_if_empty(std::uint64_t lease_id);
 
     std::uint32_t max_permanent_displays_ {};
@@ -124,6 +130,7 @@ namespace virtual_display::driver {
     std::map<std::uint64_t, LeaseRecord> leases_by_id_ {};
     std::map<std::uint64_t, std::uint32_t> connector_reservations_by_display_id_ {};
     std::uint64_t next_ephemeral_identity_ {1};
+    std::uint64_t next_temporary_display_generation_ {1};
   };
 
   const char *to_string(StoreError error);

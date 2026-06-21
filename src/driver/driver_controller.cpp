@@ -2,13 +2,54 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 namespace virtual_display::driver {
+  namespace {
+    constexpr auto kBackendCallLockTimeout = std::chrono::milliseconds(500);
+
+    template<class Result, class Call>
+    auto call_backend_without_controller_lock(
+      std::timed_mutex &backend_call_mutex,
+      std::unique_lock<std::timed_mutex> *controller_lock,
+      Result busy_result,
+      Call &&call
+    ) -> Result {
+      const bool relock_controller = controller_lock && controller_lock->owns_lock();
+      if (relock_controller) {
+        controller_lock->unlock();
+      }
+
+      std::unique_lock backend_lock {backend_call_mutex, std::defer_lock};
+      if (!backend_lock.try_lock_for(kBackendCallLockTimeout)) {
+        if (relock_controller) {
+          controller_lock->lock();
+        }
+        return busy_result;
+      }
+
+      auto result = call();
+      if (relock_controller) {
+        controller_lock->lock();
+      }
+      return result;
+    }
+  }  // namespace
+
   bool ControllerStatus::ok() const {
     return store_error == StoreError::None &&
            validation_error == ValidationError::None &&
            backend_error == BackendError::None;
+  }
+
+  bool DriverController::temporary_display_generation_is_current(
+    const TemporaryDisplayRecord &record
+  ) const {
+    const auto current = store_.find_temporary_display(record.display_id);
+    return current &&
+           current->lease_id == record.lease_id &&
+           current->generation == record.generation;
   }
 
   DriverController::DriverController(DisplayStore store, DisplayDriverBackend &backend):
@@ -18,8 +59,48 @@ namespace virtual_display::driver {
 
   ControllerCreateResult DriverController::create_temporary_display(
     const CreateTemporaryDisplayRequest &request,
-    const std::chrono::steady_clock::time_point now
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
   ) {
+    if (const auto validation = validate_create_temporary_display(request);
+        validation != ValidationError::None) {
+      return {
+        {StoreError::ValidationFailed, validation, BackendError::None},
+        {}
+      };
+    }
+
+    if (const auto existing = store_.find_temporary_display(request.display_id);
+        existing && existing->pending_departure) {
+      const auto pending_record = *existing;
+      if (const auto backend_error = call_backend_without_controller_lock(
+            backend_call_mutex_,
+            controller_lock,
+            BackendError::Failed,
+            [&]() {
+              return backend_.depart_temporary_display(existing->display_id);
+            });
+          backend_error != BackendError::None) {
+        if (temporary_display_generation_is_current(pending_record)) {
+          LeaseDisplayRequest pending {};
+          pending.lease_id = pending_record.lease_id;
+          pending.display_id = pending_record.display_id;
+          (void) store_.mark_temporary_display_pending_departure(pending);
+        }
+        return {
+          {StoreError::None, ValidationError::None, backend_error},
+          {}
+        };
+      }
+
+      if (temporary_display_generation_is_current(pending_record)) {
+        LeaseDisplayRequest remove {};
+        remove.lease_id = pending_record.lease_id;
+        remove.display_id = pending_record.display_id;
+        (void) store_.remove_temporary_display(remove);
+      }
+    }
+
     auto created = store_.create_temporary_display(request, now);
     if (created.status.error != StoreError::None) {
       return {from_store_result(created.status), {}};
@@ -34,9 +115,16 @@ namespace virtual_display::driver {
     }
 
     const auto descriptor = descriptor_from_record(*record);
+    const auto created_record = *record;
     bool identity_reserved = false;
     if (descriptor.retain_identity) {
-      if (const auto backend_error = backend_.reserve_temporary_display_identity(descriptor);
+      if (const auto backend_error = call_backend_without_controller_lock(
+            backend_call_mutex_,
+            controller_lock,
+            BackendError::Failed,
+            [&]() {
+              return backend_.reserve_temporary_display_identity(descriptor);
+            });
           backend_error != BackendError::None) {
         LeaseDisplayRequest rollback {};
         rollback.lease_id = request.lease_id;
@@ -51,13 +139,41 @@ namespace virtual_display::driver {
         };
       }
       identity_reserved = true;
+
+      if (!temporary_display_generation_is_current(created_record)) {
+        (void) call_backend_without_controller_lock(
+          backend_call_mutex_,
+          controller_lock,
+          BackendError::Failed,
+          [&]() {
+            return backend_.unreserve_temporary_display_identity(request.display_id);
+          }
+        );
+        return {
+          {StoreError::DisplayNotFound, ValidationError::None, BackendError::None},
+          {}
+        };
+      }
     }
 
-    const auto backend_result = backend_.arrive_temporary_display(descriptor);
+    const auto backend_result = call_backend_without_controller_lock(
+      backend_call_mutex_,
+      controller_lock,
+      BackendDisplayResult {BackendError::Failed, {}, 0},
+      [&]() {
+        return backend_.arrive_temporary_display(descriptor);
+      }
+    );
     if (backend_result.error != BackendError::None) {
       auto rollback_mode = RemoveTemporaryDisplayMode::ReleaseConnectorReservation;
       if (identity_reserved) {
-        if (backend_.unreserve_temporary_display_identity(request.display_id) != BackendError::None) {
+        if (call_backend_without_controller_lock(
+              backend_call_mutex_,
+              controller_lock,
+              BackendError::Failed,
+              [&]() {
+                return backend_.unreserve_temporary_display_identity(request.display_id);
+              }) != BackendError::None) {
           rollback_mode = RemoveTemporaryDisplayMode::RetainConnectorReservation;
         }
       }
@@ -74,12 +190,58 @@ namespace virtual_display::driver {
       };
     }
 
+    const auto arrived_record = store_.find_temporary_display(request.display_id);
+    if (!arrived_record ||
+        arrived_record->lease_id != request.lease_id ||
+        arrived_record->generation != created_record.generation) {
+      (void) call_backend_without_controller_lock(
+        backend_call_mutex_,
+        controller_lock,
+        BackendError::Failed,
+        [&]() {
+          return backend_.depart_temporary_display(request.display_id);
+        }
+      );
+      return {
+        {StoreError::DisplayNotFound, ValidationError::None, BackendError::None},
+        {}
+      };
+    }
+    if (arrived_record->pending_departure) {
+      const auto cleanup_error = call_backend_without_controller_lock(
+        backend_call_mutex_,
+        controller_lock,
+        BackendError::Failed,
+        [&]() {
+          return backend_.depart_temporary_display(request.display_id);
+        }
+      );
+      if (cleanup_error == BackendError::None &&
+          temporary_display_generation_is_current(*arrived_record)) {
+        LeaseDisplayRequest remove {};
+        remove.lease_id = arrived_record->lease_id;
+        remove.display_id = arrived_record->display_id;
+        (void) store_.remove_temporary_display(remove);
+      }
+      return {
+        {cleanup_error == BackendError::None ? StoreError::DisplayNotFound : StoreError::None, ValidationError::None, cleanup_error},
+        {}
+      };
+    }
+
     created.result.os_adapter_luid = backend_result.os_adapter_luid;
     created.result.target_id = backend_result.target_id;
     return {{}, created.result};
   }
 
   ControllerStatus DriverController::remove_temporary_display(const LeaseDisplayRequest &request) {
+    return remove_temporary_display(request, nullptr);
+  }
+
+  ControllerStatus DriverController::remove_temporary_display(
+    const LeaseDisplayRequest &request,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     if (const auto validation = validate_lease_display_request(request);
         validation != ValidationError::None) {
       return {StoreError::ValidationFailed, validation, BackendError::None};
@@ -90,10 +252,20 @@ namespace virtual_display::driver {
       return {StoreError::DisplayNotFound, ValidationError::None, BackendError::None};
     }
 
-    if (const auto backend_error = backend_.depart_temporary_display(request.display_id);
+    if (const auto backend_error = call_backend_without_controller_lock(
+          backend_call_mutex_,
+          controller_lock,
+          BackendError::Failed,
+          [&]() {
+            return backend_.depart_temporary_display(request.display_id);
+          });
         backend_error != BackendError::None) {
       (void) store_.mark_temporary_display_pending_departure(request);
       return {StoreError::None, ValidationError::None, backend_error};
+    }
+
+    if (!temporary_display_generation_is_current(*record)) {
+      return {StoreError::DisplayNotFound, ValidationError::None, BackendError::None};
     }
 
     return from_store_result(store_.remove_temporary_display(request));
@@ -107,6 +279,13 @@ namespace virtual_display::driver {
   }
 
   ControllerStatus DriverController::release_lease(const LeaseRequest &request) {
+    return release_lease(request, nullptr);
+  }
+
+  ControllerStatus DriverController::release_lease(
+    const LeaseRequest &request,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     if (const auto validation = validate_lease_request(request);
         validation != ValidationError::None) {
       return {StoreError::ValidationFailed, validation, BackendError::None};
@@ -119,16 +298,26 @@ namespace virtual_display::driver {
 
     BackendError backend_error = BackendError::None;
     for (const auto &display: displays) {
-      if (backend_.depart_temporary_display(display.display_id) == BackendError::None) {
-        LeaseDisplayRequest remove {};
-        remove.lease_id = display.lease_id;
-        remove.display_id = display.display_id;
-        (void) store_.remove_temporary_display(remove);
+      if (call_backend_without_controller_lock(
+            backend_call_mutex_,
+            controller_lock,
+            BackendError::Failed,
+            [&]() {
+              return backend_.depart_temporary_display(display.display_id);
+            }) == BackendError::None) {
+        if (temporary_display_generation_is_current(display)) {
+          LeaseDisplayRequest remove {};
+          remove.lease_id = display.lease_id;
+          remove.display_id = display.display_id;
+          (void) store_.remove_temporary_display(remove);
+        }
       } else {
-        LeaseDisplayRequest pending {};
-        pending.lease_id = display.lease_id;
-        pending.display_id = display.display_id;
-        (void) store_.mark_temporary_display_pending_departure(pending);
+        if (temporary_display_generation_is_current(display)) {
+          LeaseDisplayRequest pending {};
+          pending.lease_id = display.lease_id;
+          pending.display_id = display.display_id;
+          (void) store_.mark_temporary_display_pending_departure(pending);
+        }
         backend_error = BackendError::Failed;
       }
     }
@@ -144,6 +333,13 @@ namespace virtual_display::driver {
   }
 
   ControllerStatus DriverController::set_permanent_display_count(const PermanentDisplayCountRequest &request) {
+    return set_permanent_display_count(request, nullptr);
+  }
+
+  ControllerStatus DriverController::set_permanent_display_count(
+    const PermanentDisplayCountRequest &request,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     auto normalized = request;
     set_default_permanent_display_settings(normalized);
     if (const auto validation = validate_permanent_display_count(normalized, store_.max_permanent_displays());
@@ -152,11 +348,19 @@ namespace virtual_display::driver {
     }
 
     return apply_display_manifest(
-      display_manifest_from_permanent_settings(normalized, store_.max_permanent_displays())
+      display_manifest_from_permanent_settings(normalized, store_.max_permanent_displays()),
+      controller_lock
     );
   }
 
   ControllerStatus DriverController::apply_display_manifest(const DisplayManifest &manifest) {
+    return apply_display_manifest(manifest, nullptr);
+  }
+
+  ControllerStatus DriverController::apply_display_manifest(
+    const DisplayManifest &manifest,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     if (const auto validation = validate_display_manifest(manifest, store_.max_permanent_displays());
         validation != ValidationError::None) {
       return {StoreError::ValidationFailed, validation, BackendError::None};
@@ -175,7 +379,13 @@ namespace virtual_display::driver {
       );
     }
 
-    if (const auto backend_error = backend_.apply_display_manifest(canonical);
+    if (const auto backend_error = call_backend_without_controller_lock(
+          backend_call_mutex_,
+          controller_lock,
+          BackendError::Failed,
+          [&]() {
+            return backend_.apply_display_manifest(canonical);
+          });
         backend_error != BackendError::None) {
       return {StoreError::None, ValidationError::None, backend_error};
     }
@@ -184,6 +394,13 @@ namespace virtual_display::driver {
   }
 
   ControllerStatus DriverController::set_render_adapter(const SetRenderAdapterRequest &request) {
+    return set_render_adapter(request, nullptr);
+  }
+
+  ControllerStatus DriverController::set_render_adapter(
+    const SetRenderAdapterRequest &request,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     if (!is_valid_api_namespace(request.api_namespace)) {
       return {StoreError::ValidationFailed, ValidationError::WrongApiNamespace, BackendError::None};
     }
@@ -191,7 +408,13 @@ namespace virtual_display::driver {
       return {StoreError::ValidationFailed, ValidationError::InvalidFlags, BackendError::None};
     }
 
-    if (const auto backend_error = backend_.set_render_adapter(request);
+    if (const auto backend_error = call_backend_without_controller_lock(
+          backend_call_mutex_,
+          controller_lock,
+          BackendError::Failed,
+          [&]() {
+            return backend_.set_render_adapter(request);
+          });
         backend_error != BackendError::None) {
       return {StoreError::None, ValidationError::None, backend_error};
     }
@@ -254,22 +477,49 @@ namespace virtual_display::driver {
   }
 
   std::uint32_t DriverController::reap_expired(const std::chrono::steady_clock::time_point now) {
-    const auto expired = store_.expired_temporary_displays(now);
+    return reap_expired(now, nullptr);
+  }
+
+  std::uint32_t DriverController::reap_expired(
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
+    auto expired = store_.expired_temporary_displays(now);
+    auto reap_candidates = store_.pending_departure_temporary_displays();
+    for (const auto &display: expired) {
+      if (std::none_of(
+            reap_candidates.begin(),
+            reap_candidates.end(),
+            [&](const auto &candidate) {
+              return candidate.display_id == display.display_id;
+            })) {
+        reap_candidates.push_back(display);
+      }
+    }
     std::uint32_t removed = 0;
 
-    for (const auto &display: expired) {
-      if (backend_.depart_temporary_display(display.display_id) == BackendError::None) {
+    for (const auto &display: reap_candidates) {
+      if (call_backend_without_controller_lock(
+            backend_call_mutex_,
+            controller_lock,
+            BackendError::Failed,
+            [&]() {
+              return backend_.depart_temporary_display(display.display_id);
+            }) == BackendError::None) {
         LeaseDisplayRequest remove {};
         remove.lease_id = display.lease_id;
         remove.display_id = display.display_id;
-        if (store_.remove_temporary_display(remove).error == StoreError::None) {
+        if (temporary_display_generation_is_current(display) &&
+            store_.remove_temporary_display(remove).error == StoreError::None) {
           ++removed;
         }
       } else {
-        LeaseDisplayRequest pending {};
-        pending.lease_id = display.lease_id;
-        pending.display_id = display.display_id;
-        (void) store_.mark_temporary_display_pending_departure(pending);
+        if (temporary_display_generation_is_current(display)) {
+          LeaseDisplayRequest pending {};
+          pending.lease_id = display.lease_id;
+          pending.display_id = display.display_id;
+          (void) store_.mark_temporary_display_pending_departure(pending);
+        }
       }
     }
 

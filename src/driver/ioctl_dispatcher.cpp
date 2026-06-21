@@ -1,6 +1,7 @@
 #include "virtual_display/driver/ioctl_dispatcher.h"
 
 #include <cstring>
+#include <mutex>
 
 namespace virtual_display::driver {
   namespace {
@@ -72,7 +73,8 @@ namespace virtual_display::driver {
     const std::size_t input_size,
     void *output,
     const std::size_t output_size,
-    const std::chrono::steady_clock::time_point now
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
   ) {
     std::size_t bytes_returned = 0;
 
@@ -96,7 +98,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidOutputBuffer, 0, {}};
         }
 
-        auto created = controller_.create_temporary_display(request, now);
+        auto created = controller_.create_temporary_display(request, now, controller_lock);
         if (!created.status.ok()) {
           return result_from_controller(created.status);
         }
@@ -112,7 +114,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidInputBuffer, 0, {}};
         }
 
-        return result_from_controller(controller_.remove_temporary_display(request));
+        return result_from_controller(controller_.remove_temporary_display(request, controller_lock));
       }
 
       case kIoctlFeedLease: {
@@ -130,7 +132,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidInputBuffer, 0, {}};
         }
 
-        return result_from_controller(controller_.release_lease(request));
+        return result_from_controller(controller_.release_lease(request, controller_lock));
       }
 
       case kIoctlQueryLease: {
@@ -162,7 +164,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidOutputBuffer, 0, {}};
         }
 
-        const auto status = controller_.set_permanent_display_count(request);
+        const auto status = controller_.set_permanent_display_count(request, controller_lock);
         if (!status.ok()) {
           return result_from_controller(status);
         }
@@ -201,7 +203,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidOutputBuffer, 0, {}};
         }
 
-        const auto status = controller_.apply_display_manifest(manifest);
+        const auto status = controller_.apply_display_manifest(manifest, controller_lock);
         if (!status.ok()) {
           return result_from_controller(status);
         }
@@ -225,7 +227,7 @@ namespace virtual_display::driver {
           return {IoctlStatus::InvalidInputBuffer, 0, {}};
         }
 
-        return result_from_controller(controller_.set_render_adapter(request));
+        return result_from_controller(controller_.set_render_adapter(request, controller_lock));
       }
 
       default:

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace virtual_display::driver {
   enum class BackendError {
@@ -65,29 +66,56 @@ namespace virtual_display::driver {
 
     ControllerCreateResult create_temporary_display(
       const CreateTemporaryDisplayRequest &request,
-      std::chrono::steady_clock::time_point now
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock = nullptr
     );
     ControllerStatus remove_temporary_display(const LeaseDisplayRequest &request);
+    ControllerStatus remove_temporary_display(
+      const LeaseDisplayRequest &request,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     ControllerStatus feed_lease(const LeaseRequest &request, std::chrono::steady_clock::time_point now);
     ControllerStatus release_lease(const LeaseRequest &request);
+    ControllerStatus release_lease(
+      const LeaseRequest &request,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     QueryLeaseResult query_lease(std::uint64_t lease_id, std::chrono::steady_clock::time_point now) const;
     ControllerStatus set_permanent_display_count(const PermanentDisplayCountRequest &request);
+    ControllerStatus set_permanent_display_count(
+      const PermanentDisplayCountRequest &request,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     ControllerStatus apply_display_manifest(const DisplayManifest &manifest);
+    ControllerStatus apply_display_manifest(
+      const DisplayManifest &manifest,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     ControllerStatus set_render_adapter(const SetRenderAdapterRequest &request);
+    ControllerStatus set_render_adapter(
+      const SetRenderAdapterRequest &request,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     const DisplayManifest &query_display_manifest() const;
     PermanentDisplayCountResult query_permanent_display_count() const;
     QueryDisplayStateResult query_display_state() const;
     std::uint32_t reap_expired(std::chrono::steady_clock::time_point now);
+    std::uint32_t reap_expired(
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
 
     [[nodiscard]] const DisplayStore &store() const;
 
   private:
     static ControllerStatus from_store_result(const StoreResult &result);
+    bool temporary_display_generation_is_current(const TemporaryDisplayRecord &record) const;
     DisplayDescriptor descriptor_from_record(const TemporaryDisplayRecord &record) const;
     static DisplayStateEntry state_entry_from_record(const TemporaryDisplayRecord &record);
 
     DisplayStore store_;
     DisplayDriverBackend &backend_;
+    std::timed_mutex backend_call_mutex_ {};
   };
 
   const char *to_string(BackendError error);

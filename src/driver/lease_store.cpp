@@ -201,6 +201,7 @@ namespace virtual_display::driver {
         expires_at,
         retain_identity,
         identity_display_id,
+        next_temporary_display_generation_++,
         false
       }
     );
@@ -276,7 +277,7 @@ namespace virtual_display::driver {
       return {StoreError::LeaseNotFound, ValidationError::None};
     }
 
-    if (lease->second.expires_at <= now || lease_has_pending_departure(request.lease_id)) {
+    if (lease->second.expires_at <= now || lease_has_expired_pending_departure(request.lease_id, now)) {
       return {StoreError::LeaseNotFound, ValidationError::None};
     }
 
@@ -286,7 +287,7 @@ namespace virtual_display::driver {
     lease->second.expires_at = expires_at;
 
     for (auto &[_, display]: displays_by_id_) {
-      if (display.lease_id == request.lease_id) {
+      if (display.lease_id == request.lease_id && !display.pending_departure) {
         display.timeout_ms = timeout_ms;
         display.expires_at = expires_at;
       }
@@ -453,6 +454,17 @@ namespace virtual_display::driver {
     return displays;
   }
 
+  std::vector<TemporaryDisplayRecord> DisplayStore::pending_departure_temporary_displays() const {
+    std::vector<TemporaryDisplayRecord> displays;
+    for (const auto &[_, display]: displays_by_id_) {
+      if (display.pending_departure) {
+        displays.push_back(display);
+      }
+    }
+
+    return displays;
+  }
+
   std::vector<TemporaryDisplayRecord> DisplayStore::expired_temporary_displays(
     const std::chrono::steady_clock::time_point now
   ) const {
@@ -584,6 +596,15 @@ namespace virtual_display::driver {
   bool DisplayStore::lease_has_pending_departure(const std::uint64_t lease_id) const {
     return std::any_of(displays_by_id_.begin(), displays_by_id_.end(), [lease_id](const auto &entry) {
       return entry.second.lease_id == lease_id && entry.second.pending_departure;
+    });
+  }
+
+  bool DisplayStore::lease_has_expired_pending_departure(
+    const std::uint64_t lease_id,
+    const std::chrono::steady_clock::time_point now
+  ) const {
+    return std::any_of(displays_by_id_.begin(), displays_by_id_.end(), [lease_id, now](const auto &entry) {
+      return entry.second.lease_id == lease_id && entry.second.pending_departure && entry.second.expires_at <= now;
     });
   }
 

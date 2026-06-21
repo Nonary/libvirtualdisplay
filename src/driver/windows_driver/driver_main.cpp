@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -69,6 +70,10 @@ namespace {
   constexpr std::uint32_t kMaxTemporaryDisplays = vdd::kWindowsDriverMaxTemporaryDisplays;
   constexpr wchar_t kSwapchainMmcssTask[] = L"DisplayPostProcessing";
   constexpr auto kSwapchainProcessorTeardownTimeout = std::chrono::milliseconds(500);
+  constexpr auto kCursorProcessorTeardownTimeout = std::chrono::milliseconds(500);
+  constexpr auto kMonitorArrivalTimeout = std::chrono::milliseconds(500);
+  constexpr auto kMonitorDepartureTimeout = std::chrono::milliseconds(500);
+  constexpr auto kRenderAdapterTimeout = std::chrono::milliseconds(500);
   constexpr std::uint32_t kHardwareCursorMaxWidth = 256;
   constexpr std::uint32_t kHardwareCursorMaxHeight = 256;
   constexpr std::size_t kHardwareCursorShapeBufferBytes =
@@ -114,8 +119,11 @@ namespace {
     std::unique_ptr<SwapChainProcessor> swapchain_processor {};
     std::vector<std::unique_ptr<SwapChainProcessor>> retired_swapchain_processors {};
     bool permanent {};
+    bool arriving {};
     bool departing {};
+    bool orphaned_late_arrival {};
     std::uint32_t assign_callbacks_in_flight {};
+    std::uint32_t unassign_callbacks_in_flight {};
     IDDCX_DEFAULT_HDR_METADATA_TYPE default_hdr_metadata_type {IDDCX_HDRMETADATA_TYPE_UNINITIALIZED};
     UINT default_hdr_metadata_size {};
     IDDCX_GAMMARAMP_TYPE gamma_ramp_type {IDDCX_GAMMARAMP_TYPE_UNINITIALIZED};
@@ -1479,6 +1487,47 @@ namespace {
     HANDLE handle_ {};
   };
 
+  class WdfObjectReferenceGuard {
+  public:
+    WdfObjectReferenceGuard() = default;
+    explicit WdfObjectReferenceGuard(WDFOBJECT object):
+        object_ {object} {
+      if (object_) {
+        WdfObjectReference(object_);
+      }
+    }
+    static WdfObjectReferenceGuard adopt(WDFOBJECT object) {
+      WdfObjectReferenceGuard guard;
+      guard.object_ = object;
+      return guard;
+    }
+    WdfObjectReferenceGuard(const WdfObjectReferenceGuard &) = delete;
+    WdfObjectReferenceGuard &operator=(const WdfObjectReferenceGuard &) = delete;
+    WdfObjectReferenceGuard(WdfObjectReferenceGuard &&other) noexcept:
+        object_ {std::exchange(other.object_, nullptr)} {
+    }
+    WdfObjectReferenceGuard &operator=(WdfObjectReferenceGuard &&other) noexcept {
+      if (this != &other) {
+        reset();
+        object_ = std::exchange(other.object_, nullptr);
+      }
+      return *this;
+    }
+    ~WdfObjectReferenceGuard() {
+      reset();
+    }
+
+    void reset() {
+      if (object_) {
+        WdfObjectDereference(object_);
+        object_ = nullptr;
+      }
+    }
+
+  private:
+    WDFOBJECT object_ {};
+  };
+
   class CursorProcessor {
   public:
     explicit CursorProcessor(IDDCX_MONITOR monitor):
@@ -1551,6 +1600,53 @@ namespace {
         worker_.join();
       }
       cursor_event_.reset();
+    }
+
+    bool stop_for_teardown(const std::chrono::milliseconds timeout) {
+      stop_requested_.store(true, std::memory_order_release);
+      if (cursor_event_) {
+        SetEvent(cursor_event_.get());
+      }
+      if (!worker_.joinable()) {
+        cursor_event_.reset();
+        return true;
+      }
+
+      const auto wait_ms = static_cast<DWORD>((std::min<std::int64_t>)(
+        (std::max<std::int64_t>)(timeout.count(), 0),
+        MAXDWORD
+      ));
+      const DWORD wait_result = WaitForSingleObject(worker_.native_handle(), wait_ms);
+      if (wait_result == WAIT_OBJECT_0) {
+        worker_.join();
+        cursor_event_.reset();
+        return true;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "HardwareCursorWorkerTeardownDeferred",
+        TraceLoggingUInt32(wait_result, "WaitResult"),
+        TraceLoggingUInt32(GetLastError(), "LastError")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorWorkerTeardownDeferred");
+      return false;
+    }
+
+    void detach_worker_for_leak() {
+      if (worker_.joinable()) {
+        worker_.detach();
+      }
+    }
+
+    bool stop_for_monitor_departure() {
+      if (stop_for_teardown(kCursorProcessorTeardownTimeout)) {
+        return true;
+      }
+
+      TraceLoggingWrite(g_trace_provider, "HardwareCursorWorkerDepartureBlocked");
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorWorkerDepartureBlocked");
+      return false;
     }
 
   private:
@@ -1654,11 +1750,44 @@ namespace {
     INT cursor_y_ {};
   };
 
+  void stop_cursor_processor(std::unique_ptr<CursorProcessor> &processor) {
+    if (!processor) {
+      return;
+    }
+
+    if (processor->stop_for_teardown(kCursorProcessorTeardownTimeout)) {
+      processor.reset();
+      return;
+    }
+
+    TraceLoggingWrite(g_trace_provider, "HardwareCursorWorkerTeardownAbandoned");
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "HardwareCursorWorkerTeardownAbandoned");
+    processor->detach_worker_for_leak();
+    (void) processor.release();
+  }
+
+  bool try_stop_cursor_processor_for_monitor_departure(std::unique_ptr<CursorProcessor> &processor) {
+    if (!processor) {
+      return true;
+    }
+
+    if (processor->stop_for_monitor_departure()) {
+      processor.reset();
+      return true;
+    }
+
+    return false;
+  }
+
   class SwapChainProcessor {
   public:
     SwapChainProcessor(IDDCX_SWAPCHAIN swapchain, HANDLE next_surface_available):
         swapchain_ {swapchain},
-        next_surface_available_ {next_surface_available} {
+        next_surface_available_ {next_surface_available},
+        referenced_swapchain_ {reinterpret_cast<WDFOBJECT>(swapchain)} {
+      if (referenced_swapchain_) {
+        WdfObjectReference(referenced_swapchain_);
+      }
     }
 
     ~SwapChainProcessor() {
@@ -1735,6 +1864,14 @@ namespace {
       return false;
     }
 
+    bool has_stopped() {
+      if (!worker_.joinable()) {
+        return true;
+      }
+
+      return WaitForSingleObject(worker_.native_handle(), 0) == WAIT_OBJECT_0;
+    }
+
     void detach_worker_for_leak() {
       if (worker_.joinable()) {
         worker_.detach();
@@ -1764,6 +1901,7 @@ namespace {
         swapchain_ = nullptr;
       }
       assignment_changed_.notify_all();
+      release_swapchain_reference();
     }
 
   private:
@@ -1796,11 +1934,17 @@ namespace {
       assignment_changed_.notify_all();
     }
 
-    IDDCX_SWAPCHAIN claim_owned_swapchain_for_delete() {
+    IDDCX_SWAPCHAIN claim_owned_swapchain_for_delete(bool &assignment_pending) {
+      assignment_pending = false;
       std::unique_lock lock {assignment_mutex_};
-      assignment_changed_.wait(lock, [this]() {
+      if (!assignment_changed_.wait_for(lock, kSwapchainProcessorTeardownTimeout, [this]() {
         return assign_completed_;
-      });
+      })) {
+        assignment_pending = true;
+        TraceLoggingWrite(g_trace_provider, "SwapChainDeleteDeferredForAssignCompletion");
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainDeleteDeferredForAssignCompletion");
+        return nullptr;
+      }
 
       if (!driver_owns_swapchain_) {
         swapchain_ = nullptr;
@@ -1811,14 +1955,35 @@ namespace {
       return std::exchange(swapchain_, nullptr);
     }
 
+    void release_swapchain_reference() {
+      WDFOBJECT referenced_swapchain {};
+      {
+        std::lock_guard lock {assignment_mutex_};
+        referenced_swapchain = std::exchange(referenced_swapchain_, nullptr);
+      }
+
+      if (referenced_swapchain) {
+        WdfObjectDereference(referenced_swapchain);
+      }
+    }
+
     void delete_swapchain() {
-      if (const auto swapchain = claim_owned_swapchain_for_delete()) {
+      bool assignment_pending = false;
+      if (const auto swapchain = claim_owned_swapchain_for_delete(assignment_pending)) {
         // A successful AssignSwapChain transfers hSwapChain ownership to the
         // driver. Closing the WDF object is what releases any frame still owned
         // after the worker exits; abandon_swapchain() is only for callbacks we
         // return to IddCx as ABANDON_SWAPCHAIN.
         WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapchain));
       }
+      if (assignment_pending) {
+        // The worker has stopped using the raw swapchain handle, but ownership
+        // was not resolved within the bounded cleanup window. Do not delete a
+        // swapchain that IddCx may still own; only drop our lifetime pin.
+        release_swapchain_reference();
+        return;
+      }
+      release_swapchain_reference();
     }
 
     void log_render_device_lost(const char *operation, const HRESULT hr) const {
@@ -2012,6 +2177,7 @@ namespace {
     std::condition_variable assignment_changed_ {};
     bool assign_completed_ {};
     bool driver_owns_swapchain_ {};
+    WDFOBJECT referenced_swapchain_ {};
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
   };
@@ -2037,7 +2203,13 @@ namespace {
       std::thread {[processor = std::move(processor), cleanup]() mutable {
         TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupStarted");
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupStarted");
-        processor->stop();
+        if (!processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)) {
+          TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDeferredCleanupBlocked");
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerDeferredCleanupBlocked");
+          processor->detach_worker_for_leak();
+          (void) processor.release();
+          return;
+        }
         if (cleanup == DeferredSwapChainCleanup::AbandonOwned) {
           processor->abandon_swapchain();
         }
@@ -2064,7 +2236,14 @@ namespace {
       return;
     }
 
+    if (deferred_cleanup == DeferredSwapChainCleanup::AbandonOwned) {
+      processor->mark_assign_abandoned();
+    }
+
     if (processor->stop_for_teardown(kSwapchainProcessorTeardownTimeout)) {
+      if (deferred_cleanup == DeferredSwapChainCleanup::AbandonOwned) {
+        processor->abandon_swapchain();
+      }
       processor.reset();
       return;
     }
@@ -2091,10 +2270,151 @@ namespace {
     processors.clear();
   }
 
+  void abandon_swapchain_processor_for_shutdown(std::unique_ptr<SwapChainProcessor> &processor) {
+    if (!processor) {
+      return;
+    }
+
+    processor->request_stop();
+    processor->mark_assign_abandoned();
+    processor->detach_worker_for_leak();
+    (void) processor.release();
+    TraceLoggingWrite(g_trace_provider, "SwapChainWorkerAbandonedDuringShutdown");
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerAbandonedDuringShutdown");
+  }
+
+  void abandon_swapchain_processors_for_shutdown(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
+    for (auto &processor: processors) {
+      abandon_swapchain_processor_for_shutdown(processor);
+    }
+    processors.clear();
+  }
+
   void request_stop_swapchain_processors(std::vector<std::unique_ptr<SwapChainProcessor>> &processors) {
     for (auto &processor: processors) {
       request_stop_swapchain_processor(processor);
     }
+  }
+
+  std::chrono::milliseconds remaining_teardown_timeout(
+    const std::chrono::steady_clock::time_point deadline
+  ) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return std::chrono::milliseconds {0};
+    }
+
+    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  }
+
+  bool try_stop_swapchain_processor_for_monitor_departure(
+    std::unique_ptr<SwapChainProcessor> &processor,
+    const std::chrono::steady_clock::time_point deadline
+  ) {
+    if (!processor) {
+      return true;
+    }
+
+    processor->request_stop();
+    if (processor->stop_for_teardown(remaining_teardown_timeout(deadline))) {
+      processor.reset();
+      return true;
+    }
+
+    TraceLoggingWrite(g_trace_provider, "SwapChainWorkerDepartureBlocked");
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerDepartureBlocked");
+    return false;
+  }
+
+  bool try_stop_swapchain_processors_for_monitor_departure(
+    std::vector<std::unique_ptr<SwapChainProcessor>> &processors,
+    const std::chrono::steady_clock::time_point deadline
+  ) {
+    bool all_stopped = true;
+    for (auto &processor: processors) {
+      if (!try_stop_swapchain_processor_for_monitor_departure(processor, deadline)) {
+        all_stopped = false;
+      }
+    }
+    processors.erase(
+      std::remove_if(
+        processors.begin(),
+        processors.end(),
+        [](const auto &processor) {
+          return !processor;
+        }
+      ),
+      processors.end()
+    );
+    return all_stopped;
+  }
+
+  bool try_stop_swapchain_processor_for_unassign(
+    std::unique_ptr<SwapChainProcessor> &processor,
+    const std::chrono::steady_clock::time_point deadline
+  ) {
+    if (!processor) {
+      return true;
+    }
+
+    processor->request_stop();
+    if (processor->stop_for_teardown(remaining_teardown_timeout(deadline))) {
+      processor.reset();
+      return true;
+    }
+
+    TraceLoggingWrite(g_trace_provider, "SwapChainWorkerUnassignBlocked");
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainWorkerUnassignBlocked");
+    return false;
+  }
+
+  bool try_stop_swapchain_processors_for_unassign(
+    std::vector<std::unique_ptr<SwapChainProcessor>> &processors,
+    const std::chrono::steady_clock::time_point deadline
+  ) {
+    bool all_stopped = true;
+    for (auto &processor: processors) {
+      if (!try_stop_swapchain_processor_for_unassign(processor, deadline)) {
+        all_stopped = false;
+      }
+    }
+    processors.erase(
+      std::remove_if(
+        processors.begin(),
+        processors.end(),
+        [](const auto &processor) {
+          return !processor;
+        }
+      ),
+      processors.end()
+    );
+    return all_stopped;
+  }
+
+  std::uint32_t collect_finished_retired_swapchain_processors(
+    std::vector<std::unique_ptr<SwapChainProcessor>> &processors,
+    std::vector<std::unique_ptr<SwapChainProcessor>> &finished_processors
+  ) {
+    std::uint32_t cleaned = 0;
+    for (auto &processor: processors) {
+      if (processor && processor->has_stopped()) {
+        finished_processors.push_back(std::move(processor));
+        ++cleaned;
+        TraceLoggingWrite(g_trace_provider, "RetiredSwapChainProcessorCollected");
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "RetiredSwapChainProcessorCollected");
+      }
+    }
+    processors.erase(
+      std::remove_if(
+        processors.begin(),
+        processors.end(),
+        [](const auto &processor) {
+          return !processor;
+        }
+      ),
+      processors.end()
+    );
+    return cleaned;
   }
 
   class IddCxBackend: public vdd::DisplayDriverBackend {
@@ -2278,19 +2598,75 @@ namespace {
     vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
       const auto preferred_render_adapter = vdd::to_windows_luid(request.adapter_luid);
       IDDCX_ADAPTER adapter {};
+      WDFOBJECT referenced_adapter {};
       {
         std::lock_guard lock {mutex_};
         preferred_render_adapter_luid_ = preferred_render_adapter;
         adapter = adapter_;
+        if (adapter) {
+          referenced_adapter = reinterpret_cast<WDFOBJECT>(adapter);
+          WdfObjectReference(referenced_adapter);
+        }
       }
 
       if (!adapter) {
         return vdd::BackendError::None;
       }
 
-      IDARG_IN_ADAPTERSETRENDERADAPTER args {};
-      args.PreferredRenderAdapter = preferred_render_adapter;
-      IddCxAdapterSetRenderAdapter(adapter, &args);
+      struct RenderAdapterState {
+        vdd::BackendError result {vdd::BackendError::Failed};
+      };
+      auto state = std::make_shared<RenderAdapterState>();
+      {
+        std::lock_guard lock {mutex_};
+        ++render_adapter_calls_in_flight_;
+      }
+
+      std::thread render_adapter_thread;
+      try {
+        render_adapter_thread = std::thread([this, adapter, referenced_adapter, preferred_render_adapter, state]() {
+          const auto adapter_reference = WdfObjectReferenceGuard::adopt(referenced_adapter);
+          IDARG_IN_ADAPTERSETRENDERADAPTER args {};
+          args.PreferredRenderAdapter = preferred_render_adapter;
+          IddCxAdapterSetRenderAdapter(adapter, &args);
+          state->result = vdd::BackendError::None;
+          finish_render_adapter_call();
+        });
+      } catch (...) {
+        WdfObjectDereference(referenced_adapter);
+        finish_render_adapter_call();
+        return vdd::BackendError::Failed;
+      }
+
+      const DWORD wait_result = WaitForSingleObject(
+        render_adapter_thread.native_handle(),
+        static_cast<DWORD>(kRenderAdapterTimeout.count())
+      );
+      if (wait_result == WAIT_OBJECT_0) {
+        render_adapter_thread.join();
+        if (state->result != vdd::BackendError::None) {
+          return state->result;
+        }
+      } else if (WaitForSingleObject(render_adapter_thread.native_handle(), 0) == WAIT_OBJECT_0) {
+        render_adapter_thread.join();
+        if (state->result != vdd::BackendError::None) {
+          return state->result;
+        }
+      } else {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "RenderAdapterPreferenceTimedOut",
+          TraceLoggingUInt32(wait_result, "WaitResult"),
+          TraceLoggingUInt32(GetLastError(), "LastError")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "RenderAdapterPreferenceTimedOut");
+        {
+          std::lock_guard lock {mutex_};
+          lifecycle_unhealthy_ = true;
+        }
+        render_adapter_thread.detach();
+        return vdd::BackendError::Failed;
+      }
 
       TraceLoggingWrite(
         g_trace_provider,
@@ -2334,9 +2710,54 @@ namespace {
         TraceLoggingInt32(args->AdapterInitStatus, "Status")
       );
       if (adapter && (preferred_render_adapter.HighPart != 0 || preferred_render_adapter.LowPart != 0)) {
-        IDARG_IN_ADAPTERSETRENDERADAPTER set_render_adapter {};
-        set_render_adapter.PreferredRenderAdapter = preferred_render_adapter;
-        IddCxAdapterSetRenderAdapter(adapter, &set_render_adapter);
+        auto *adapter_object = reinterpret_cast<WDFOBJECT>(adapter);
+        WdfObjectReference(adapter_object);
+        struct RenderAdapterState {
+          vdd::BackendError result {vdd::BackendError::Failed};
+        };
+        auto state = std::make_shared<RenderAdapterState>();
+        {
+          std::lock_guard lock {mutex_};
+          ++render_adapter_calls_in_flight_;
+        }
+
+        std::thread render_adapter_thread;
+        try {
+          render_adapter_thread = std::thread([this, adapter, adapter_object, preferred_render_adapter, state]() {
+            const auto adapter_reference = WdfObjectReferenceGuard::adopt(adapter_object);
+            IDARG_IN_ADAPTERSETRENDERADAPTER set_render_adapter {};
+            set_render_adapter.PreferredRenderAdapter = preferred_render_adapter;
+            IddCxAdapterSetRenderAdapter(adapter, &set_render_adapter);
+            state->result = vdd::BackendError::None;
+            finish_render_adapter_call();
+          });
+        } catch (...) {
+          WdfObjectDereference(adapter_object);
+          finish_render_adapter_call();
+          return STATUS_SUCCESS;
+        }
+
+        const DWORD wait_result = WaitForSingleObject(
+          render_adapter_thread.native_handle(),
+          static_cast<DWORD>(kRenderAdapterTimeout.count())
+        );
+        if (wait_result == WAIT_OBJECT_0 ||
+            WaitForSingleObject(render_adapter_thread.native_handle(), 0) == WAIT_OBJECT_0) {
+          render_adapter_thread.join();
+        } else {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "AdapterInitRenderAdapterPreferenceTimedOut",
+            TraceLoggingUInt32(wait_result, "WaitResult"),
+            TraceLoggingUInt32(GetLastError(), "LastError")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "AdapterInitRenderAdapterPreferenceTimedOut");
+          {
+            std::lock_guard lock {mutex_};
+            lifecycle_unhealthy_ = true;
+          }
+          render_adapter_thread.detach();
+        }
       }
       return STATUS_SUCCESS;
     }
@@ -2383,11 +2804,38 @@ namespace {
       return STATUS_SUCCESS;
     }
 
-    void shutdown() {
+    bool shutdown() {
+      {
+        std::unique_lock lock {mutex_};
+        shutting_down_ = true;
+        if (monitor_arrivals_in_flight_ > 0 ||
+            monitor_departures_in_flight_ > 0 ||
+            render_adapter_calls_in_flight_ > 0) {
+          departure_cv_.wait_for(lock, kMonitorDepartureTimeout, [&]() {
+            return monitor_arrivals_in_flight_ == 0 &&
+                   monitor_departures_in_flight_ == 0 &&
+                   render_adapter_calls_in_flight_ == 0;
+          });
+        }
+
+        if (monitor_arrivals_in_flight_ > 0 ||
+            monitor_departures_in_flight_ > 0 ||
+            render_adapter_calls_in_flight_ > 0) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "BackendShutdownDeferredForInFlightLifecycle",
+            TraceLoggingUInt32(monitor_arrivals_in_flight_, "ArrivalsInFlight"),
+            TraceLoggingUInt32(monitor_departures_in_flight_, "DeparturesInFlight"),
+            TraceLoggingUInt32(render_adapter_calls_in_flight_, "RenderAdapterCallsInFlight")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "BackendShutdownDeferredForInFlightLifecycle");
+          return false;
+        }
+      }
+
       std::vector<std::uint64_t> display_ids;
       {
         std::lock_guard lock {mutex_};
-        shutting_down_ = true;
         display_ids.reserve(monitors_.size());
         for (const auto &[display_id, record]: monitors_) {
           if (!record.departing) {
@@ -2396,8 +2844,93 @@ namespace {
         }
       }
 
+      std::vector<std::uint64_t> failed_departures;
       for (const auto display_id: display_ids) {
-        (void) depart_display(display_id);
+        if (depart_display(display_id) != vdd::BackendError::None) {
+          failed_departures.push_back(display_id);
+        }
+      }
+
+      if (!failed_departures.empty()) {
+        std::lock_guard lock {mutex_};
+        for (const auto display_id: failed_departures) {
+          const auto monitor = monitors_.find(display_id);
+          if (monitor == monitors_.end()) {
+            continue;
+          }
+
+          if (auto *context = GetMonitorContext(monitor->second.monitor); context && context->backend == this) {
+            context->backend = nullptr;
+          }
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorShutdownDeferredAfterFailedDeparture",
+            TraceLoggingUInt64(display_id, "DisplayId")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "MonitorShutdownDeferredAfterFailedDeparture");
+        }
+      }
+
+      std::unique_lock lock {mutex_};
+      if (monitor_departures_in_flight_ > 0) {
+        departure_cv_.wait_for(lock, kMonitorDepartureTimeout, [&]() {
+          return monitor_departures_in_flight_ == 0;
+        });
+      }
+
+      if (monitor_departures_in_flight_ > 0 || !monitors_.empty()) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "BackendShutdownDeferredForMonitors",
+          TraceLoggingUInt32(monitor_departures_in_flight_, "DeparturesInFlight"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(monitors_.size()), "RemainingMonitors")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "BackendShutdownDeferredForMonitors");
+        return false;
+      }
+
+      return true;
+    }
+
+    void cleanup_finished_retired_swapchains() {
+      std::vector<std::unique_ptr<SwapChainProcessor>> finished_processors;
+      std::vector<std::uint64_t> orphaned_late_arrivals;
+      {
+        std::lock_guard lock {mutex_};
+        for (auto &[display_id, record]: monitors_) {
+          if (record.orphaned_late_arrival && !record.departing) {
+            orphaned_late_arrivals.push_back(display_id);
+          }
+          const auto before = record.retired_swapchain_processors.size();
+          const auto cleaned = collect_finished_retired_swapchain_processors(
+            record.retired_swapchain_processors,
+            finished_processors
+          );
+          const auto after = record.retired_swapchain_processors.size();
+          if (cleaned == 0) {
+            continue;
+          }
+
+          TraceLoggingWrite(
+            g_trace_provider,
+            "RetiredSwapChainProcessorsCleaned",
+            TraceLoggingUInt64(display_id, "DisplayId"),
+            TraceLoggingUInt32(cleaned, "Cleaned"),
+            TraceLoggingUInt32(static_cast<std::uint32_t>(after), "Remaining")
+          );
+          TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "RetiredSwapChainProcessorsCleaned");
+        }
+      }
+      finished_processors.clear();
+      for (const auto display_id: orphaned_late_arrivals) {
+        if (depart_display(display_id) != vdd::BackendError::None) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalLateCleanupRetryDeferred",
+            TraceLoggingUInt64(display_id, "DisplayId")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalLateCleanupRetryDeferred");
+        }
       }
     }
 
@@ -2420,33 +2953,12 @@ namespace {
         }
       }
 
-      std::unique_ptr<CursorProcessor> processor;
-      try {
-        processor = std::make_unique<CursorProcessor>(monitor);
-      } catch (...) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-      }
-
-      const NTSTATUS status = processor->start();
-      if (!NT_SUCCESS(status)) {
-        return status;
-      }
-
-      std::unique_ptr<CursorProcessor> previous_processor;
-      {
-        std::lock_guard lock {mutex_};
-        const auto record = find_current_monitor_locked(context->display_id, monitor);
-        if (record == monitors_.end() || record->second.departing || shutting_down_) {
-          return STATUS_GRAPHICS_PATH_NOT_IN_TOPOLOGY;
-        }
-
-        previous_processor = std::move(record->second.cursor_processor);
-        record->second.cursor_processor = std::move(processor);
-      }
-
-      if (previous_processor) {
-        previous_processor->stop();
-      }
+      // Hardware cursor polling uses IddCxMonitorQueryHardwareCursor* on a worker tied to the
+      // raw IDDCX_MONITOR. Those calls cannot be cancelled safely during mode/topology churn, and
+      // a worker that outlives IddCxMonitorDeparture can use the departed monitor. Do not arm this
+      // optional path; Sunshine renders/captures the cursor independently.
+      TraceLoggingWrite(g_trace_provider, "HardwareCursorDisabledForTopologySafety");
+      TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_CURSOR, "HardwareCursorDisabledForTopologySafety");
       return STATUS_SUCCESS;
     }
 
@@ -2472,7 +2984,7 @@ namespace {
       }
 
       if (processor) {
-        processor->stop();
+        stop_cursor_processor(processor);
       }
     }
 
@@ -2491,6 +3003,17 @@ namespace {
         const auto record = find_current_monitor_locked(display_id, monitor);
         if (record != monitors_.end() && record->second.assign_callbacks_in_flight > 0) {
           --record->second.assign_callbacks_in_flight;
+        }
+      }
+      departure_cv_.notify_all();
+    }
+
+    void finish_unassign_callback(const std::uint64_t display_id, const IDDCX_MONITOR monitor) {
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(display_id, monitor);
+        if (record != monitors_.end() && record->second.unassign_callbacks_in_flight > 0) {
+          --record->second.unassign_callbacks_in_flight;
         }
       }
       departure_cv_.notify_all();
@@ -2517,9 +3040,144 @@ namespace {
       IDDCX_MONITOR monitor_ {};
     };
 
+    class UnassignCallbackScope {
+    public:
+      UnassignCallbackScope(IddCxBackend &backend, const std::uint64_t display_id, const IDDCX_MONITOR monitor):
+          backend_ {backend},
+          display_id_ {display_id},
+          monitor_ {monitor} {
+      }
+
+      ~UnassignCallbackScope() {
+        backend_.finish_unassign_callback(display_id_, monitor_);
+      }
+
+      UnassignCallbackScope(const UnassignCallbackScope &) = delete;
+      UnassignCallbackScope &operator=(const UnassignCallbackScope &) = delete;
+
+    private:
+      IddCxBackend &backend_;
+      std::uint64_t display_id_ {};
+      IDDCX_MONITOR monitor_ {};
+    };
+
+    void clear_lifecycle_unhealthy_if_settled_locked() {
+      if (monitor_arrivals_in_flight_ == 0 &&
+          monitor_departures_in_flight_ == 0 &&
+          render_adapter_calls_in_flight_ == 0) {
+        lifecycle_unhealthy_ = false;
+      }
+    }
+
+    void finish_monitor_arrival() {
+      {
+        std::lock_guard lock {mutex_};
+        if (monitor_arrivals_in_flight_ > 0) {
+          --monitor_arrivals_in_flight_;
+        }
+        clear_lifecycle_unhealthy_if_settled_locked();
+      }
+      departure_cv_.notify_all();
+    }
+
+    void finish_render_adapter_call() {
+      {
+        std::lock_guard lock {mutex_};
+        if (render_adapter_calls_in_flight_ > 0) {
+          --render_adapter_calls_in_flight_;
+        }
+        clear_lifecycle_unhealthy_if_settled_locked();
+      }
+      departure_cv_.notify_all();
+    }
+
     vdd::BackendDisplayResult arrive_display(const vdd::DisplayDescriptor &requested_descriptor, const bool permanent) {
+      struct ArrivalState {
+        vdd::BackendDisplayResult result {vdd::BackendError::Failed, {}, 0};
+        std::atomic<bool> timed_out {false};
+      };
+
+      auto state = std::make_shared<ArrivalState>();
+      {
+        std::lock_guard lock {mutex_};
+        ++monitor_arrivals_in_flight_;
+      }
+
+      std::thread arrival_thread;
+      try {
+        arrival_thread = std::thread([this, requested_descriptor, permanent, state]() {
+          auto result = arrive_display_synchronously(requested_descriptor, permanent);
+          if (state->timed_out.load(std::memory_order_acquire) &&
+              result.error == vdd::BackendError::None) {
+            TraceLoggingWrite(
+              g_trace_provider,
+              "MonitorArrivalCompletedAfterTimeout",
+              TraceLoggingUInt64(requested_descriptor.display_id, "DisplayId")
+            );
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalCompletedAfterTimeout");
+            {
+              std::lock_guard lock {mutex_};
+              if (auto monitor = monitors_.find(requested_descriptor.display_id);
+                  monitor != monitors_.end()) {
+                monitor->second.orphaned_late_arrival = true;
+              }
+            }
+            if (depart_display(requested_descriptor.display_id) != vdd::BackendError::None) {
+              TraceLoggingWrite(
+                g_trace_provider,
+                "MonitorArrivalLateCleanupFailed",
+                TraceLoggingUInt64(requested_descriptor.display_id, "DisplayId")
+              );
+              TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalLateCleanupFailed");
+            }
+            result = {vdd::BackendError::Failed, {}, 0};
+          }
+          state->result = result;
+          finish_monitor_arrival();
+        });
+      } catch (...) {
+        finish_monitor_arrival();
+        return {vdd::BackendError::Failed, {}, 0};
+      }
+
+      const DWORD wait_result = WaitForSingleObject(
+        arrival_thread.native_handle(),
+        static_cast<DWORD>(kMonitorArrivalTimeout.count())
+      );
+      if (wait_result == WAIT_OBJECT_0) {
+        arrival_thread.join();
+        return state->result;
+      }
+
+      state->timed_out.store(true, std::memory_order_release);
+      if (WaitForSingleObject(arrival_thread.native_handle(), 0) == WAIT_OBJECT_0) {
+        arrival_thread.join();
+        return state->result;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "MonitorArrivalTimedOut",
+        TraceLoggingUInt64(requested_descriptor.display_id, "DisplayId"),
+        TraceLoggingUInt32(wait_result, "WaitResult"),
+        TraceLoggingUInt32(GetLastError(), "LastError")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalTimedOut");
+      {
+        std::lock_guard lock {mutex_};
+        lifecycle_unhealthy_ = true;
+      }
+      arrival_thread.detach();
+      return {vdd::BackendError::Failed, {}, 0};
+    }
+
+    vdd::BackendDisplayResult arrive_display_synchronously(
+      const vdd::DisplayDescriptor &requested_descriptor,
+      const bool permanent
+    ) {
       const auto descriptor = descriptor_with_runtime_hdr_policy(requested_descriptor);
       IDDCX_ADAPTER adapter {};
+      WDFOBJECT referenced_adapter {};
       {
         std::lock_guard lock {mutex_};
         if (shutting_down_ || !adapter_ready_) {
@@ -2543,11 +3201,15 @@ namespace {
           return {vdd::BackendError::Failed, {}, 0};
         }
         adapter = adapter_;
+        referenced_adapter = reinterpret_cast<WDFOBJECT>(adapter);
+        WdfObjectReference(referenced_adapter);
       }
+      const auto adapter_reference = WdfObjectReferenceGuard::adopt(referenced_adapter);
 
       MonitorRecord record {};
       record.descriptor = descriptor;
       record.permanent = permanent;
+      record.arriving = true;
 
       WDF_OBJECT_ATTRIBUTES monitor_attributes;
       WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&monitor_attributes, MonitorContext);
@@ -2592,6 +3254,8 @@ namespace {
         unregister_monitor_description_mode(descriptor);
         return {vdd::BackendError::Failed, {}, 0};
       }
+      WdfObjectReference(reinterpret_cast<WDFOBJECT>(create_out.MonitorObject));
+      auto monitor_reference = WdfObjectReferenceGuard::adopt(reinterpret_cast<WDFOBJECT>(create_out.MonitorObject));
 
       record.monitor = create_out.MonitorObject;
       auto *monitor_context = GetMonitorContext(record.monitor);
@@ -2648,6 +3312,23 @@ namespace {
         return {vdd::BackendError::Failed, {}, 0};
       }
 
+      {
+        std::lock_guard lock {mutex_};
+        const auto monitor = monitors_.find(descriptor.display_id);
+        if (monitor == monitors_.end() || monitor->second.monitor != create_out.MonitorObject) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalRecordMissingAfterArrival",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalRecordMissingAfterArrival");
+          WdfObjectDelete(create_out.MonitorObject);
+          unregister_monitor_description_mode(descriptor);
+          return {vdd::BackendError::Failed, {}, 0};
+        }
+        monitor->second.arriving = false;
+      }
+
       TraceLoggingWrite(
         g_trace_provider,
         "MonitorArrived",
@@ -2675,30 +3356,141 @@ namespace {
       };
     }
 
+    void finish_monitor_departure(
+      const std::uint64_t display_id,
+      const IDDCX_MONITOR monitor_handle,
+      const NTSTATUS status
+    ) {
+      std::optional<vdd::DisplayDescriptor> descriptor_to_unregister;
+      {
+        std::lock_guard lock {mutex_};
+        if (monitor_departures_in_flight_ > 0) {
+          --monitor_departures_in_flight_;
+        }
+
+        const auto monitor = monitors_.find(display_id);
+        if (monitor != monitors_.end() && monitor->second.monitor == monitor_handle) {
+          if (NT_SUCCESS(status)) {
+            descriptor_to_unregister = monitor->second.descriptor;
+            monitors_.erase(monitor);
+          } else {
+            monitor->second.departing = false;
+          }
+        }
+        clear_lifecycle_unhealthy_if_settled_locked();
+      }
+
+      if (descriptor_to_unregister) {
+        unregister_monitor_description_mode(*descriptor_to_unregister);
+      }
+
+      if (NT_SUCCESS(status)) {
+        TraceLoggingWrite(g_trace_provider, "MonitorDeparted", TraceLoggingUInt64(display_id, "DisplayId"));
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorDeparted");
+      } else {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorDepartureFailed",
+          TraceLoggingUInt64(display_id, "DisplayId"),
+          TraceLoggingInt32(status, "Status")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorDepartureFailed");
+      }
+      departure_cv_.notify_all();
+    }
+
+    NTSTATUS depart_monitor_with_timeout(
+      const std::uint64_t display_id,
+      const IDDCX_MONITOR monitor_handle
+    ) {
+      struct DepartureState {
+        std::atomic<NTSTATUS> status {STATUS_PENDING};
+      };
+
+      auto state = std::make_shared<DepartureState>();
+      WdfObjectReference(reinterpret_cast<WDFOBJECT>(monitor_handle));
+      auto monitor_reference = std::make_shared<WdfObjectReferenceGuard>(
+        WdfObjectReferenceGuard::adopt(reinterpret_cast<WDFOBJECT>(monitor_handle))
+      );
+      {
+        std::lock_guard lock {mutex_};
+        ++monitor_departures_in_flight_;
+      }
+
+      std::thread departure_thread;
+      try {
+        departure_thread = std::thread([this, display_id, monitor_handle, state, monitor_reference]() {
+          const auto status = IddCxMonitorDeparture(monitor_handle);
+          state->status.store(status, std::memory_order_release);
+          finish_monitor_departure(display_id, monitor_handle, status);
+        });
+      } catch (...) {
+        monitor_reference.reset();
+        finish_monitor_departure(display_id, monitor_handle, STATUS_INSUFFICIENT_RESOURCES);
+        return STATUS_INSUFFICIENT_RESOURCES;
+      }
+
+      const auto wait_ms = static_cast<DWORD>(kMonitorDepartureTimeout.count());
+      const DWORD wait_result = WaitForSingleObject(departure_thread.native_handle(), wait_ms);
+      if (wait_result == WAIT_OBJECT_0) {
+        departure_thread.join();
+        return state->status.load(std::memory_order_acquire);
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "MonitorDepartureTimedOut",
+        TraceLoggingUInt64(display_id, "DisplayId"),
+        TraceLoggingUInt32(wait_result, "WaitResult"),
+        TraceLoggingUInt32(GetLastError(), "LastError")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorDepartureTimedOut");
+      {
+        std::lock_guard lock {mutex_};
+        lifecycle_unhealthy_ = true;
+      }
+      departure_thread.detach();
+      return STATUS_TIMEOUT;
+    }
+
     vdd::BackendError depart_display(const std::uint64_t display_id) {
       IDDCX_MONITOR monitor_handle {};
-      std::optional<vdd::DisplayDescriptor> descriptor_to_unregister;
       std::unique_ptr<CursorProcessor> cursor_processor_to_stop;
       std::unique_ptr<SwapChainProcessor> processor_to_stop;
       std::vector<std::unique_ptr<SwapChainProcessor>> retired_processors_to_stop;
       {
         std::unique_lock lock {mutex_};
         auto monitor = monitors_.find(display_id);
-        if (monitor == monitors_.end() || monitor->second.departing) {
+        if (monitor == monitors_.end()) {
           return vdd::BackendError::None;
+        }
+        if (monitor->second.arriving) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorDepartureDeferredForArrival",
+            TraceLoggingUInt64(display_id, "DisplayId")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorDepartureDeferredForArrival");
+          return vdd::BackendError::Failed;
+        }
+        if (monitor->second.departing) {
+          return vdd::BackendError::Failed;
         }
 
         monitor->second.departing = true;
         monitor_handle = monitor->second.monitor;
-        if (monitor->second.assign_callbacks_in_flight > 0) {
+        if (monitor->second.assign_callbacks_in_flight > 0 ||
+            monitor->second.unassign_callbacks_in_flight > 0) {
           // DisplayConfig can remove a just-activated path while IddCx is still
-          // unwinding HandleNewSwapChain. Mark departure first, then wait only
-          // for known in-flight assign callbacks to observe teardown.
+          // unwinding swapchain callbacks. Mark departure first, then wait only
+          // for known in-flight callbacks to restore or settle processor
+          // bookkeeping before crossing the monitor lifetime boundary.
           departure_cv_.wait_for(lock, std::chrono::milliseconds(250), [&]() {
             const auto current = monitors_.find(display_id);
             return current == monitors_.end() ||
                    current->second.monitor != monitor_handle ||
-                   current->second.assign_callbacks_in_flight == 0;
+                   (current->second.assign_callbacks_in_flight == 0 &&
+                    current->second.unassign_callbacks_in_flight == 0);
           });
         }
 
@@ -2706,56 +3498,106 @@ namespace {
         if (monitor == monitors_.end() || monitor->second.monitor != monitor_handle) {
           return vdd::BackendError::None;
         }
+        if (monitor->second.assign_callbacks_in_flight > 0 ||
+            monitor->second.unassign_callbacks_in_flight > 0) {
+          monitor->second.departing = false;
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorDepartureDeferredForSwapChainCallback",
+            TraceLoggingUInt64(display_id, "DisplayId"),
+            TraceLoggingUInt32(monitor->second.assign_callbacks_in_flight, "AssignCallbacksInFlight"),
+            TraceLoggingUInt32(monitor->second.unassign_callbacks_in_flight, "UnassignCallbacksInFlight")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "MonitorDepartureDeferredForSwapChainCallback");
+          return vdd::BackendError::Failed;
+        }
         cursor_processor_to_stop = std::move(monitor->second.cursor_processor);
         processor_to_stop = std::move(monitor->second.swapchain_processor);
         retired_processors_to_stop = std::move(monitor->second.retired_swapchain_processors);
       }
 
-      if (cursor_processor_to_stop) {
-        cursor_processor_to_stop->stop();
+      const bool cursor_processor_stopped = try_stop_cursor_processor_for_monitor_departure(cursor_processor_to_stop);
+      if (!cursor_processor_stopped) {
+        std::lock_guard lock {mutex_};
+        if (auto monitor = monitors_.find(display_id);
+            monitor != monitors_.end() &&
+            monitor->second.monitor == monitor_handle) {
+          monitor->second.departing = false;
+          monitor->second.cursor_processor = std::move(cursor_processor_to_stop);
+          if (processor_to_stop) {
+            monitor->second.swapchain_processor = std::move(processor_to_stop);
+          }
+          for (auto &processor: retired_processors_to_stop) {
+            if (processor) {
+              monitor->second.retired_swapchain_processors.push_back(std::move(processor));
+            }
+          }
+        } else {
+          stop_cursor_processor(cursor_processor_to_stop);
+          stop_swapchain_processor(processor_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+          stop_swapchain_processors(retired_processors_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+        }
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorDepartureDeferredForHardwareCursorWorker",
+          TraceLoggingUInt64(display_id, "DisplayId")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_CURSOR, "MonitorDepartureDeferredForHardwareCursorWorker");
+        return vdd::BackendError::Failed;
       }
 
       // Wake all frame workers first so processors that stop within the
       // teardown window can close their owned swapchains before monitor
-      // departure. Slow workers move to no-delete deferred cleanup because the
-      // cleanup thread may outlive the IddCx/WDF swapchain lifetime boundary.
+      // departure. If any worker is still in an IddCx/D3D call after the
+      // bounded wait, do NOT cross the monitor-departure lifetime boundary;
+      // keep the monitor alive and let the control plane retry the departure.
       request_stop_swapchain_processor(processor_to_stop);
       request_stop_swapchain_processors(retired_processors_to_stop);
-      stop_swapchain_processor(processor_to_stop, DeferredSwapChainCleanup::AbandonOwned);
-      stop_swapchain_processors(retired_processors_to_stop, DeferredSwapChainCleanup::AbandonOwned);
-
-      // IddCx can synchronously or asynchronously issue swapchain callbacks
-      // during departure. Calling it outside the backend mutex keeps those
-      // callbacks from re-entering a locked monitor map.
-      const auto status = IddCxMonitorDeparture(monitor_handle);
-      if (!NT_SUCCESS(status)) {
-        TraceLoggingWrite(
-          g_trace_provider,
-          "MonitorDepartureFailed",
-          TraceLoggingUInt64(display_id, "DisplayId"),
-          TraceLoggingInt32(status, "Status")
-        );
+      const auto swapchain_teardown_deadline =
+        std::chrono::steady_clock::now() + kSwapchainProcessorTeardownTimeout;
+      const bool active_processor_stopped = try_stop_swapchain_processor_for_monitor_departure(
+        processor_to_stop,
+        swapchain_teardown_deadline
+      );
+      const bool retired_processors_stopped = try_stop_swapchain_processors_for_monitor_departure(
+        retired_processors_to_stop,
+        swapchain_teardown_deadline
+      );
+      if (!active_processor_stopped || !retired_processors_stopped) {
         std::lock_guard lock {mutex_};
-        if (const auto monitor = monitors_.find(display_id);
+        if (auto monitor = monitors_.find(display_id);
             monitor != monitors_.end() &&
             monitor->second.monitor == monitor_handle) {
           monitor->second.departing = false;
+          if (processor_to_stop) {
+            monitor->second.swapchain_processor = std::move(processor_to_stop);
+          }
+          for (auto &processor: retired_processors_to_stop) {
+            if (processor) {
+              monitor->second.retired_swapchain_processors.push_back(std::move(processor));
+            }
+          }
+        } else {
+          stop_swapchain_processor(processor_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+          stop_swapchain_processors(retired_processors_to_stop, DeferredSwapChainCleanup::AbandonOwned);
         }
+        TraceLoggingWrite(
+          g_trace_provider,
+          "MonitorDepartureDeferredForSwapChainWorker",
+          TraceLoggingUInt64(display_id, "DisplayId")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "MonitorDepartureDeferredForSwapChainWorker");
         return vdd::BackendError::Failed;
       }
 
-      std::lock_guard lock {mutex_};
-      if (const auto monitor = monitors_.find(display_id);
-          monitor != monitors_.end() &&
-          monitor->second.monitor == monitor_handle) {
-        descriptor_to_unregister = monitor->second.descriptor;
-        monitors_.erase(monitor);
+      // IddCx can synchronously or asynchronously issue swapchain callbacks
+      // during departure. Run the call behind a bounded worker so one wedged OS
+      // display-stack call cannot pin the control path forever.
+      const auto status = depart_monitor_with_timeout(display_id, monitor_handle);
+      if (!NT_SUCCESS(status)) {
+        return vdd::BackendError::Failed;
       }
-      if (descriptor_to_unregister) {
-        unregister_monitor_description_mode(*descriptor_to_unregister);
-      }
-      TraceLoggingWrite(g_trace_provider, "MonitorDeparted", TraceLoggingUInt64(display_id, "DisplayId"));
-      TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorDeparted");
+
       return vdd::BackendError::None;
     }
 
@@ -2796,6 +3638,7 @@ namespace {
       processor->mark_assign_succeeded();
 
       std::unique_ptr<SwapChainProcessor> previous_processor;
+      std::vector<std::unique_ptr<SwapChainProcessor>> finished_retired_processors;
       bool abandon_new_processor = false;
       {
         std::lock_guard lock {mutex_};
@@ -2803,15 +3646,19 @@ namespace {
         if (record == monitors_.end() || record->second.departing) {
           abandon_new_processor = true;
         } else {
+          collect_finished_retired_swapchain_processors(
+            record->second.retired_swapchain_processors,
+            finished_retired_processors
+          );
           previous_processor = std::move(record->second.swapchain_processor);
           record->second.swapchain_processor = std::move(processor);
         }
       }
+      finished_retired_processors.clear();
 
       if (abandon_new_processor) {
         processor->mark_assign_abandoned();
-        processor->stop();
-        processor->abandon_swapchain();
+        stop_swapchain_processor(processor);
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
 
@@ -2861,6 +3708,8 @@ namespace {
 
       std::unique_ptr<SwapChainProcessor> processor_to_stop;
       std::vector<std::unique_ptr<SwapChainProcessor>> retired_processors_to_stop;
+      std::vector<std::unique_ptr<SwapChainProcessor>> finished_retired_processors;
+      std::optional<UnassignCallbackScope> unassign_scope;
       {
         std::lock_guard lock {mutex_};
         const auto record = find_current_monitor_locked(context->display_id, monitor);
@@ -2869,16 +3718,71 @@ namespace {
           // final unassign callback. The swapchain is already gone in that case.
           return STATUS_SUCCESS;
         }
+        if (record->second.departing || shutting_down_) {
+          // Departure/shutdown owns the monitor lifetime boundary. Leave the
+          // processors attached to bookkeeping so that path can defer removal
+          // if any worker is still live.
+          TraceLoggingWrite(
+            g_trace_provider,
+            "SwapChainUnassignIgnoredDuringDeparture",
+            TraceLoggingUInt64(context->display_id, "DisplayId"),
+            TraceLoggingBool(record->second.departing, "Departing"),
+            TraceLoggingBool(shutting_down_, "ShuttingDown")
+          );
+          TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainUnassignIgnoredDuringDeparture");
+          return STATUS_SUCCESS;
+        }
 
+        ++record->second.unassign_callbacks_in_flight;
+        unassign_scope.emplace(*this, context->display_id, monitor);
+        collect_finished_retired_swapchain_processors(
+          record->second.retired_swapchain_processors,
+          finished_retired_processors
+        );
         processor_to_stop = std::move(record->second.swapchain_processor);
         retired_processors_to_stop = std::move(record->second.retired_swapchain_processors);
       }
+      finished_retired_processors.clear();
 
       // IddCx unassign asks the driver to stop processing and close its owned
-      // swapchain object. The assignment ownership gate keeps abandoned
-      // swapchains from being deleted here.
-      stop_swapchain_processor(processor_to_stop);
-      stop_swapchain_processors(retired_processors_to_stop);
+      // swapchain object. If a worker is stuck in IddCx/D3D, keep the object in
+      // monitor bookkeeping as retired work so later monitor departure still
+      // sees the live processor and can defer the lifetime boundary.
+      request_stop_swapchain_processor(processor_to_stop);
+      request_stop_swapchain_processors(retired_processors_to_stop);
+      const auto swapchain_teardown_deadline =
+        std::chrono::steady_clock::now() + kSwapchainProcessorTeardownTimeout;
+      const bool active_processor_stopped = try_stop_swapchain_processor_for_unassign(
+        processor_to_stop,
+        swapchain_teardown_deadline
+      );
+      const bool retired_processors_stopped = try_stop_swapchain_processors_for_unassign(
+        retired_processors_to_stop,
+        swapchain_teardown_deadline
+      );
+      if (!active_processor_stopped || !retired_processors_stopped) {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(context->display_id, monitor);
+        if (record != monitors_.end()) {
+          if (processor_to_stop) {
+            record->second.retired_swapchain_processors.push_back(std::move(processor_to_stop));
+          }
+          for (auto &processor: retired_processors_to_stop) {
+            if (processor) {
+              record->second.retired_swapchain_processors.push_back(std::move(processor));
+            }
+          }
+        } else {
+          stop_swapchain_processor(processor_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+          stop_swapchain_processors(retired_processors_to_stop, DeferredSwapChainCleanup::AbandonOwned);
+        }
+        TraceLoggingWrite(
+          g_trace_provider,
+          "SwapChainUnassignDeferredForWorker",
+          TraceLoggingUInt64(context->display_id, "DisplayId")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_SWAPCHAIN, "SwapChainUnassignDeferredForWorker");
+      }
       TraceLoggingWrite(g_trace_provider, "SwapChainUnassigned", TraceLoggingUInt64(context->display_id, "DisplayId"));
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainUnassigned");
       return STATUS_SUCCESS;
@@ -2977,6 +3881,11 @@ namespace {
       return fill_target_modes2(input, output);
     }
 
+    bool lifecycle_unhealthy() {
+      std::lock_guard lock {mutex_};
+      return lifecycle_unhealthy_;
+    }
+
   private:
     std::optional<ModeShape> requested_mode_shape(IDDCX_MONITOR monitor) {
       if (!monitor) {
@@ -3005,6 +3914,10 @@ namespace {
     LUID preferred_render_adapter_luid_ {};
     bool adapter_ready_ {};
     bool shutting_down_ {};
+    std::uint32_t monitor_arrivals_in_flight_ {};
+    std::uint32_t monitor_departures_in_flight_ {};
+    std::uint32_t render_adapter_calls_in_flight_ {};
+    bool lifecycle_unhealthy_ {};
     NTSTATUS adapter_init_status_ {STATUS_DEVICE_NOT_READY};
     std::map<std::uint64_t, MonitorRecord> monitors_ {};
     std::map<std::uint64_t, DWORD> retained_dpi_values_by_display_id_ {};
@@ -3027,8 +3940,23 @@ namespace {
     }
 
     ~DeviceState() {
-      stop_reaper();
-      backend.shutdown();
+      (void) shutdown_for_cleanup();
+    }
+
+    bool shutdown_for_cleanup() {
+      if (shutdown_completed_) {
+        return true;
+      }
+
+      if (!stop_reaper()) {
+        return false;
+      }
+
+      if (!backend.shutdown()) {
+        return false;
+      }
+      shutdown_completed_ = true;
+      return true;
     }
 
     vdd::IoctlDispatchResult dispatch(
@@ -3039,6 +3967,16 @@ namespace {
       const std::size_t output_buffer_length,
       const std::chrono::steady_clock::time_point now
     ) {
+      if (backend.lifecycle_unhealthy() && !can_dispatch_while_backend_unhealthy(io_control_code)) {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "DeviceIoControlRejectedForUnhealthyBackend",
+          TraceLoggingUInt32(io_control_code, "IoControlCode")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "DeviceIoControlRejectedForUnhealthyBackend");
+        return {vdd::IoctlStatus::BackendFailed, 0, {}};
+      }
+
       std::unique_lock lock {controller_mutex, std::defer_lock};
       if (!lock.try_lock_for(kControllerLockTimeout)) {
         TraceLoggingWrite(
@@ -3055,7 +3993,8 @@ namespace {
         input_buffer_length,
         output,
         output_buffer_length,
-        now
+        now,
+        &lock
       );
     }
 
@@ -3065,7 +4004,24 @@ namespace {
 
   private:
     static constexpr auto kReaperInterval = std::chrono::seconds(1);
+    static constexpr auto kReaperTeardownTimeout = std::chrono::milliseconds(500);
     static constexpr auto kControllerLockTimeout = std::chrono::seconds(30);
+
+    static bool can_dispatch_while_backend_unhealthy(const ULONG io_control_code) {
+      switch (io_control_code) {
+        case vdd::kIoctlGetProtocolVersion:
+        case vdd::kIoctlRemoveTemporaryDisplay:
+        case vdd::kIoctlFeedLease:
+        case vdd::kIoctlReleaseLease:
+        case vdd::kIoctlQueryLease:
+        case vdd::kIoctlQueryPermanentDisplayCount:
+        case vdd::kIoctlQueryDisplayState:
+        case vdd::kIoctlQueryDisplayManifest:
+          return true;
+        default:
+          return false;
+      }
+    }
 
     void start_reaper() {
       try {
@@ -3079,12 +4035,31 @@ namespace {
       }
     }
 
-    void stop_reaper() {
+    bool stop_reaper() {
       reaper_stop_requested.store(true, std::memory_order_release);
       reaper_cv.notify_all();
-      if (reaper_thread.joinable()) {
-        reaper_thread.join();
+      if (!reaper_thread.joinable()) {
+        return true;
       }
+
+      const DWORD wait_result = WaitForSingleObject(
+        reaper_thread.native_handle(),
+        static_cast<DWORD>(kReaperTeardownTimeout.count())
+      );
+      if (wait_result == WAIT_OBJECT_0) {
+        reaper_thread.join();
+        return true;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "LeaseReaperShutdownDeferred",
+        TraceLoggingUInt32(wait_result, "WaitResult"),
+        TraceLoggingUInt32(GetLastError(), "LastError")
+      );
+      TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "LeaseReaperShutdownDeferred");
+      reaper_thread.detach();
+      return false;
     }
 
     void reaper_loop() {
@@ -3102,12 +4077,15 @@ namespace {
           TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "LeaseReaperSkippedBusyController");
           continue;
         }
-        (void) controller.reap_expired(std::chrono::steady_clock::now());
+        (void) controller.reap_expired(std::chrono::steady_clock::now(), &controller_lock);
+        controller_lock.unlock();
+        backend.cleanup_finished_retired_swapchains();
       }
     }
 
     std::timed_mutex controller_mutex {};
     std::atomic<bool> reaper_stop_requested {false};
+    bool shutdown_completed_ {};
     std::mutex reaper_wait_mutex {};
     std::condition_variable reaper_cv {};
     std::thread reaper_thread {};
@@ -3139,7 +4117,21 @@ namespace {
 
   void cleanup_device_context(WDFOBJECT object) {
     auto *context = GetDeviceContext(static_cast<WDFDEVICE>(object));
-    delete context->state;
+    auto *state = std::exchange(context->state, nullptr);
+    if (!state) {
+      return;
+    }
+
+    if (state->shutdown_for_cleanup()) {
+      delete state;
+      return;
+    }
+
+    // The lease reaper or a bounded monitor-departure worker can still be
+    // inside backend/IddCx code while WDF is cleaning up the device. Keep
+    // DeviceState alive instead of deleting storage those threads may touch.
+    TraceLoggingWrite(g_trace_provider, "DeviceStateLeakedForDeferredShutdown");
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "DeviceStateLeakedForDeferredShutdown");
     context->state = nullptr;
   }
 
