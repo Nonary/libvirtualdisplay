@@ -126,13 +126,19 @@ namespace virtual_display::driver {
               return backend_.reserve_temporary_display_identity(descriptor);
             });
           backend_error != BackendError::None) {
-        LeaseDisplayRequest rollback {};
-        rollback.lease_id = request.lease_id;
-        rollback.display_id = request.display_id;
-        (void) store_.remove_temporary_display(
-          rollback,
-          RemoveTemporaryDisplayMode::ReleaseConnectorReservation
-        );
+        // Roll back only if our just-created record is still current. A concurrent
+        // remove+recreate of the same display_id during the unlocked backend call
+        // could otherwise make us delete the replacement record and free its
+        // connector reservation (store/backend divergence).
+        if (temporary_display_generation_is_current(created_record)) {
+          LeaseDisplayRequest rollback {};
+          rollback.lease_id = request.lease_id;
+          rollback.display_id = request.display_id;
+          (void) store_.remove_temporary_display(
+            rollback,
+            RemoveTemporaryDisplayMode::ReleaseConnectorReservation
+          );
+        }
         return {
           {StoreError::None, ValidationError::None, backend_error},
           {}
@@ -180,10 +186,14 @@ namespace virtual_display::driver {
       LeaseDisplayRequest rollback {};
       rollback.lease_id = request.lease_id;
       rollback.display_id = request.display_id;
-      (void) store_.remove_temporary_display(
-        rollback,
-        rollback_mode
-      );
+      // Same ABA guard as the reserve-failure rollback: don't delete a replacement
+      // record created while the backend arrive/unreserve call held no lock.
+      if (temporary_display_generation_is_current(created_record)) {
+        (void) store_.remove_temporary_display(
+          rollback,
+          rollback_mode
+        );
+      }
       return {
         {StoreError::None, ValidationError::None, backend_result.error},
         {}
@@ -260,7 +270,13 @@ namespace virtual_display::driver {
             return backend_.depart_temporary_display(request.display_id);
           });
         backend_error != BackendError::None) {
-      (void) store_.mark_temporary_display_pending_departure(request);
+      // Only mark OUR record pending-departure. The backend call released the
+      // controller lock, so a concurrent remove+recreate of the same display_id
+      // could have produced a newer record; marking that would let the reaper
+      // depart a healthy, in-use virtual display (ABA). Matches release_lease.
+      if (temporary_display_generation_is_current(*record)) {
+        (void) store_.mark_temporary_display_pending_departure(request);
+      }
       return {StoreError::None, ValidationError::None, backend_error};
     }
 

@@ -92,7 +92,11 @@ namespace {
   };
 
   struct MonitorContext {
-    IddCxBackend *backend {};
+    // Atomic because shutdown nulls this (depart-failed path) while IddCx monitor
+    // callbacks on other threads read it. Plain-pointer load/store would be a data
+    // race (benign on x64 in practice, but formally UB). std::atomic<T*>'s implicit
+    // load/store conversions keep the call sites unchanged.
+    std::atomic<IddCxBackend *> backend {};
     std::uint64_t display_id {};
   };
 
@@ -1788,11 +1792,20 @@ namespace {
       if (referenced_swapchain_) {
         WdfObjectReference(referenced_swapchain_);
       }
+      // Private manual-reset stop event. The worker waits on BOTH this and the
+      // OS-supplied frame event; teardown signals this one. Never signal the OS
+      // frame event (next_surface_available_) to request stop -- it is owned by
+      // IddCx and manufacturing signals on it is outside the driver contract.
+      stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
 
     ~SwapChainProcessor() {
       stop();
       delete_swapchain();
+      if (stop_event_) {
+        CloseHandle(stop_event_);
+        stop_event_ = nullptr;
+      }
     }
 
     SwapChainProcessor(const SwapChainProcessor &) = delete;
@@ -1880,8 +1893,8 @@ namespace {
 
     void request_stop() {
       stop_requested_.store(true, std::memory_order_release);
-      if (next_surface_available_) {
-        SetEvent(next_surface_available_);
+      if (stop_event_) {
+        SetEvent(stop_event_);
       }
     }
 
@@ -2052,12 +2065,19 @@ namespace {
       }
 
       while (!stop_requested_.load(std::memory_order_acquire)) {
-        const DWORD wait_result = WaitForSingleObject(next_surface_available_, 1000);
+        HANDLE wait_handles[2] = {next_surface_available_, stop_event_};
+        const DWORD handle_count = stop_event_ ? 2u : 1u;
+        const DWORD wait_result = WaitForMultipleObjects(handle_count, wait_handles, FALSE, 1000);
         if (stop_requested_.load(std::memory_order_acquire)) {
           break;
         }
         if (wait_result == WAIT_TIMEOUT) {
           continue;
+        }
+        if (handle_count == 2 && wait_result == WAIT_OBJECT_0 + 1) {
+          // stop_event_ signaled by teardown; stop_requested_ is set before the
+          // event so the check above normally already broke -- exit defensively.
+          break;
         }
         if (wait_result != WAIT_OBJECT_0) {
           TraceLoggingWrite(
@@ -2099,12 +2119,17 @@ namespace {
               return;
             }
             if (is_access_lost_hresult(acquire_result)) {
+              // A virtual-display mode change (alt-tab / topology churn) raises
+              // ACCESS_LOST. Do NOT destroy+recreate the render device here: a
+              // D3D11 device create/destroy on the render adapter while the OS is
+              // mid mode-commit serializes against the display stack and wedges the
+              // host's concurrent D3DKMTDestroyHwQueue (the alt-tab deadlock). Match
+              // the canonical IddCx drivers (SudoVDA / WDK sample): exit the worker
+              // and let the OS re-assign a fresh swapchain -- a fresh device is
+              // created at assign time, after the mode has settled.
               log_render_device_lost("ReleaseAndAcquireBuffer", acquire_result);
-              if (FAILED(reset_render_device(render_adapter_luid))) {
-                delete_swapchain();
-                return;
-              }
-              continue;
+              delete_swapchain();
+              return;
             }
             if (is_device_lost_hresult(acquire_result)) {
               log_render_device_lost("ReleaseAndAcquireBuffer", acquire_result);
@@ -2137,15 +2162,11 @@ namespace {
               return;
             }
             if (is_access_lost_hresult(finished_result)) {
+              // Same as the acquire path: never destroy+recreate the device during
+              // an in-flight mode change. Exit and let the OS re-assign.
               log_render_device_lost("FinishedProcessingFrame", finished_result);
-              if (FAILED(reset_render_device(render_adapter_luid))) {
-                delete_swapchain();
-                return;
-              }
-              finished_result = IddCxSwapChainFinishedProcessingFrame(swapchain_);
-              if (SUCCEEDED(finished_result)) {
-                continue;
-              }
+              delete_swapchain();
+              return;
             }
             if (is_device_lost_hresult(finished_result)) {
               log_render_device_lost("FinishedProcessingFrame", finished_result);
@@ -2171,6 +2192,7 @@ namespace {
 
     IDDCX_SWAPCHAIN swapchain_ {};
     HANDLE next_surface_available_ {};
+    HANDLE stop_event_ {};
     std::atomic<bool> stop_requested_ {false};
     std::thread worker_ {};
     std::mutex assignment_mutex_ {};
@@ -2662,7 +2684,11 @@ namespace {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "RenderAdapterPreferenceTimedOut");
         {
           std::lock_guard lock {mutex_};
-          lifecycle_unhealthy_ = true;
+          // Same poison guard as monitor departure: only set unhealthy while the
+          // detached worker is still outstanding.
+          if (render_adapter_calls_in_flight_ > 0) {
+            lifecycle_unhealthy_ = true;
+          }
         }
         render_adapter_thread.detach();
         return vdd::BackendError::Failed;
@@ -2754,7 +2780,9 @@ namespace {
           TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "AdapterInitRenderAdapterPreferenceTimedOut");
           {
             std::lock_guard lock {mutex_};
-            lifecycle_unhealthy_ = true;
+            if (render_adapter_calls_in_flight_ > 0) {
+              lifecycle_unhealthy_ = true;
+            }
           }
           render_adapter_thread.detach();
         }
@@ -3093,8 +3121,15 @@ namespace {
 
     vdd::BackendDisplayResult arrive_display(const vdd::DisplayDescriptor &requested_descriptor, const bool permanent) {
       struct ArrivalState {
+        // All fields guarded by IddCxBackend::mutex_. The worker-completes vs
+        // caller-times-out decision is made under that lock so there is exactly one
+        // winner: if the caller wins (caller_timed_out), the worker departs a
+        // late-but-successful arrival (no orphan); if the worker wins (worker_done),
+        // the caller consumes result. This also avoids the lifecycle_unhealthy_
+        // poison: the flag is only set while the worker is genuinely outstanding.
         vdd::BackendDisplayResult result {vdd::BackendError::Failed, {}, 0};
-        std::atomic<bool> timed_out {false};
+        bool worker_done {false};
+        bool caller_timed_out {false};
       };
 
       auto state = std::make_shared<ArrivalState>();
@@ -3107,8 +3142,20 @@ namespace {
       try {
         arrival_thread = std::thread([this, requested_descriptor, permanent, state]() {
           auto result = arrive_display_synchronously(requested_descriptor, permanent);
-          if (state->timed_out.load(std::memory_order_acquire) &&
-              result.error == vdd::BackendError::None) {
+          bool caller_abandoned = false;
+          {
+            std::lock_guard lock {mutex_};
+            if (state->caller_timed_out) {
+              caller_abandoned = true;
+            } else {
+              state->result = result;
+              state->worker_done = true;
+            }
+          }
+          if (caller_abandoned && result.error == vdd::BackendError::None) {
+            // The caller already timed out and reported failure (the controller
+            // rolled back its store record). A successful late arrival would strand
+            // an orphan backend monitor with no control-plane owner, so depart it.
             TraceLoggingWrite(
               g_trace_provider,
               "MonitorArrivalCompletedAfterTimeout",
@@ -3130,9 +3177,7 @@ namespace {
               );
               TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalLateCleanupFailed");
             }
-            result = {vdd::BackendError::Failed, {}, 0};
           }
-          state->result = result;
           finish_monitor_arrival();
         });
       } catch (...) {
@@ -3144,13 +3189,22 @@ namespace {
         arrival_thread.native_handle(),
         static_cast<DWORD>(kMonitorArrivalTimeout.count())
       );
-      if (wait_result == WAIT_OBJECT_0) {
-        arrival_thread.join();
-        return state->result;
+
+      bool worker_finished = false;
+      {
+        std::lock_guard lock {mutex_};
+        if (state->worker_done) {
+          worker_finished = true;
+        } else {
+          // Give up on this arrival. The worker (still outstanding) will observe
+          // caller_timed_out and depart a late success itself, and will clear the
+          // unhealthy flag via finish_monitor_arrival once it settles.
+          state->caller_timed_out = true;
+          lifecycle_unhealthy_ = true;
+        }
       }
 
-      state->timed_out.store(true, std::memory_order_release);
-      if (WaitForSingleObject(arrival_thread.native_handle(), 0) == WAIT_OBJECT_0) {
+      if (worker_finished) {
         arrival_thread.join();
         return state->result;
       }
@@ -3163,10 +3217,6 @@ namespace {
         TraceLoggingUInt32(GetLastError(), "LastError")
       );
       TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalTimedOut");
-      {
-        std::lock_guard lock {mutex_};
-        lifecycle_unhealthy_ = true;
-      }
       arrival_thread.detach();
       return {vdd::BackendError::Failed, {}, 0};
     }
@@ -3447,7 +3497,12 @@ namespace {
       TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorDepartureTimedOut");
       {
         std::lock_guard lock {mutex_};
-        lifecycle_unhealthy_ = true;
+        // Only mark unhealthy while the detached departure worker is genuinely
+        // still outstanding. If it already finished (and cleared the flag) under
+        // this same lock, do not re-poison a flag nobody will clear.
+        if (monitor_departures_in_flight_ > 0) {
+          lifecycle_unhealthy_ = true;
+        }
       }
       departure_thread.detach();
       return STATUS_TIMEOUT;
@@ -3603,13 +3658,17 @@ namespace {
 
   public:
     NTSTATUS assign_swapchain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN *args) {
+      // IddCx bugchecks the driver if EvtIddCxMonitorAssignSwapChain returns any
+      // status other than STATUS_SUCCESS or STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN.
+      // Every failure exit on this path must therefore decline via ABANDON, never a
+      // generic NTSTATUS.
       if (!monitor || !args || !args->hSwapChain || !args->hNextSurfaceAvailable) {
-        return STATUS_INVALID_PARAMETER;
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
 
       auto *context = GetMonitorContext(monitor);
       if (!context || !context->backend) {
-        return STATUS_DEVICE_NOT_READY;
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
 
       {
@@ -3635,8 +3694,12 @@ namespace {
         processor->abandon_swapchain();
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
-      processor->mark_assign_succeeded();
-
+      // NOTE: do NOT publish assignment success yet. The worker is already running
+      // and is allowed to WdfObjectDelete the swapchain once ownership is committed.
+      // Publishing success before the departing recheck below let a fast worker
+      // failure delete a swapchain that this callback might then hand back to IddCx
+      // as ABANDON_SWAPCHAIN (which keeps OS ownership) -> double free / verifier
+      // bugcheck. Commit ownership exactly once, on the success path, under mutex_.
       std::unique_ptr<SwapChainProcessor> previous_processor;
       std::vector<std::unique_ptr<SwapChainProcessor>> finished_retired_processors;
       bool abandon_new_processor = false;
@@ -3651,6 +3714,9 @@ namespace {
             finished_retired_processors
           );
           previous_processor = std::move(record->second.swapchain_processor);
+          // Irrevocable success: from here the callback returns STATUS_SUCCESS and
+          // the decision never transitions back to abandoned.
+          processor->mark_assign_succeeded();
           record->second.swapchain_processor = std::move(processor);
         }
       }
@@ -4335,7 +4401,7 @@ NTSTATUS SunshineEvtQueryTargetModes(
 
   auto *context = GetMonitorContext(monitor);
   if (context && context->backend) {
-    return context->backend->query_target_modes(monitor, input, output);
+    return context->backend.load()->query_target_modes(monitor, input, output);
   }
 
   return fill_target_modes(input, output);
@@ -4396,7 +4462,7 @@ NTSTATUS SunshineEvtSetDefaultHdrMetadata(
     return STATUS_DEVICE_NOT_READY;
   }
 
-  return context->backend->set_default_hdr_metadata(monitor, args);
+  return context->backend.load()->set_default_hdr_metadata(monitor, args);
 }
 
 NTSTATUS SunshineEvtSetGammaRamp(
@@ -4412,7 +4478,7 @@ NTSTATUS SunshineEvtSetGammaRamp(
     return STATUS_DEVICE_NOT_READY;
   }
 
-  return context->backend->set_gamma_ramp(monitor, args);
+  return context->backend.load()->set_gamma_ramp(monitor, args);
 }
 
 NTSTATUS SunshineEvtQueryTargetModes2(
@@ -4426,23 +4492,27 @@ NTSTATUS SunshineEvtQueryTargetModes2(
 
   auto *context = GetMonitorContext(monitor);
   if (context && context->backend) {
-    return context->backend->query_target_modes2(monitor, input, output);
+    return context->backend.load()->query_target_modes2(monitor, input, output);
   }
 
   return fill_target_modes2(input, output);
 }
 
 NTSTATUS SunshineEvtAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN *args) {
+  // IddCx bugchecks on any assign return other than SUCCESS / ABANDON_SWAPCHAIN.
+  // The null-backend case is reachable on a late callback after shutdown nulls
+  // MonitorContext::backend, so it must decline via ABANDON rather than a generic
+  // failure status.
   if (!monitor) {
-    return STATUS_INVALID_PARAMETER;
+    return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
   }
 
   auto *context = GetMonitorContext(monitor);
   if (!context || !context->backend) {
-    return STATUS_DEVICE_NOT_READY;
+    return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
   }
 
-  return context->backend->assign_swapchain(monitor, args);
+  return context->backend.load()->assign_swapchain(monitor, args);
 }
 
 NTSTATUS SunshineEvtUnassignSwapChain(IDDCX_MONITOR monitor) {
@@ -4455,7 +4525,7 @@ NTSTATUS SunshineEvtUnassignSwapChain(IDDCX_MONITOR monitor) {
     return STATUS_DEVICE_NOT_READY;
   }
 
-  return context->backend->unassign_swapchain(monitor);
+  return context->backend.load()->unassign_swapchain(monitor);
 }
 
 void SunshineEvtIddCxDeviceIoControl(
