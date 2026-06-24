@@ -31,6 +31,9 @@
 //   PsExec64 -accepteula -s -i -w <dir> alttab_stress.exe
 // No driver test-signing or reboot needed (Microsoft-whitelisted IddCx driver).
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <d3d11.h>
