@@ -108,6 +108,15 @@ if(WIN32 AND BUILD_VIRTUALDISPLAY_TOOLS)
     target_compile_features(virtualdisplay_broker PRIVATE cxx_std_20)
     install(TARGETS virtualdisplay_broker RUNTIME DESTINATION tools)
     list(APPEND _libvirtualdisplay_tool_targets virtualdisplay_broker)
+
+    # Alt-tab / teardown brute-force stress harness: creates its own temporary virtual
+    # display, captures it like Sunshine (recreating the capture device on every mode
+    # change), churns the mode + connect/disconnect, and watchdogs for hangs.
+    add_executable(alttab_stress "${PROJECT_SOURCE_DIR}/tools/alttab_stress.cpp")
+    target_link_libraries(alttab_stress PRIVATE libvirtualdisplay::driver advapi32 d3d11 dxgi)
+    target_compile_features(alttab_stress PRIVATE cxx_std_20)
+    install(TARGETS alttab_stress RUNTIME DESTINATION tools)
+    list(APPEND _libvirtualdisplay_tool_targets alttab_stress)
 endif()
 
 if(WIN32 AND BUILD_VIRTUALDISPLAY_VULKAN_LAYER)

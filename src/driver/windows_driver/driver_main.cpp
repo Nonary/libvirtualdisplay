@@ -1896,6 +1896,7 @@ namespace {
       if (stop_event_) {
         SetEvent(stop_event_);
       }
+      assignment_changed_.notify_all();
     }
 
     void mark_assign_succeeded() {
@@ -1980,6 +1981,21 @@ namespace {
       }
     }
 
+    HRESULT wait_for_assignment_commit() {
+      std::unique_lock lock {assignment_mutex_};
+      assignment_changed_.wait(lock, [this]() {
+        return assign_completed_ || stop_requested_.load(std::memory_order_acquire);
+      });
+
+      if (!assign_completed_ || !driver_owns_swapchain_ || !swapchain_) {
+        TraceLoggingWrite(g_trace_provider, "SwapChainSetDeviceSkippedBeforeAssignCommit");
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainSetDeviceSkippedBeforeAssignCommit");
+        return HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+      }
+
+      return S_OK;
+    }
+
     void delete_swapchain() {
       bool assignment_pending = false;
       if (const auto swapchain = claim_owned_swapchain_for_delete(assignment_pending)) {
@@ -2012,6 +2028,11 @@ namespace {
     }
 
     HRESULT assign_swapchain_device() {
+      HRESULT hr = wait_for_assignment_commit();
+      if (FAILED(hr)) {
+        return hr;
+      }
+
       if (!dxgi_device_) {
         return E_FAIL;
       }
