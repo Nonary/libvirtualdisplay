@@ -53,7 +53,7 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR BUILD_SUNSHINE_VIRTUAL_DISPLAY_DR
     if(NOT _libvirtualdisplay_driver_version_match)
         message(FATAL_ERROR "LIBVIRTUALDISPLAY_PACKAGE_VERSION must start with a numeric version usable for DriverVer, got '${LIBVIRTUALDISPLAY_PACKAGE_VERSION}'")
     endif()
-    if(CMAKE_MATCH_5 STREQUAL "")
+    if("${CMAKE_MATCH_5}" STREQUAL "")
         set(_libvirtualdisplay_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}.0")
     else()
         set(_libvirtualdisplay_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}.${CMAKE_MATCH_5}")
