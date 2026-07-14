@@ -33,6 +33,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <ratio>
 #include <span>
 #include <string>
 #include <thread>
@@ -82,6 +83,22 @@ namespace {
     sizeof(std::uint32_t);
   constexpr wchar_t kTemporaryDisplayProfilesValue[] = L"TemporaryDisplayProfiles";
   const GUID kControlInterfaceGuid = vdd::to_windows_guid(vdd::kDeviceInterfaceGuid);
+
+  std::chrono::steady_clock::time_point lease_clock_now() noexcept {
+    ULONGLONG unbiased_time_100ns {};
+    if (QueryUnbiasedInterruptTime(&unbiased_time_100ns)) {
+      using UnbiasedDuration = std::chrono::duration<std::uint64_t, std::ratio<1, 10'000'000>>;
+      return std::chrono::steady_clock::time_point {
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          UnbiasedDuration {unbiased_time_100ns}
+        )
+      };
+    }
+
+    // The API only fails for exceptional platform errors. Preserve lease service
+    // with the process monotonic clock if Windows cannot provide unbiased time.
+    return std::chrono::steady_clock::now();
+  }
 
   class IddCxBackend;
   class CursorProcessor;
@@ -4164,7 +4181,7 @@ namespace {
           TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "LeaseReaperSkippedBusyController");
           continue;
         }
-        (void) controller.reap_expired(std::chrono::steady_clock::now(), &controller_lock);
+        (void) controller.reap_expired(lease_clock_now(), &controller_lock);
         controller_lock.unlock();
         backend.cleanup_finished_retired_swapchains();
       }
@@ -4582,7 +4599,7 @@ void SunshineEvtIddCxDeviceIoControl(
     input_buffer_length,
     output,
     output_buffer_length,
-    std::chrono::steady_clock::now()
+    lease_clock_now()
   );
   const auto completion_status = ntstatus_from_ioctl_status(result.status);
   TraceLoggingWrite(
