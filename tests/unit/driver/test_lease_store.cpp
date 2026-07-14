@@ -43,6 +43,7 @@ namespace {
     request.height = 1080;
     request.physical_width_mm = 530;
     request.physical_height_mm = 300;
+    request.hdr_max_luminance_nits = 2000;
     request.refresh_rate_millihz = 60'000;
     request.requested_timeout_ms = 30'000;
     set_display_name(request.display_name, "Sunshine Display");
@@ -69,6 +70,7 @@ TEST(VirtualDisplayDriverLeaseStore, CreatesTemporaryDisplayWithConnectorIndex) 
   EXPECT_EQ(record->height, 1080u);
   EXPECT_EQ(record->physical_width_mm, 530u);
   EXPECT_EQ(record->physical_height_mm, 300u);
+  EXPECT_EQ(record->hdr_max_luminance_nits, 2000u);
   EXPECT_EQ(record->refresh_rate_millihz, 60'000u);
   EXPECT_EQ(record->display_name, "Sunshine Display");
 }

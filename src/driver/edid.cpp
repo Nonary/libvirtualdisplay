@@ -8,6 +8,9 @@
 
 namespace virtual_display::driver {
   namespace {
+    constexpr std::uint32_t kMinEdidHdrMaxLuminanceNits = 400;
+    constexpr std::uint32_t kMaxEdidHdrMaxLuminanceNits = 2000;
+
     std::byte byte(const std::uint32_t value) {
       return static_cast<std::byte>(value & 0xffu);
     }
@@ -16,7 +19,11 @@ namespace virtual_display::driver {
       return static_cast<std::uint8_t>(value);
     }
 
-    constexpr std::byte kDefaultHdrMaxLuminanceCtaValue {0x8b};
+    std::byte hdr_max_luminance_cta_value(const std::uint32_t nits) {
+      const auto safe_nits = std::max(nits, 1u);
+      const auto code = std::ceil(32.0 * std::log2(static_cast<double>(safe_nits) / 50.0));
+      return byte(static_cast<std::uint32_t>(std::clamp(code, 0.0, 255.0)));
+    }
 
     void put_le16(std::span<std::byte> data, const std::size_t offset, const std::uint16_t value) {
       data[offset] = byte(value);
@@ -121,6 +128,11 @@ namespace virtual_display::driver {
       );
       safe.physical_width_mm = std::clamp(safe.physical_width_mm, 1u, 4095u);
       safe.physical_height_mm = std::clamp(safe.physical_height_mm, 1u, 4095u);
+      safe.hdr_max_luminance_nits = std::clamp(
+        safe.hdr_max_luminance_nits,
+        kMinEdidHdrMaxLuminanceNits,
+        kMaxEdidHdrMaxLuminanceNits
+      );
       return safe;
     }
 
@@ -298,7 +310,7 @@ namespace virtual_display::driver {
 
     std::size_t data_offset = 4;
     if (safe_options.hdr_supported) {
-      constexpr std::array<std::byte, 64> hdr_cta_blocks {
+      std::array<std::byte, 64> hdr_cta_blocks {
         std::byte {0x51}, std::byte {0x5d}, std::byte {0x5e}, std::byte {0x5f},
         std::byte {0x60}, std::byte {0x61}, std::byte {0x10}, std::byte {0x1f},
         std::byte {0x22}, std::byte {0x21}, std::byte {0x20}, std::byte {0x05},
@@ -314,8 +326,11 @@ namespace virtual_display::driver {
         std::byte {0xe3}, std::byte {0x05}, std::byte {0xe0}, std::byte {0x01},
         std::byte {0xe4}, std::byte {0x0f}, std::byte {0x18}, std::byte {0x00},
         std::byte {0x00}, std::byte {0xe6}, std::byte {0x06}, std::byte {0x0f},
-        std::byte {0x01}, kDefaultHdrMaxLuminanceCtaValue, kDefaultHdrMaxLuminanceCtaValue, std::byte {0x00}
+        std::byte {0x01}, std::byte {0x00}, std::byte {0x00}, std::byte {0x00}
       };
+      const auto hdr_max_luminance = hdr_max_luminance_cta_value(safe_options.hdr_max_luminance_nits);
+      hdr_cta_blocks[61] = hdr_max_luminance;
+      hdr_cta_blocks[62] = hdr_max_luminance;
       // Windows HDR classification expects the complete CTA metadata block set.
       // Keep that block stable while the base EDID remains identity-specific.
       std::copy(hdr_cta_blocks.begin(), hdr_cta_blocks.end(), extension.begin() + 4);

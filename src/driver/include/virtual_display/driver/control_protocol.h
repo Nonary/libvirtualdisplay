@@ -33,7 +33,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 5;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 6;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
 
   inline constexpr std::uint32_t kDisplayNameChars = 32;
@@ -52,6 +52,9 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kDefaultPhysicalHeightMillimeters = 340;
   inline constexpr std::uint32_t kMinPhysicalSizeMillimeters = 10;
   inline constexpr std::uint32_t kMaxPhysicalSizeMillimeters = 2550;
+  inline constexpr std::uint32_t kDefaultHdrMaxLuminanceNits = 1000;
+  inline constexpr std::uint32_t kMinHdrMaxLuminanceNits = 400;
+  inline constexpr std::uint32_t kMaxHdrMaxLuminanceNits = 2000;
   inline constexpr std::uint32_t kCreateTemporaryDisplayFlagEphemeralIdentity = 0x00000001u;
   inline constexpr std::uint32_t kCreateTemporaryDisplayKnownFlags =
     kCreateTemporaryDisplayFlagEphemeralIdentity;
@@ -159,7 +162,8 @@ namespace virtual_display::driver {
     std::uint32_t requested_timeout_ms {};
     char display_name[kDisplayNameChars] {};
     std::uint32_t flags {};
-    std::uint32_t reserved {};
+    // Zero preserves compatibility with protocol 3.5 clients and selects the default.
+    std::uint32_t hdr_max_luminance_nits {};
   };
 
   struct CreateTemporaryDisplayResult {
@@ -298,6 +302,7 @@ namespace virtual_display::driver {
     InvalidWidth,
     InvalidHeight,
     InvalidPhysicalSize,
+    InvalidHdrLuminance,
     InvalidRefreshRate,
     InvalidDisplayName,
     PermanentDisplayCountTooHigh,

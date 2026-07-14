@@ -60,7 +60,8 @@ TEST(VirtualDisplayDriverDisplayIdentity, DerivesStableContainerGuidFromDisplayI
 }
 
 TEST(VirtualDisplayDriverDisplayIdentity, BuildsHdrEdidOptionsFromDisplayRecord) {
-  const auto record = record_for_display_id(0x12345678);
+  auto record = record_for_display_id(0x12345678);
+  record.hdr_max_luminance_nits = 2000;
   const auto options = vdd::edid_options_for_temporary_display(record);
 
   EXPECT_EQ(options.manufacturer_id, vdd::kSunshineDriverManufacturerId);
@@ -70,6 +71,7 @@ TEST(VirtualDisplayDriverDisplayIdentity, BuildsHdrEdidOptionsFromDisplayRecord)
   EXPECT_EQ(options.height, record.height);
   EXPECT_EQ(options.physical_width_mm, record.physical_width_mm);
   EXPECT_EQ(options.physical_height_mm, record.physical_height_mm);
+  EXPECT_EQ(options.hdr_max_luminance_nits, record.hdr_max_luminance_nits);
   EXPECT_EQ(options.refresh_rate_millihz, record.refresh_rate_millihz);
   EXPECT_EQ(options.monitor_name, record.display_name);
   EXPECT_TRUE(options.hdr_supported);

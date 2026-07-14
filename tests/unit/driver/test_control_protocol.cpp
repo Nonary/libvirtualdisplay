@@ -95,7 +95,7 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants)
   // Behavioral replacement for the test that scraped README.md for the version prose: it
   // asserts the formatter that is the single source of truth for the dotted version, rather
   // than that a string happens to appear in a checked-in document.
-  EXPECT_EQ(vdd::protocol_version_string(), "3.5.0");
+  EXPECT_EQ(vdd::protocol_version_string(), "3.6.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {
@@ -178,6 +178,7 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesCreateRequest) {
   EXPECT_EQ(validated.effective_timeout_ms, request.requested_timeout_ms);
   EXPECT_EQ(validated.request.physical_width_mm, 600u);
   EXPECT_EQ(validated.request.physical_height_mm, 340u);
+  EXPECT_EQ(validated.request.hdr_max_luminance_nits, vdd::kDefaultHdrMaxLuminanceNits);
   EXPECT_EQ(validated.display_name, "Sunshine Display");
 }
 
@@ -278,11 +279,19 @@ TEST(VirtualDisplayDriverControlProtocol, RejectsOutOfRangeMode) {
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
 }
 
-TEST(VirtualDisplayDriverControlProtocol, RejectsReservedCreateFields) {
+TEST(VirtualDisplayDriverControlProtocol, ValidatesCreateHdrLuminance) {
   auto request = valid_create_request();
-  request.reserved = 1;
+  request.hdr_max_luminance_nits = vdd::kMaxHdrMaxLuminanceNits;
+  vdd::ValidatedCreateTemporaryDisplay validated {};
 
-  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidReservedField);
+  ASSERT_EQ(vdd::validate_create_temporary_display(request, &validated), vdd::ValidationError::None);
+  EXPECT_EQ(validated.request.hdr_max_luminance_nits, vdd::kMaxHdrMaxLuminanceNits);
+
+  request.hdr_max_luminance_nits = vdd::kMinHdrMaxLuminanceNits - 1;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidHdrLuminance);
+
+  request.hdr_max_luminance_nits = vdd::kMaxHdrMaxLuminanceNits + 1;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidHdrLuminance);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, RejectsBlankDisplayName) {

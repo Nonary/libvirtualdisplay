@@ -390,7 +390,7 @@ if (!released.ok()) {
 
 ### Protocol notes
 
-- The current protocol version is `3.5.0`.
+- The current protocol version is `3.6.0`.
 - `ControlClient::check_protocol_compatible()` should be called before issuing
   state-changing requests.
 - IDs are caller-owned. Reuse `DisplayId` for the same logical display when you

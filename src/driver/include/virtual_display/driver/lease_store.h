@@ -43,6 +43,7 @@ namespace virtual_display::driver {
     std::uint64_t identity_display_id {};
     std::uint64_t generation {};
     bool pending_departure {};
+    std::uint32_t hdr_max_luminance_nits {kDefaultHdrMaxLuminanceNits};
   };
 
   struct StoreResult {

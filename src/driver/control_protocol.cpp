@@ -127,9 +127,6 @@ namespace virtual_display::driver {
     if (!is_valid_api_namespace(request.api_namespace)) {
       return ValidationError::WrongApiNamespace;
     }
-    if (request.reserved != 0) {
-      return ValidationError::InvalidReservedField;
-    }
     if (request.lease_id < kMinOpaqueLeaseId) {
       return ValidationError::MissingLeaseId;
     }
@@ -159,6 +156,13 @@ namespace virtual_display::driver {
         physical_height_mm > kMaxPhysicalSizeMillimeters) {
       return ValidationError::InvalidPhysicalSize;
     }
+    const auto hdr_max_luminance_nits = request.hdr_max_luminance_nits == 0 ?
+      kDefaultHdrMaxLuminanceNits :
+      request.hdr_max_luminance_nits;
+    if (hdr_max_luminance_nits < kMinHdrMaxLuminanceNits ||
+        hdr_max_luminance_nits > kMaxHdrMaxLuminanceNits) {
+      return ValidationError::InvalidHdrLuminance;
+    }
     char canonical_display_name[kDisplayNameChars] {};
     if (!canonicalize_display_name(request.display_name, canonical_display_name)) {
       return ValidationError::InvalidDisplayName;
@@ -168,6 +172,7 @@ namespace virtual_display::driver {
       validated->request = request;
       validated->request.physical_width_mm = physical_width_mm;
       validated->request.physical_height_mm = physical_height_mm;
+      validated->request.hdr_max_luminance_nits = hdr_max_luminance_nits;
       std::copy(
         std::begin(canonical_display_name),
         std::end(canonical_display_name),
@@ -373,6 +378,8 @@ namespace virtual_display::driver {
         return "invalid_height";
       case ValidationError::InvalidPhysicalSize:
         return "invalid_physical_size";
+      case ValidationError::InvalidHdrLuminance:
+        return "invalid_hdr_luminance";
       case ValidationError::InvalidRefreshRate:
         return "invalid_refresh_rate";
       case ValidationError::InvalidDisplayName:

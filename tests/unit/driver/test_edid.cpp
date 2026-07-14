@@ -305,6 +305,20 @@ TEST(VirtualDisplayDriverEdid, DefaultsHdrStaticMetadataToAtLeastThousandNitMaxi
   EXPECT_EQ(edid[cta + 66], edid[cta + 65]);
 }
 
+TEST(VirtualDisplayDriverEdid, EncodesRequestedHdrMaximumLuminance) {
+  auto options = default_options();
+  options.hdr_max_luminance_nits = 2000;
+
+  const auto edid = vdd::create_edid(options);
+  const auto hdr = vdd::read_hdr_static_metadata(edid);
+
+  ASSERT_TRUE(hdr.has_value());
+  EXPECT_TRUE(vdd::has_valid_edid_checksums(edid));
+  EXPECT_GE(vdd::hdr_luminance_nits_from_code(hdr->max_luminance_code), 2000.0);
+  EXPECT_LT(vdd::hdr_luminance_nits_from_code(hdr->max_luminance_code), 2050.0);
+  EXPECT_EQ(hdr->max_frame_average_luminance_code, hdr->max_luminance_code);
+}
+
 TEST(VirtualDisplayDriverEdid, OmitsHdrStaticMetadataWhenDisabled) {
   auto options = default_options();
   options.hdr_supported = false;

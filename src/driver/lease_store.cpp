@@ -202,7 +202,8 @@ namespace virtual_display::driver {
         retain_identity,
         identity_display_id,
         next_temporary_display_generation_++,
-        false
+        false,
+        validated.request.hdr_max_luminance_nits
       }
     );
 
