@@ -108,6 +108,17 @@ TEST(VirtualDisplayWindowsDriverModes, TargetModesPreferRequestedTimingOverMonit
   EXPECT_EQ(modes[preferred_index].height, requested.height);
   EXPECT_EQ(modes[preferred_index].refresh_rate_millihz, requested.refresh_rate_millihz);
   EXPECT_TRUE(has_mode(modes, 5120, 1440, 480'000));
+  EXPECT_TRUE(has_mode(modes, 5120, 1440, 960'000));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, PreferredTimingAdvertisesQuadrupledRefreshForArbitraryRates) {
+  const auto requested = vdd::active_windows_driver_mode_shape(2304, 1440, 116'000);
+
+  const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(requested);
+
+  ASSERT_LT(preferred_index, modes.size());
+  EXPECT_TRUE(has_mode(modes, 2304, 1440, 116'000));
+  EXPECT_TRUE(has_mode(modes, 2304, 1440, 464'000));
 }
 
 TEST(VirtualDisplayWindowsDriverModes, TargetModesFallBackToMonitorDescriptionWhenNoRequestExists) {

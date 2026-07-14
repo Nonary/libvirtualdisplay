@@ -122,10 +122,13 @@ namespace virtual_display::driver {
           }
         }
 
-        const auto doubled_refresh_rate_millihz =
-          clamp_windows_driver_u32(static_cast<std::uint64_t>(preferred.refresh_rate_millihz) * 2ull);
-        if (const auto doubled = scaled_mode_shape(preferred, scale_percent, doubled_refresh_rate_millihz)) {
-          (void) append_unique_windows_driver_mode(modes, *doubled);
+        for (const auto multiplier: {2ull, 4ull}) {
+          const auto multiplied_refresh_rate_millihz = clamp_windows_driver_u32(
+            static_cast<std::uint64_t>(preferred.refresh_rate_millihz) * multiplier
+          );
+          if (const auto multiplied = scaled_mode_shape(preferred, scale_percent, multiplied_refresh_rate_millihz)) {
+            (void) append_unique_windows_driver_mode(modes, *multiplied);
+          }
         }
       }
 
@@ -242,7 +245,7 @@ namespace virtual_display::driver {
     const std::optional<WindowsDriverModeShape> &preferred
   ) {
     std::vector<WindowsDriverModeShape> modes;
-    modes.reserve(kDefaultWindowsDriverModes.size() + (preferred ? kPreferredModeScalePercent.size() * 2u : 0u));
+    modes.reserve(kDefaultWindowsDriverModes.size() + (preferred ? kPreferredModeScalePercent.size() * 3u : 0u));
 
     for (const auto &spec: kDefaultWindowsDriverModes) {
       modes.push_back(mode_shape_from_spec(spec));
