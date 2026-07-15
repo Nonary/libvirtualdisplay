@@ -23,6 +23,7 @@ namespace virtual_display::driver {
     WindowsControlTransport &operator=(WindowsControlTransport &&other) noexcept;
 
     [[nodiscard]] bool valid() const;
+    void cancel_pending_io() const;
 
     bool ioctl(
       std::uint32_t ioctl_code,

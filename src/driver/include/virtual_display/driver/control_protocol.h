@@ -33,14 +33,16 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 6;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 7;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
+  inline constexpr std::uint16_t kMinimumCompatibleProtocolVersionMinor = 6;
 
   inline constexpr std::uint32_t kDisplayNameChars = 32;
   inline constexpr std::uint32_t kDefaultLeaseTimeoutMs = 10'000;
   inline constexpr std::uint32_t kMinLeaseTimeoutMs = 3'000;
   inline constexpr std::uint32_t kMaxLeaseTimeoutMs = 300'000;
   inline constexpr std::uint64_t kMinOpaqueLeaseId = 0x6000000000000000ull;
+  inline constexpr std::size_t kOwnerCapabilityBytes = 32;
 
   inline constexpr std::uint32_t kMinWidth = 320;
   inline constexpr std::uint32_t kMinHeight = 200;
@@ -92,6 +94,8 @@ namespace virtual_display::driver {
     SetDisplayManifest = 0x909,
     QueryDisplayManifest = 0x90a,
     SetRenderAdapter = 0x90b,
+    CreateTemporaryDisplayOwned = 0x90c,
+    ReclaimTemporaryDisplay = 0x90d,
   };
 
   enum class IoctlAccess : std::uint32_t {
@@ -134,6 +138,10 @@ namespace virtual_display::driver {
     ioctl_code(IoctlFunction::QueryDisplayManifest, IoctlAccess::Read);
   inline constexpr std::uint32_t kIoctlSetRenderAdapter =
     ioctl_code(IoctlFunction::SetRenderAdapter, IoctlAccess::Write);
+  inline constexpr std::uint32_t kIoctlCreateTemporaryDisplayOwned =
+    ioctl_code(IoctlFunction::CreateTemporaryDisplayOwned, IoctlAccess::ReadWrite);
+  inline constexpr std::uint32_t kIoctlReclaimTemporaryDisplay =
+    ioctl_code(IoctlFunction::ReclaimTemporaryDisplay, IoctlAccess::ReadWrite);
 
   struct ProtocolVersion {
     Guid api_namespace {kApiNamespaceGuid};
@@ -181,6 +189,36 @@ namespace virtual_display::driver {
     Guid api_namespace {kApiNamespaceGuid};
     AdapterLuid adapter_luid {};
     std::uint32_t flags {};
+    std::uint32_t reserved {};
+  };
+
+  struct OwnerCapability {
+    std::array<std::uint8_t, kOwnerCapabilityBytes> bytes {};
+
+    friend constexpr bool operator==(const OwnerCapability &lhs, const OwnerCapability &rhs) = default;
+  };
+
+  struct CreateTemporaryDisplayOwnedRequest {
+    CreateTemporaryDisplayRequest display {};
+    OwnerCapability owner_capability {};
+  };
+
+  struct ReclaimTemporaryDisplayRequest {
+    Guid api_namespace {kApiNamespaceGuid};
+    std::uint64_t display_id {};
+    std::uint64_t new_lease_id {};
+    std::uint32_t requested_timeout_ms {};
+    std::uint32_t reserved {};
+    OwnerCapability owner_capability {};
+  };
+
+  struct ReclaimTemporaryDisplayResult {
+    Guid api_namespace {kApiNamespaceGuid};
+    std::uint64_t lease_id {};
+    std::uint64_t display_id {};
+    std::uint32_t connector_index {};
+    std::uint32_t effective_timeout_ms {};
+    std::uint32_t temporary_display_count {};
     std::uint32_t reserved {};
   };
 
@@ -298,6 +336,7 @@ namespace virtual_display::driver {
     WrongApiNamespace,
     MissingLeaseId,
     MissingDisplayId,
+    MissingOwnerCapability,
     InvalidFlags,
     InvalidWidth,
     InvalidHeight,
@@ -372,6 +411,11 @@ namespace virtual_display::driver {
     const CreateTemporaryDisplayRequest &request,
     ValidatedCreateTemporaryDisplay *validated = nullptr
   );
+  ValidationError validate_create_temporary_display_owned(
+    const CreateTemporaryDisplayOwnedRequest &request,
+    ValidatedCreateTemporaryDisplay *validated = nullptr
+  );
+  ValidationError validate_reclaim_temporary_display(const ReclaimTemporaryDisplayRequest &request);
   ValidationError validate_lease_display_request(const LeaseDisplayRequest &request);
   ValidationError validate_lease_request(const LeaseRequest &request);
   ValidationError validate_permanent_display_count(
@@ -391,6 +435,11 @@ namespace virtual_display::driver {
   static_assert(sizeof(ProtocolVersion) == 24);
   static_assert(sizeof(CreateTemporaryDisplayRequest) == 96);
   static_assert(sizeof(CreateTemporaryDisplayResult) == 56);
+  static_assert(std::is_standard_layout_v<OwnerCapability>);
+  static_assert(sizeof(OwnerCapability) == kOwnerCapabilityBytes);
+  static_assert(sizeof(CreateTemporaryDisplayOwnedRequest) == 128);
+  static_assert(sizeof(ReclaimTemporaryDisplayRequest) == 72);
+  static_assert(sizeof(ReclaimTemporaryDisplayResult) == 48);
   static_assert(sizeof(SetRenderAdapterRequest) == 32);
   static_assert(sizeof(LeaseDisplayRequest) == 32);
   static_assert(sizeof(LeaseRequest) == 32);

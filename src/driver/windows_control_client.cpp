@@ -144,6 +144,12 @@ namespace virtual_display::driver {
     return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr;
   }
 
+  void WindowsControlTransport::cancel_pending_io() const {
+    if (valid()) {
+      (void) CancelIoEx(handle_, nullptr);
+    }
+  }
+
   bool WindowsControlTransport::ioctl(
     const std::uint32_t ioctl_code,
     const void *input,

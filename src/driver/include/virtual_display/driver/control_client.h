@@ -57,6 +57,12 @@ namespace virtual_display::driver {
     ControlResult<ProtocolVersion> query_protocol_version();
     ControlOperationResult check_protocol_compatible();
     ControlResult<CreateTemporaryDisplayResult> create_temporary_display(const CreateTemporaryDisplayRequest &request);
+    ControlResult<CreateTemporaryDisplayResult> create_temporary_display_owned(
+      const CreateTemporaryDisplayOwnedRequest &request
+    );
+    ControlResult<ReclaimTemporaryDisplayResult> reclaim_temporary_display(
+      const ReclaimTemporaryDisplayRequest &request
+    );
     ControlOperationResult remove_temporary_display(const LeaseDisplayRequest &request);
     ControlOperationResult feed_lease(const LeaseRequest &request);
     ControlOperationResult release_lease(const LeaseRequest &request);

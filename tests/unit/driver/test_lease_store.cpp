@@ -49,6 +49,25 @@ namespace {
     set_display_name(request.display_name, "Sunshine Display");
     return request;
   }
+
+  vdd::OwnerCapability owner_capability(const std::uint8_t seed = 1) {
+    vdd::OwnerCapability capability {};
+    for (std::size_t index = 0; index < capability.bytes.size(); ++index) {
+      capability.bytes[index] = static_cast<std::uint8_t>(seed + index);
+    }
+    return capability;
+  }
+
+  vdd::CreateTemporaryDisplayOwnedRequest make_owned_create_request(
+    const std::uint64_t lease_id_value = lease_id(100),
+    const std::uint64_t display_id = 200,
+    const vdd::OwnerCapability &capability = owner_capability()
+  ) {
+    vdd::CreateTemporaryDisplayOwnedRequest request {};
+    request.display = make_create_request(lease_id_value, display_id);
+    request.owner_capability = capability;
+    return request;
+  }
 }  // namespace
 
 TEST(VirtualDisplayDriverLeaseStore, CreatesTemporaryDisplayWithConnectorIndex) {
@@ -73,6 +92,135 @@ TEST(VirtualDisplayDriverLeaseStore, CreatesTemporaryDisplayWithConnectorIndex) 
   EXPECT_EQ(record->hdr_max_luminance_nits, 2000u);
   EXPECT_EQ(record->refresh_rate_millihz, 60'000u);
   EXPECT_EQ(record->display_name, "Sunshine Display");
+}
+
+TEST(VirtualDisplayDriverLeaseStore, ReclaimsOwnedDisplayWithoutChangingIdentity) {
+  vdd::DisplayStore store {2, 4};
+  const auto now = std::chrono::steady_clock::now();
+  const auto capability = owner_capability();
+  ASSERT_EQ(
+    store.create_temporary_display_owned(make_owned_create_request(lease_id(100), 200, capability), now).status.error,
+    vdd::StoreError::None
+  );
+  const auto before = require_temporary_display(store, 200);
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = 200;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = capability;
+  const auto reclaimed = store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(10));
+
+  ASSERT_EQ(reclaimed.status.error, vdd::StoreError::None);
+  EXPECT_EQ(reclaimed.result.lease_id, lease_id(101));
+  EXPECT_EQ(reclaimed.result.display_id, 200u);
+  EXPECT_EQ(reclaimed.result.connector_index, before.connector_index);
+  EXPECT_EQ(reclaimed.result.temporary_display_count, 1u);
+  EXPECT_EQ(store.query_lease(lease_id(100), now + std::chrono::seconds(10)).lease_exists, 0u);
+  EXPECT_EQ(store.query_lease(lease_id(101), now + std::chrono::seconds(10)).remaining_ms, 60'000u);
+
+  const auto after = require_temporary_display(store, 200);
+  EXPECT_EQ(after.lease_id, lease_id(101));
+  EXPECT_EQ(after.connector_index, before.connector_index);
+  EXPECT_EQ(after.identity_display_id, before.identity_display_id);
+  EXPECT_EQ(after.generation, before.generation);
+  EXPECT_EQ(after.width, before.width);
+  EXPECT_EQ(after.height, before.height);
+  EXPECT_EQ(after.physical_width_mm, before.physical_width_mm);
+  EXPECT_EQ(after.physical_height_mm, before.physical_height_mm);
+  EXPECT_EQ(after.refresh_rate_millihz, before.refresh_rate_millihz);
+  EXPECT_EQ(after.display_name, before.display_name);
+  EXPECT_EQ(after.retain_identity, before.retain_identity);
+  EXPECT_EQ(after.hdr_max_luminance_nits, before.hdr_max_luminance_nits);
+  EXPECT_EQ(after.retain_identity, before.retain_identity);
+  EXPECT_EQ(after.width, before.width);
+  EXPECT_EQ(after.height, before.height);
+}
+
+TEST(VirtualDisplayDriverLeaseStore, ReclaimRotatesEveryDisplayOnOwnedLease) {
+  vdd::DisplayStore store {2, 4};
+  const auto now = std::chrono::steady_clock::now();
+  const auto capability = owner_capability();
+  ASSERT_EQ(
+    store.create_temporary_display_owned(make_owned_create_request(lease_id(100), 200, capability), now).status.error,
+    vdd::StoreError::None
+  );
+  ASSERT_EQ(
+    store.create_temporary_display_owned(make_owned_create_request(lease_id(100), 201, capability), now).status.error,
+    vdd::StoreError::None
+  );
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = 200;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 30'000;
+  reclaim.owner_capability = capability;
+  const auto reclaimed = store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1));
+
+  ASSERT_EQ(reclaimed.status.error, vdd::StoreError::None);
+  EXPECT_EQ(reclaimed.result.temporary_display_count, 2u);
+  EXPECT_EQ(require_temporary_display(store, 200).lease_id, lease_id(101));
+  EXPECT_EQ(require_temporary_display(store, 201).lease_id, lease_id(101));
+  EXPECT_EQ(store.query_lease(lease_id(100), now + std::chrono::seconds(1)).lease_exists, 0u);
+  EXPECT_EQ(store.query_lease(lease_id(101), now + std::chrono::seconds(1)).temporary_display_count, 2u);
+}
+
+TEST(VirtualDisplayDriverLeaseStore, ReclaimFailsClosedForWrongCapabilityExpiryAndPendingDeparture) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto capability = owner_capability();
+
+  {
+    vdd::DisplayStore store {2, 4};
+    ASSERT_EQ(
+      store.create_temporary_display_owned(make_owned_create_request(lease_id(100), 200, capability), now).status.error,
+      vdd::StoreError::None
+    );
+    vdd::ReclaimTemporaryDisplayRequest reclaim {};
+    reclaim.display_id = 200;
+    reclaim.new_lease_id = lease_id(100);
+    reclaim.requested_timeout_ms = 30'000;
+    reclaim.owner_capability = capability;
+    EXPECT_EQ(
+      store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1)).status.error,
+      vdd::StoreError::LeaseNotFound
+    );
+    EXPECT_EQ(require_temporary_display(store, 200).lease_id, lease_id(100));
+
+    reclaim.new_lease_id = lease_id(101);
+    reclaim.owner_capability = owner_capability(9);
+    EXPECT_EQ(
+      store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1)).status.error,
+      vdd::StoreError::LeaseNotFound
+    );
+    EXPECT_EQ(require_temporary_display(store, 200).lease_id, lease_id(100));
+
+    reclaim.owner_capability = capability;
+    EXPECT_EQ(
+      store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(30)).status.error,
+      vdd::StoreError::LeaseNotFound
+    );
+  }
+
+  {
+    vdd::DisplayStore store {2, 4};
+    ASSERT_EQ(
+      store.create_temporary_display_owned(make_owned_create_request(lease_id(100), 200, capability), now).status.error,
+      vdd::StoreError::None
+    );
+    EXPECT_EQ(
+      store.mark_temporary_display_pending_departure({vdd::kApiNamespaceGuid, lease_id(100), 200}).error,
+      vdd::StoreError::None
+    );
+    vdd::ReclaimTemporaryDisplayRequest reclaim {};
+    reclaim.display_id = 200;
+    reclaim.new_lease_id = lease_id(101);
+    reclaim.requested_timeout_ms = 30'000;
+    reclaim.owner_capability = capability;
+    EXPECT_EQ(
+      store.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1)).status.error,
+      vdd::StoreError::LeaseNotFound
+    );
+  }
 }
 
 TEST(VirtualDisplayDriverLeaseStore, RejectsDuplicateDisplayId) {

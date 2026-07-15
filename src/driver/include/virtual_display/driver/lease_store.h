@@ -56,6 +56,11 @@ namespace virtual_display::driver {
     CreateTemporaryDisplayResult result {};
   };
 
+  struct ReclaimStoreResult {
+    StoreResult status {};
+    ReclaimTemporaryDisplayResult result {};
+  };
+
   enum class RemoveTemporaryDisplayMode {
     RetainConnectorReservation,
     ReleaseConnectorReservation,
@@ -81,6 +86,14 @@ namespace virtual_display::driver {
       const CreateTemporaryDisplayRequest &request,
       std::chrono::steady_clock::time_point now
     );
+    CreateStoreResult create_temporary_display_owned(
+      const CreateTemporaryDisplayOwnedRequest &request,
+      std::chrono::steady_clock::time_point now
+    );
+    ReclaimStoreResult reclaim_temporary_display(
+      const ReclaimTemporaryDisplayRequest &request,
+      std::chrono::steady_clock::time_point now
+    );
     StoreResult remove_temporary_display(
       const LeaseDisplayRequest &request,
       RemoveTemporaryDisplayMode mode = RemoveTemporaryDisplayMode::RetainConnectorReservation
@@ -104,7 +117,14 @@ namespace virtual_display::driver {
     struct LeaseRecord {
       std::uint32_t timeout_ms {};
       std::chrono::steady_clock::time_point expires_at {};
+      std::optional<OwnerCapability> owner_capability {};
     };
+
+    CreateStoreResult create_temporary_display_impl(
+      const CreateTemporaryDisplayRequest &request,
+      const OwnerCapability *owner_capability,
+      std::chrono::steady_clock::time_point now
+    );
 
     bool is_temporary_connector_index(std::uint32_t connector_index) const;
     std::uint32_t temporary_connector_limit() const;

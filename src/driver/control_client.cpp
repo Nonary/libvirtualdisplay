@@ -12,7 +12,7 @@ namespace virtual_display::driver {
     }
     if (!is_valid_api_namespace(result.value.api_namespace) ||
         result.value.major != kProtocolVersionMajor ||
-        result.value.minor < kProtocolVersionMinor) {
+        result.value.minor < kMinimumCompatibleProtocolVersionMinor) {
       result.status = ControlStatus::ProtocolIncompatible;
     }
     return result;
@@ -65,6 +65,26 @@ namespace virtual_display::driver {
 
   ControlResult<DisplayManifest> ControlClient::query_display_manifest() {
     return ioctl_out<DisplayManifest>(kIoctlQueryDisplayManifest, nullptr, 0);
+  }
+
+  ControlResult<CreateTemporaryDisplayResult> ControlClient::create_temporary_display_owned(
+    const CreateTemporaryDisplayOwnedRequest &request
+  ) {
+    return ioctl_out<CreateTemporaryDisplayResult>(
+      kIoctlCreateTemporaryDisplayOwned,
+      &request,
+      sizeof(request)
+    );
+  }
+
+  ControlResult<ReclaimTemporaryDisplayResult> ControlClient::reclaim_temporary_display(
+    const ReclaimTemporaryDisplayRequest &request
+  ) {
+    return ioctl_out<ReclaimTemporaryDisplayResult>(
+      kIoctlReclaimTemporaryDisplay,
+      &request,
+      sizeof(request)
+    );
   }
 
   ControlOperationResult ControlClient::set_render_adapter(const SetRenderAdapterRequest &request) {

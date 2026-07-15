@@ -62,6 +62,35 @@ namespace virtual_display::driver {
     const std::chrono::steady_clock::time_point now,
     std::unique_lock<std::timed_mutex> *controller_lock
   ) {
+    return create_temporary_display_impl(request, nullptr, now, controller_lock);
+  }
+
+  ControllerCreateResult DriverController::create_temporary_display_owned(
+    const CreateTemporaryDisplayOwnedRequest &request,
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
+    if (const auto validation = validate_create_temporary_display_owned(request);
+        validation != ValidationError::None) {
+      return {
+        {StoreError::ValidationFailed, validation, BackendError::None},
+        {}
+      };
+    }
+    return create_temporary_display_impl(
+      request.display,
+      &request.owner_capability,
+      now,
+      controller_lock
+    );
+  }
+
+  ControllerCreateResult DriverController::create_temporary_display_impl(
+    const CreateTemporaryDisplayRequest &request,
+    const OwnerCapability *owner_capability,
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
     if (const auto validation = validate_create_temporary_display(request);
         validation != ValidationError::None) {
       return {
@@ -101,7 +130,15 @@ namespace virtual_display::driver {
       }
     }
 
-    auto created = store_.create_temporary_display(request, now);
+    auto created = [&]() {
+      if (!owner_capability) {
+        return store_.create_temporary_display(request, now);
+      }
+      CreateTemporaryDisplayOwnedRequest owned {};
+      owned.display = request;
+      owned.owner_capability = *owner_capability;
+      return store_.create_temporary_display_owned(owned, now);
+    }();
     if (created.status.error != StoreError::None) {
       return {from_store_result(created.status), {}};
     }
@@ -242,6 +279,38 @@ namespace virtual_display::driver {
     created.result.os_adapter_luid = backend_result.os_adapter_luid;
     created.result.target_id = backend_result.target_id;
     return {{}, created.result};
+  }
+
+  ControllerReclaimResult DriverController::reclaim_temporary_display(
+    const ReclaimTemporaryDisplayRequest &request,
+    const std::chrono::steady_clock::time_point now,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
+    if (const auto validation = validate_reclaim_temporary_display(request);
+        validation != ValidationError::None) {
+      return {{StoreError::ValidationFailed, validation, BackendError::None}, {}};
+    }
+
+    // Reclaim changes the lease fencing token used by lifecycle ABA checks. Wait
+    // until no backend arrival/departure is in flight, then hold both locks while
+    // rotating it so a completed departure cannot leave a live store record behind.
+    const bool relock_controller = controller_lock && controller_lock->owns_lock();
+    if (relock_controller) {
+      controller_lock->unlock();
+    }
+    std::unique_lock backend_lock {backend_call_mutex_, std::defer_lock};
+    if (!backend_lock.try_lock_for(kBackendCallLockTimeout)) {
+      if (relock_controller) {
+        controller_lock->lock();
+      }
+      return {{StoreError::None, ValidationError::None, BackendError::Failed}, {}};
+    }
+    if (relock_controller) {
+      controller_lock->lock();
+    }
+
+    const auto reclaimed = store_.reclaim_temporary_display(request, now);
+    return {from_store_result(reclaimed.status), reclaimed.result};
   }
 
   ControllerStatus DriverController::remove_temporary_display(const LeaseDisplayRequest &request) {

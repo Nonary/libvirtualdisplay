@@ -4118,6 +4118,7 @@ namespace {
         case vdd::kIoctlFeedLease:
         case vdd::kIoctlReleaseLease:
         case vdd::kIoctlQueryLease:
+        case vdd::kIoctlReclaimTemporaryDisplay:
         case vdd::kIoctlQueryPermanentDisplayCount:
         case vdd::kIoctlQueryDisplayState:
         case vdd::kIoctlQueryDisplayManifest:

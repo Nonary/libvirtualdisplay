@@ -60,12 +60,27 @@ namespace virtual_display::driver {
     CreateTemporaryDisplayResult result {};
   };
 
+  struct ControllerReclaimResult {
+    ControllerStatus status {};
+    ReclaimTemporaryDisplayResult result {};
+  };
+
   class DriverController {
   public:
     DriverController(DisplayStore store, DisplayDriverBackend &backend);
 
     ControllerCreateResult create_temporary_display(
       const CreateTemporaryDisplayRequest &request,
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock = nullptr
+    );
+    ControllerCreateResult create_temporary_display_owned(
+      const CreateTemporaryDisplayOwnedRequest &request,
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock = nullptr
+    );
+    ControllerReclaimResult reclaim_temporary_display(
+      const ReclaimTemporaryDisplayRequest &request,
       std::chrono::steady_clock::time_point now,
       std::unique_lock<std::timed_mutex> *controller_lock = nullptr
     );
@@ -108,6 +123,12 @@ namespace virtual_display::driver {
     [[nodiscard]] const DisplayStore &store() const;
 
   private:
+    ControllerCreateResult create_temporary_display_impl(
+      const CreateTemporaryDisplayRequest &request,
+      const OwnerCapability *owner_capability,
+      std::chrono::steady_clock::time_point now,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
     static ControllerStatus from_store_result(const StoreResult &result);
     bool temporary_display_generation_is_current(const TemporaryDisplayRecord &record) const;
     DisplayDescriptor descriptor_from_record(const TemporaryDisplayRecord &record) const;

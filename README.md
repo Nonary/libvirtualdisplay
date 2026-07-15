@@ -390,7 +390,14 @@ if (!released.ok()) {
 
 ### Protocol notes
 
-- The current protocol version is `3.6.0`.
+- The current protocol version is `3.7.0`. Protocol 3.7 adds owned temporary
+  display creation and capability-based lease reclaim without exposing lease IDs
+  through global display-state queries.
+- Reclaim rotates only lease ownership and expiry. Connector assignment and the
+  EDID-producing display descriptor remain unchanged, so Windows keeps the same
+  monitor identity and settings contract.
+- The Windows driver measures lease expiry with unbiased interrupt time; time
+  spent in system sleep does not consume a temporary display lease.
 - `ControlClient::check_protocol_compatible()` should be called before issuing
   state-changing requests.
 - IDs are caller-owned. Reuse `DisplayId` for the same logical display when you

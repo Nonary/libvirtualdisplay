@@ -221,6 +221,44 @@ namespace virtual_display::driver {
         return {IoctlStatus::Success, bytes_returned, {}};
       }
 
+      case kIoctlCreateTemporaryDisplayOwned: {
+        CreateTemporaryDisplayOwnedRequest request {};
+        if (!read_input(input, input_size, request)) {
+          return {IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+
+        if (!output || output_size < sizeof(CreateTemporaryDisplayResult)) {
+          return {IoctlStatus::InvalidOutputBuffer, 0, {}};
+        }
+
+        auto created = controller_.create_temporary_display_owned(request, now, controller_lock);
+        if (!created.status.ok()) {
+          return result_from_controller(created.status);
+        }
+
+        (void) write_output(output, output_size, created.result, bytes_returned);
+        return {IoctlStatus::Success, bytes_returned, {}};
+      }
+
+      case kIoctlReclaimTemporaryDisplay: {
+        ReclaimTemporaryDisplayRequest request {};
+        if (!read_input(input, input_size, request)) {
+          return {IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+
+        if (!output || output_size < sizeof(ReclaimTemporaryDisplayResult)) {
+          return {IoctlStatus::InvalidOutputBuffer, 0, {}};
+        }
+
+        auto reclaimed = controller_.reclaim_temporary_display(request, now, controller_lock);
+        if (!reclaimed.status.ok()) {
+          return result_from_controller(reclaimed.status);
+        }
+
+        (void) write_output(output, output_size, reclaimed.result, bytes_returned);
+        return {IoctlStatus::Success, bytes_returned, {}};
+      }
+
       case kIoctlSetRenderAdapter: {
         SetRenderAdapterRequest request {};
         if (!read_input(input, input_size, request)) {

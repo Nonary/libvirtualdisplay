@@ -14,6 +14,14 @@ namespace virtual_display::driver {
         error
       };
     }
+
+    bool owner_capabilities_equal(const OwnerCapability &lhs, const OwnerCapability &rhs) {
+      std::uint8_t difference = 0;
+      for (std::size_t index = 0; index < lhs.bytes.size(); ++index) {
+        difference |= static_cast<std::uint8_t>(lhs.bytes[index] ^ rhs.bytes[index]);
+      }
+      return difference == 0;
+    }
   }  // namespace
 
   DisplayManifest display_manifest_from_permanent_settings(
@@ -136,6 +144,25 @@ namespace virtual_display::driver {
     const CreateTemporaryDisplayRequest &request,
     const std::chrono::steady_clock::time_point now
   ) {
+    return create_temporary_display_impl(request, nullptr, now);
+  }
+
+  CreateStoreResult DisplayStore::create_temporary_display_owned(
+    const CreateTemporaryDisplayOwnedRequest &request,
+    const std::chrono::steady_clock::time_point now
+  ) {
+    if (const auto validation = validate_create_temporary_display_owned(request);
+        validation != ValidationError::None) {
+      return CreateStoreResult {validation_failure(validation), {}};
+    }
+    return create_temporary_display_impl(request.display, &request.owner_capability, now);
+  }
+
+  CreateStoreResult DisplayStore::create_temporary_display_impl(
+    const CreateTemporaryDisplayRequest &request,
+    const OwnerCapability *owner_capability,
+    const std::chrono::steady_clock::time_point now
+  ) {
     ValidatedCreateTemporaryDisplay validated {};
     if (const auto validation = validate_create_temporary_display(request, &validated);
         validation != ValidationError::None) {
@@ -153,6 +180,11 @@ namespace virtual_display::driver {
     const auto lease = leases_by_id_.find(request.lease_id);
     if (lease != leases_by_id_.end() &&
         (lease->second.expires_at <= now || lease_has_pending_departure(request.lease_id))) {
+      return CreateStoreResult {{StoreError::LeaseNotFound, ValidationError::None}, {}};
+    }
+    if (lease != leases_by_id_.end() && owner_capability &&
+        lease->second.owner_capability &&
+        !owner_capabilities_equal(*lease->second.owner_capability, *owner_capability)) {
       return CreateStoreResult {{StoreError::LeaseNotFound, ValidationError::None}, {}};
     }
 
@@ -212,9 +244,12 @@ namespace virtual_display::driver {
         request.lease_id,
         LeaseRecord {
           effective_timeout_ms,
-          expires_at
+          expires_at,
+          owner_capability ? std::optional<OwnerCapability> {*owner_capability} : std::nullopt
         }
       );
+    } else if (owner_capability && !lease->second.owner_capability) {
+      lease->second.owner_capability = *owner_capability;
     }
 
     CreateTemporaryDisplayResult result {};
@@ -224,6 +259,70 @@ namespace virtual_display::driver {
     result.effective_timeout_ms = effective_timeout_ms;
 
     return CreateStoreResult {{}, result};
+  }
+
+  ReclaimStoreResult DisplayStore::reclaim_temporary_display(
+    const ReclaimTemporaryDisplayRequest &request,
+    const std::chrono::steady_clock::time_point now
+  ) {
+    if (const auto validation = validate_reclaim_temporary_display(request);
+        validation != ValidationError::None) {
+      return ReclaimStoreResult {validation_failure(validation), {}};
+    }
+
+    const auto display = displays_by_id_.find(request.display_id);
+    if (display == displays_by_id_.end() || display->second.pending_departure) {
+      return ReclaimStoreResult {{StoreError::LeaseNotFound, ValidationError::None}, {}};
+    }
+
+    const auto old_lease_id = display->second.lease_id;
+    auto lease = leases_by_id_.find(old_lease_id);
+    if (lease == leases_by_id_.end() ||
+        lease->second.expires_at <= now ||
+        lease_has_pending_departure(old_lease_id) ||
+        !lease->second.owner_capability ||
+        !owner_capabilities_equal(*lease->second.owner_capability, request.owner_capability)) {
+      return ReclaimStoreResult {{StoreError::LeaseNotFound, ValidationError::None}, {}};
+    }
+
+    // Reclaim is a fencing operation. Reusing the old lease would leave a stale
+    // process authorized to feed or remove the recovered display.
+    if (request.new_lease_id == old_lease_id || leases_by_id_.contains(request.new_lease_id)) {
+      return ReclaimStoreResult {{StoreError::LeaseNotFound, ValidationError::None}, {}};
+    }
+
+    const auto timeout_ms = normalize_timeout_ms(request.requested_timeout_ms);
+    const auto expires_at = now + std::chrono::milliseconds(timeout_ms);
+    const auto capability = *lease->second.owner_capability;
+
+    std::uint32_t display_count = 0;
+    for (auto &[_, record]: displays_by_id_) {
+      if (record.lease_id != old_lease_id) {
+        continue;
+      }
+      record.lease_id = request.new_lease_id;
+      record.timeout_ms = timeout_ms;
+      record.expires_at = expires_at;
+      ++display_count;
+    }
+
+    leases_by_id_.erase(lease);
+    leases_by_id_.emplace(
+      request.new_lease_id,
+      LeaseRecord {
+        timeout_ms,
+        expires_at,
+        capability
+      }
+    );
+
+    ReclaimTemporaryDisplayResult result {};
+    result.lease_id = request.new_lease_id;
+    result.display_id = request.display_id;
+    result.connector_index = display->second.connector_index;
+    result.effective_timeout_ms = timeout_ms;
+    result.temporary_display_count = display_count;
+    return ReclaimStoreResult {{}, result};
   }
 
   StoreResult DisplayStore::remove_temporary_display(

@@ -91,6 +91,19 @@ TEST(VirtualDisplayDriverControlClient, QueryProtocolVersionUsesProtocolIoctl) {
   EXPECT_EQ(result.value.major, vdd::kProtocolVersionMajor);
 }
 
+TEST(VirtualDisplayDriverControlClient, AcceptsPreviousCompatibleProtocolMinor) {
+  FakeTransport transport;
+  vdd::ProtocolVersion version {};
+  version.minor = vdd::kMinimumCompatibleProtocolVersionMinor;
+  transport.set_output(version);
+  vdd::ControlClient client {transport};
+
+  const auto result = client.query_protocol_version();
+
+  EXPECT_TRUE(result.ok());
+  EXPECT_EQ(result.value.minor, vdd::kMinimumCompatibleProtocolVersionMinor);
+}
+
 TEST(VirtualDisplayDriverControlClient, RejectsIncompatibleProtocolNamespace) {
   FakeTransport transport;
   vdd::ProtocolVersion version {};
@@ -157,6 +170,52 @@ TEST(VirtualDisplayDriverControlClient, CreateTemporaryDisplayRoundTripsRequestA
   EXPECT_EQ(sent.height, 1440u);
   EXPECT_EQ(sent.physical_width_mm, 590u);
   EXPECT_EQ(sent.physical_height_mm, 330u);
+}
+
+TEST(VirtualDisplayDriverControlClient, OwnedCreateAndReclaimUseCapabilityIoctls) {
+  FakeTransport transport;
+  vdd::ControlClient client {transport};
+
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display.lease_id = vdd::kMinOpaqueLeaseId | 10;
+  owned.display.display_id = 20;
+  owned.display.width = 2560;
+  owned.display.height = 1440;
+  owned.display.refresh_rate_millihz = 120'000;
+  for (std::size_t index = 0; index < owned.owner_capability.bytes.size(); ++index) {
+    owned.owner_capability.bytes[index] = static_cast<std::uint8_t>(index + 1);
+  }
+
+  vdd::CreateTemporaryDisplayResult created {};
+  created.lease_id = owned.display.lease_id;
+  created.display_id = owned.display.display_id;
+  transport.set_output(created);
+  ASSERT_TRUE(client.create_temporary_display_owned(owned).ok());
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = vdd::kMinOpaqueLeaseId | 11;
+  reclaim.requested_timeout_ms = 30'000;
+  reclaim.owner_capability = owned.owner_capability;
+  vdd::ReclaimTemporaryDisplayResult reclaimed {};
+  reclaimed.lease_id = reclaim.new_lease_id;
+  reclaimed.display_id = reclaim.display_id;
+  transport.set_output(reclaimed);
+  const auto result = client.reclaim_temporary_display(reclaim);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(transport.calls.size(), 2u);
+  EXPECT_EQ(transport.calls[0].ioctl_code, vdd::kIoctlCreateTemporaryDisplayOwned);
+  EXPECT_EQ(transport.calls[1].ioctl_code, vdd::kIoctlReclaimTemporaryDisplay);
+  EXPECT_EQ(
+    input_as<vdd::CreateTemporaryDisplayOwnedRequest>(transport.calls[0]).owner_capability,
+    owned.owner_capability
+  );
+  EXPECT_EQ(
+    input_as<vdd::ReclaimTemporaryDisplayRequest>(transport.calls[1]).owner_capability,
+    owned.owner_capability
+  );
+  EXPECT_EQ(result.value.lease_id, reclaim.new_lease_id);
 }
 
 TEST(VirtualDisplayDriverControlClient, LeaseOperationsUseExpectedIoctls) {

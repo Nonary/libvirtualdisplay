@@ -185,6 +185,54 @@ namespace virtual_display::driver {
     return ValidationError::None;
   }
 
+  ValidationError validate_create_temporary_display_owned(
+    const CreateTemporaryDisplayOwnedRequest &request,
+    ValidatedCreateTemporaryDisplay *validated
+  ) {
+    if (const auto validation = validate_create_temporary_display(request.display, validated);
+        validation != ValidationError::None) {
+      return validation;
+    }
+
+    if (std::all_of(
+          request.owner_capability.bytes.begin(),
+          request.owner_capability.bytes.end(),
+          [](const std::uint8_t byte) {
+            return byte == 0;
+          }
+        )) {
+      return ValidationError::MissingOwnerCapability;
+    }
+
+    return ValidationError::None;
+  }
+
+  ValidationError validate_reclaim_temporary_display(const ReclaimTemporaryDisplayRequest &request) {
+    if (!is_valid_api_namespace(request.api_namespace)) {
+      return ValidationError::WrongApiNamespace;
+    }
+    if (request.new_lease_id < kMinOpaqueLeaseId) {
+      return ValidationError::MissingLeaseId;
+    }
+    if (request.display_id == 0) {
+      return ValidationError::MissingDisplayId;
+    }
+    if (request.reserved != 0) {
+      return ValidationError::InvalidReservedField;
+    }
+    if (std::all_of(
+          request.owner_capability.bytes.begin(),
+          request.owner_capability.bytes.end(),
+          [](const std::uint8_t byte) {
+            return byte == 0;
+          }
+        )) {
+      return ValidationError::MissingOwnerCapability;
+    }
+
+    return ValidationError::None;
+  }
+
   ValidationError validate_lease_display_request(const LeaseDisplayRequest &request) {
     if (!is_valid_api_namespace(request.api_namespace)) {
       return ValidationError::WrongApiNamespace;
@@ -370,6 +418,8 @@ namespace virtual_display::driver {
         return "missing_lease_id";
       case ValidationError::MissingDisplayId:
         return "missing_display_id";
+      case ValidationError::MissingOwnerCapability:
+        return "missing_owner_capability";
       case ValidationError::InvalidFlags:
         return "invalid_flags";
       case ValidationError::InvalidWidth:

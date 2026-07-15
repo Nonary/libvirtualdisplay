@@ -81,6 +81,14 @@ namespace {
     set_display_name(request.display_name, "Sunshine");
     return request;
   }
+
+  vdd::OwnerCapability owner_capability(const std::uint8_t seed = 1) {
+    vdd::OwnerCapability capability {};
+    for (std::size_t index = 0; index < capability.bytes.size(); ++index) {
+      capability.bytes[index] = static_cast<std::uint8_t>(seed + index);
+    }
+    return capability;
+  }
 }  // namespace
 
 TEST(VirtualDisplayDriverIoctlDispatcher, ReturnsProtocolVersion) {
@@ -161,6 +169,63 @@ TEST(VirtualDisplayDriverIoctlDispatcher, CreateTemporaryDisplayWritesResultAndA
   EXPECT_EQ(harness.backend.arrived[0].physical_width_mm, 530u);
   EXPECT_EQ(harness.backend.arrived[0].physical_height_mm, 300u);
   EXPECT_TRUE(vdd::has_hdr_static_metadata(harness.backend.arrived[0].edid));
+}
+
+TEST(VirtualDisplayDriverIoctlDispatcher, OwnedCreateAndReclaimRoundTripWithoutBackendChurn) {
+  Harness harness;
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.owner_capability = owner_capability();
+  vdd::CreateTemporaryDisplayResult created {};
+  ASSERT_EQ(
+    harness.dispatcher.dispatch(
+      vdd::kIoctlCreateTemporaryDisplayOwned,
+      &owned,
+      sizeof(owned),
+      &created,
+      sizeof(created),
+      now
+    ).status,
+    vdd::IoctlStatus::Success
+  );
+  ASSERT_EQ(harness.backend.arrived.size(), 1u);
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = owned.owner_capability;
+  vdd::ReclaimTemporaryDisplayResult reclaimed {};
+  const auto result = harness.dispatcher.dispatch(
+    vdd::kIoctlReclaimTemporaryDisplay,
+    &reclaim,
+    sizeof(reclaim),
+    &reclaimed,
+    sizeof(reclaimed),
+    now + std::chrono::seconds(1)
+  );
+
+  EXPECT_EQ(result.status, vdd::IoctlStatus::Success);
+  EXPECT_EQ(result.bytes_returned, sizeof(reclaimed));
+  EXPECT_EQ(reclaimed.lease_id, lease_id(101));
+  EXPECT_EQ(reclaimed.display_id, owned.display.display_id);
+  EXPECT_EQ(reclaimed.temporary_display_count, 1u);
+  EXPECT_EQ(harness.backend.arrived.size(), 1u);
+  EXPECT_TRUE(harness.backend.departed.empty());
+
+  reclaim.owner_capability = owner_capability(9);
+  EXPECT_EQ(
+    harness.dispatcher.dispatch(
+      vdd::kIoctlReclaimTemporaryDisplay,
+      &reclaim,
+      sizeof(reclaim),
+      &reclaimed,
+      sizeof(reclaimed),
+      now + std::chrono::seconds(2)
+    ).status,
+    vdd::IoctlStatus::NotFound
+  );
 }
 
 TEST(VirtualDisplayDriverIoctlDispatcher, CreateTemporaryDisplayRejectsShortOutputBeforeBackendArrival) {

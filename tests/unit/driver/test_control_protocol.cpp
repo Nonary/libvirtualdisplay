@@ -41,6 +41,14 @@ namespace {
     return request;
   }
 
+  vdd::OwnerCapability valid_owner_capability() {
+    vdd::OwnerCapability capability {};
+    for (std::size_t index = 0; index < capability.bytes.size(); ++index) {
+      capability.bytes[index] = static_cast<std::uint8_t>(index + 1);
+    }
+    return capability;
+  }
+
   vdd::DisplayManifest valid_display_manifest() {
     vdd::DisplayManifest manifest {};
     manifest.profile_count = 1;
@@ -80,6 +88,8 @@ TEST(VirtualDisplayDriverControlProtocol, ComputesBufferedUnknownDeviceIoctlCode
   EXPECT_EQ(vdd::kIoctlSetDisplayManifest, 0x0022e424u);
   EXPECT_EQ(vdd::kIoctlQueryDisplayManifest, 0x00226428u);
   EXPECT_EQ(vdd::kIoctlSetRenderAdapter, 0x0022a42cu);
+  EXPECT_EQ(vdd::kIoctlCreateTemporaryDisplayOwned, 0x0022e430u);
+  EXPECT_EQ(vdd::kIoctlReclaimTemporaryDisplay, 0x0022e434u);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionUsesDedicatedNamespace) {
@@ -95,7 +105,7 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants)
   // Behavioral replacement for the test that scraped README.md for the version prose: it
   // asserts the formatter that is the single source of truth for the dotted version, rather
   // than that a string happens to appear in a checked-in document.
-  EXPECT_EQ(vdd::protocol_version_string(), "3.6.0");
+  EXPECT_EQ(vdd::protocol_version_string(), "3.7.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {
@@ -292,6 +302,32 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesCreateHdrLuminance) {
 
   request.hdr_max_luminance_nits = vdd::kMaxHdrMaxLuminanceNits + 1;
   EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidHdrLuminance);
+}
+
+TEST(VirtualDisplayDriverControlProtocol, ValidatesOwnedCreateAndReclaimRequests) {
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = valid_create_request();
+  owned.owner_capability = valid_owner_capability();
+  EXPECT_EQ(vdd::validate_create_temporary_display_owned(owned), vdd::ValidationError::None);
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(11);
+  reclaim.requested_timeout_ms = 30'000;
+  reclaim.owner_capability = owned.owner_capability;
+  EXPECT_EQ(vdd::validate_reclaim_temporary_display(reclaim), vdd::ValidationError::None);
+
+  owned.owner_capability = {};
+  EXPECT_EQ(
+    vdd::validate_create_temporary_display_owned(owned),
+    vdd::ValidationError::MissingOwnerCapability
+  );
+
+  reclaim.owner_capability = {};
+  EXPECT_EQ(
+    vdd::validate_reclaim_temporary_display(reclaim),
+    vdd::ValidationError::MissingOwnerCapability
+  );
 }
 
 TEST(VirtualDisplayDriverControlProtocol, RejectsBlankDisplayName) {

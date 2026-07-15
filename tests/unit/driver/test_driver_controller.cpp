@@ -2,8 +2,13 @@
 #include "virtual_display/driver/driver_controller.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace vdd = virtual_display::driver;
@@ -45,8 +50,31 @@ namespace {
     }
 
     vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
+      if (block_depart) {
+        std::unique_lock lock {depart_mutex};
+        depart_entered = true;
+        depart_cv.notify_all();
+        depart_cv.wait(lock, [&]() {
+          return allow_depart;
+        });
+      }
       departed.push_back(display_id);
       return fail_depart ? vdd::BackendError::Failed : vdd::BackendError::None;
+    }
+
+    bool wait_for_departure(const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {depart_mutex};
+      return depart_cv.wait_for(lock, timeout, [&]() {
+        return depart_entered;
+      });
+    }
+
+    void unblock_departure() {
+      {
+        std::lock_guard lock {depart_mutex};
+        allow_depart = true;
+      }
+      depart_cv.notify_all();
     }
 
     vdd::BackendError set_permanent_display_count(const vdd::PermanentDisplayCountRequest &request) override {
@@ -66,6 +94,7 @@ namespace {
     bool fail_reserve {};
     bool fail_unreserve {};
     bool fail_render_adapter {};
+    bool block_depart {};
     vdd::AdapterLuid adapter_luid {44, 2};
     vdd::SetRenderAdapterRequest render_adapter_request {};
     std::uint32_t next_target_id {7};
@@ -77,6 +106,10 @@ namespace {
     std::vector<vdd::PermanentDisplayCountRequest> permanent_settings {};
     std::vector<vdd::DisplayManifest> manifests {};
     std::vector<std::string> events {};
+    std::mutex depart_mutex {};
+    std::condition_variable depart_cv {};
+    bool depart_entered {};
+    bool allow_depart {};
 
     vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
       render_adapter_request = request;
@@ -100,6 +133,14 @@ namespace {
     request.requested_timeout_ms = 30'000;
     set_display_name(request.display_name, "Sunshine HDR");
     return request;
+  }
+
+  vdd::OwnerCapability owner_capability() {
+    vdd::OwnerCapability capability {};
+    for (std::size_t index = 0; index < capability.bytes.size(); ++index) {
+      capability.bytes[index] = static_cast<std::uint8_t>(index + 1);
+    }
+    return capability;
   }
 
   vdd::DriverController make_controller(FakeBackend &backend) {
@@ -126,6 +167,111 @@ TEST(VirtualDisplayDriverController, CreateTemporaryDisplayArrivesBackendAndRetu
   EXPECT_EQ(backend.arrived[0].physical_height_mm, 330u);
   EXPECT_TRUE(vdd::has_valid_edid_checksums(backend.arrived[0].edid));
   EXPECT_TRUE(vdd::has_hdr_static_metadata(backend.arrived[0].edid));
+}
+
+TEST(VirtualDisplayDriverController, ReclaimOwnedDisplayRenewsLeaseWithoutBackendOrIdentityChurn) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+  const auto before = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(before);
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = owned.owner_capability;
+  const auto reclaimed = controller.reclaim_temporary_display(reclaim, now + std::chrono::seconds(5));
+
+  ASSERT_TRUE(reclaimed.status.ok());
+  EXPECT_EQ(reclaimed.result.connector_index, before->connector_index);
+  EXPECT_EQ(backend.events, (std::vector<std::string> {"reserve", "arrive"}));
+  EXPECT_TRUE(backend.departed.empty());
+  ASSERT_EQ(backend.arrived.size(), 1u);
+
+  const auto after = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->lease_id, lease_id(101));
+  EXPECT_EQ(after->connector_index, before->connector_index);
+  EXPECT_EQ(after->identity_display_id, before->identity_display_id);
+  EXPECT_EQ(after->generation, before->generation);
+
+  const auto state = controller.query_display_state();
+  ASSERT_EQ(state.temporary_display_count, 1u);
+  ASSERT_EQ(state.entry_count, 1u);
+  EXPECT_EQ(state.entries[0].lease_id, 0u);
+  EXPECT_EQ(state.entries[0].display_id, owned.display.display_id);
+  EXPECT_EQ(state.entries[0].container_id, vdd::container_guid_from_display_id(owned.display.display_id));
+}
+
+TEST(VirtualDisplayDriverController, ReclaimWaitsForInFlightDepartureAndCannotReviveRemovedDisplay) {
+  FakeBackend backend;
+  backend.block_depart = true;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = owned.display.lease_id;
+  remove.display_id = owned.display.display_id;
+  std::timed_mutex controller_mutex;
+  vdd::ControllerStatus remove_status {};
+  std::thread remover([&]() {
+    std::unique_lock controller_lock {controller_mutex};
+    remove_status = controller.remove_temporary_display(remove, &controller_lock);
+  });
+
+  if (!backend.wait_for_departure(std::chrono::seconds(1))) {
+    backend.unblock_departure();
+    remover.join();
+    FAIL() << "backend departure did not start";
+  }
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = owned.owner_capability;
+  std::promise<void> reclaim_acquired_controller;
+  auto reclaim_acquired_controller_future = reclaim_acquired_controller.get_future();
+  std::atomic<bool> reclaim_returned {false};
+  vdd::ControllerReclaimResult reclaim_result {};
+  std::thread reclaimer([&]() {
+    std::unique_lock controller_lock {controller_mutex};
+    reclaim_acquired_controller.set_value();
+    reclaim_result = controller.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1), &controller_lock);
+    reclaim_returned.store(true, std::memory_order_release);
+  });
+
+  reclaim_acquired_controller_future.wait();
+  {
+    // The reclaim call releases the controller lock while it waits for the
+    // backend lifecycle fence. Acquiring it here proves the reclaimer reached
+    // that wait without relying on a scheduling delay.
+    std::unique_lock controller_lock {controller_mutex};
+    EXPECT_FALSE(reclaim_returned.load(std::memory_order_acquire));
+    const auto record = controller.store().find_temporary_display(owned.display.display_id);
+    EXPECT_TRUE(record);
+    if (record) {
+      EXPECT_EQ(record->lease_id, owned.display.lease_id);
+    }
+  }
+
+  backend.unblock_departure();
+  remover.join();
+  reclaimer.join();
+
+  EXPECT_TRUE(remove_status.ok());
+  EXPECT_EQ(reclaim_result.status.store_error, vdd::StoreError::LeaseNotFound);
+  EXPECT_FALSE(controller.store().find_temporary_display(owned.display.display_id));
+  EXPECT_EQ(backend.departed, (std::vector<std::uint64_t> {owned.display.display_id}));
 }
 
 TEST(VirtualDisplayDriverController, SetRenderAdapterForwardsPreferenceToBackend) {
