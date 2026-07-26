@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -23,6 +24,21 @@ namespace {
     }
     return false;
   }
+
+  std::size_t mode_index(
+    const std::vector<vdd::WindowsDriverModeShape> &modes,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t refresh_rate_millihz
+  ) {
+    for (std::size_t index = 0; index < modes.size(); ++index) {
+      const auto &mode = modes[index];
+      if (mode.width == width && mode.height == height && mode.refresh_rate_millihz == refresh_rate_millihz) {
+        return index;
+      }
+    }
+    return modes.size();
+  }
 }  // namespace
 
 TEST(VirtualDisplayWindowsDriverModes, DefaultsPreferredModeToFullHdSixtyHertz) {
@@ -32,6 +48,60 @@ TEST(VirtualDisplayWindowsDriverModes, DefaultsPreferredModeToFullHdSixtyHertz) 
   EXPECT_EQ(modes[preferred_index].width, 1920u);
   EXPECT_EQ(modes[preferred_index].height, 1080u);
   EXPECT_EQ(modes[preferred_index].refresh_rate_millihz, 60'000u);
+  EXPECT_FALSE(has_mode(modes, 1920, 1080, 59'940));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RequestedFractionalTimingAddsToNominalRatesWithoutDisplacingThem) {
+  const auto requested = vdd::active_windows_driver_mode_shape(1920, 1080, 59'940);
+
+  const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(requested);
+
+  ASSERT_LT(preferred_index, modes.size());
+  EXPECT_EQ(modes[preferred_index].width, 1920u);
+  EXPECT_EQ(modes[preferred_index].height, 1080u);
+  EXPECT_EQ(modes[preferred_index].refresh_rate_millihz, 59'940u);
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 59'940));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 119'880));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 60'000));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 120'000));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, NominalRatesEnumerateAheadOfRequestedFractionalTimings) {
+  // Whole-Hz mode matching takes the first candidate in enumeration order, so a
+  // "60 Hz" request must reach 60.000 before it reaches 59.94.
+  const auto requested = vdd::active_windows_driver_mode_shape(1920, 1080, 59'940);
+
+  const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(requested);
+
+  EXPECT_LT(mode_index(modes, 1920, 1080, 60'000), mode_index(modes, 1920, 1080, 59'940));
+  EXPECT_LT(mode_index(modes, 1920, 1080, 120'000), mode_index(modes, 1920, 1080, 119'880));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RequestedArbitraryFractionalTimingKeepsNearbyDefault) {
+  const auto requested = vdd::active_windows_driver_mode_shape(2560, 1440, 144'500);
+
+  const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(requested);
+
+  ASSERT_LT(preferred_index, modes.size());
+  EXPECT_EQ(modes[preferred_index].refresh_rate_millihz, 144'500u);
+  EXPECT_TRUE(has_mode(modes, 2560, 1440, 144'500));
+  EXPECT_TRUE(has_mode(modes, 2560, 1440, 144'000));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RequestedFractionalTimingLeavesOtherResolutionsUntouched) {
+  // The 50/75/150 percent scaled variants land on default resolutions; adding
+  // them must not cost those resolutions their nominal rates.
+  const auto requested = vdd::active_windows_driver_mode_shape(2560, 1440, 59'940);
+
+  const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(requested);
+
+  ASSERT_LT(preferred_index, modes.size());
+  EXPECT_EQ(modes[preferred_index].refresh_rate_millihz, 59'940u);
+  EXPECT_TRUE(has_mode(modes, 1280, 720, 60'000));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 60'000));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 120'000));
+  EXPECT_TRUE(has_mode(modes, 1920, 1080, 240'000));
+  EXPECT_TRUE(has_mode(modes, 3840, 2160, 60'000));
 }
 
 TEST(VirtualDisplayWindowsDriverModes, AddsRequestedModeAndScaledVariants) {

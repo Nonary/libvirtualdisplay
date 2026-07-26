@@ -15,9 +15,8 @@ namespace virtual_display::driver {
       std::uint32_t refresh_rate_millihz;
     };
 
-    constexpr std::array<ModeSpec, 55> kDefaultWindowsDriverModes {{
+    constexpr std::array<ModeSpec, 48> kDefaultWindowsDriverModes {{
       {800, 600, 30'000},
-      {800, 600, 59'940},
       {800, 600, 60'000},
       {800, 600, 72'000},
       {800, 600, 90'000},
@@ -25,14 +24,12 @@ namespace virtual_display::driver {
       {800, 600, 144'000},
       {800, 600, 240'000},
       {1280, 720, 30'000},
-      {1280, 720, 59'940},
       {1280, 720, 60'000},
       {1280, 720, 72'000},
       {1280, 720, 90'000},
       {1280, 720, 120'000},
       {1280, 720, 144'000},
       {1366, 768, 30'000},
-      {1366, 768, 59'940},
       {1366, 768, 60'000},
       {1366, 768, 72'000},
       {1366, 768, 90'000},
@@ -40,7 +37,6 @@ namespace virtual_display::driver {
       {1366, 768, 144'000},
       {1366, 768, 240'000},
       {1920, 1080, 30'000},
-      {1920, 1080, 59'940},
       {1920, 1080, 60'000},
       {1920, 1080, 72'000},
       {1920, 1080, 90'000},
@@ -48,7 +44,6 @@ namespace virtual_display::driver {
       {1920, 1080, 144'000},
       {1920, 1080, 240'000},
       {2560, 1440, 30'000},
-      {2560, 1440, 59'940},
       {2560, 1440, 60'000},
       {2560, 1440, 72'000},
       {2560, 1440, 90'000},
@@ -56,7 +51,6 @@ namespace virtual_display::driver {
       {2560, 1440, 144'000},
       {2560, 1440, 240'000},
       {3840, 2160, 30'000},
-      {3840, 2160, 59'940},
       {3840, 2160, 60'000},
       {3840, 2160, 72'000},
       {3840, 2160, 90'000},
@@ -64,7 +58,6 @@ namespace virtual_display::driver {
       {3840, 2160, 144'000},
       {3840, 2160, 240'000},
       {5120, 1440, 30'000},
-      {5120, 1440, 59'940},
       {5120, 1440, 60'000},
       {5120, 1440, 120'000},
       {5120, 1440, 144'000},
@@ -113,6 +106,12 @@ namespace virtual_display::driver {
       std::uint32_t preferred_index = static_cast<std::uint32_t>(modes.size());
       bool preferred_index_set = false;
 
+      // Requested timings are strictly additive: they append after the integral
+      // defaults and never displace them. Whole-Hz mode matching takes the first
+      // candidate in enumeration order, so keeping the nominal rate ahead of a
+      // near-identical fractional one is what stops a "60 Hz" request from
+      // landing on 59.94. Callers that genuinely want the fractional timing
+      // select it by preferred index or by its exact vSyncFreq rational.
       for (const auto scale_percent: kPreferredModeScalePercent) {
         if (const auto scaled = scaled_mode_shape(preferred, scale_percent, preferred.refresh_rate_millihz)) {
           const auto index = append_unique_windows_driver_mode(modes, *scaled);
