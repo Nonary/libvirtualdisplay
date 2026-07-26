@@ -322,6 +322,8 @@ TEST(VirtualDisplayDriverIoctlDispatcher, RemoveTemporaryDisplayBackendFailureKe
   EXPECT_TRUE(harness.controller.store().find_temporary_display(request.display_id));
   EXPECT_EQ(harness.backend.departed, (std::vector<std::uint64_t> {request.display_id}));
 
+  // The stuck display does not poison the lease; feeding stays available until
+  // that display's own deadline lapses.
   vdd::LeaseRequest feed {};
   feed.lease_id = request.lease_id;
   feed.requested_timeout_ms = 60'000;
@@ -333,7 +335,7 @@ TEST(VirtualDisplayDriverIoctlDispatcher, RemoveTemporaryDisplayBackendFailureKe
     0,
     std::chrono::steady_clock::now()
   );
-  EXPECT_EQ(feed_result.status, vdd::IoctlStatus::NotFound);
+  EXPECT_EQ(feed_result.status, vdd::IoctlStatus::Success);
   EXPECT_EQ(feed_result.bytes_returned, 0u);
 }
 
@@ -451,6 +453,8 @@ TEST(VirtualDisplayDriverIoctlDispatcher, ReleaseLeaseBackendFailureKeepsStore) 
   EXPECT_EQ(harness.controller.query_lease(first.lease_id, now).lease_exists, 1u);
   EXPECT_EQ(harness.backend.departed, (std::vector<std::uint64_t> {first.display_id, second.display_id}));
 
+  // Both displays are pending departure, so feeding extends nothing, but it is
+  // still accepted until their deadlines lapse.
   vdd::LeaseRequest feed {};
   feed.lease_id = first.lease_id;
   feed.requested_timeout_ms = 60'000;
@@ -462,8 +466,19 @@ TEST(VirtualDisplayDriverIoctlDispatcher, ReleaseLeaseBackendFailureKeepsStore) 
     0,
     now
   );
-  EXPECT_EQ(feed_result.status, vdd::IoctlStatus::NotFound);
+  EXPECT_EQ(feed_result.status, vdd::IoctlStatus::Success);
   EXPECT_EQ(feed_result.bytes_returned, 0u);
+
+  const auto expired_feed_result = harness.dispatcher.dispatch(
+    vdd::kIoctlFeedLease,
+    &feed,
+    sizeof(feed),
+    nullptr,
+    0,
+    now + std::chrono::seconds(31)
+  );
+  EXPECT_EQ(expired_feed_result.status, vdd::IoctlStatus::NotFound);
+  EXPECT_EQ(expired_feed_result.bytes_returned, 0u);
 }
 
 TEST(VirtualDisplayDriverIoctlDispatcher, SetAndQueryPermanentDisplayCountUsePermanentApi) {

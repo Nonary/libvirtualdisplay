@@ -441,10 +441,24 @@ TEST(VirtualDisplayDriverController, RemoveTemporaryDisplayKeepsStoreWhenBackend
   EXPECT_EQ(controller.query_lease(lease_id(100), now).pending_departure_count, 1u);
   EXPECT_EQ(backend.departed, (std::vector<std::uint64_t> {0x12345678}));
 
+  // A display stuck pending departure does not poison its lease: the owner can
+  // still feed to keep any healthy sibling alive. The pending display keeps its
+  // original deadline, though, so the reaper collects it on schedule.
   vdd::LeaseRequest feed {};
   feed.lease_id = lease_id(100);
   feed.requested_timeout_ms = 60'000;
-  EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::LeaseNotFound);
+  EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::None);
+  const auto after_feed = controller.store().find_temporary_display(0x12345678);
+  ASSERT_TRUE(after_feed);
+  EXPECT_TRUE(after_feed->pending_departure);
+  EXPECT_EQ(after_feed->timeout_ms, 30'000u);
+  EXPECT_EQ(after_feed->expires_at, retained->expires_at);
+
+  // Once that original deadline lapses the lease stops being feedable.
+  EXPECT_EQ(
+    controller.feed_lease(feed, now + std::chrono::seconds(31)).store_error,
+    vdd::StoreError::LeaseNotFound
+  );
 
   backend.fail_depart = false;
   const auto retry_status = controller.remove_temporary_display(remove);
@@ -493,10 +507,20 @@ TEST(VirtualDisplayDriverController, ReleaseLeaseKeepsStoreWhenBackendDepartFail
   EXPECT_EQ(query.pending_departure_count, 2u);
   EXPECT_EQ(backend.departed, (std::vector<std::uint64_t> {200, 201}));
 
+  // Every display in the lease is pending departure, so feeding extends nothing,
+  // but it is still accepted until those deadlines lapse.
   vdd::LeaseRequest feed {};
   feed.lease_id = lease_id(100);
   feed.requested_timeout_ms = 60'000;
-  EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::LeaseNotFound);
+  EXPECT_EQ(controller.feed_lease(feed, now + std::chrono::seconds(1)).store_error, vdd::StoreError::None);
+  for (const auto &display: controller.store().temporary_displays()) {
+    EXPECT_TRUE(display.pending_departure);
+    EXPECT_EQ(display.timeout_ms, 30'000u);
+  }
+  EXPECT_EQ(
+    controller.feed_lease(feed, now + std::chrono::seconds(31)).store_error,
+    vdd::StoreError::LeaseNotFound
+  );
 
   backend.fail_depart = false;
   const auto retry_status = controller.release_lease(release);
