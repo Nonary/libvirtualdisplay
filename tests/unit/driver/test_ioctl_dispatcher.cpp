@@ -30,7 +30,7 @@ namespace {
       return {vdd::BackendError::None, {99, 3}, next_target_id++};
     }
 
-    vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
+    vdd::BackendError depart_temporary_display(const std::uint64_t display_id, const std::uint64_t) override {
       departed.push_back(display_id);
       return fail_depart ? vdd::BackendError::Failed : vdd::BackendError::None;
     }

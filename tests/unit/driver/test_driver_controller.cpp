@@ -49,7 +49,7 @@ namespace {
       return {vdd::BackendError::None, adapter_luid, next_target_id++};
     }
 
-    vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
+    vdd::BackendError depart_temporary_display(const std::uint64_t display_id, const std::uint64_t expected_generation) override {
       if (block_depart) {
         std::unique_lock lock {depart_mutex};
         depart_entered = true;
@@ -59,6 +59,7 @@ namespace {
         });
       }
       departed.push_back(display_id);
+      departed_generations.push_back(expected_generation);
       return fail_depart ? vdd::BackendError::Failed : vdd::BackendError::None;
     }
 
@@ -102,6 +103,7 @@ namespace {
     std::vector<std::uint64_t> unreserved {};
     std::vector<vdd::DisplayDescriptor> arrived {};
     std::vector<std::uint64_t> departed {};
+    std::vector<std::uint64_t> departed_generations {};
     std::vector<std::uint32_t> permanent_counts {};
     std::vector<vdd::PermanentDisplayCountRequest> permanent_settings {};
     std::vector<vdd::DisplayManifest> manifests {};
@@ -702,4 +704,91 @@ TEST(VirtualDisplayDriverController, ApplyDisplayManifestReportsPerSlotIdentity)
   EXPECT_EQ(state.entries[0].flags & vdd::kDisplayStateFlagHdrSupported, 0u);
   EXPECT_EQ(state.entries[0].flags & vdd::kDisplayStateFlagRetainIdentity, vdd::kDisplayStateFlagRetainIdentity);
   EXPECT_EQ(vdd::trim_display_name(state.entries[0].display_name), "Side Display");
+}
+
+TEST(VirtualDisplayDriverController, DeparturesCarryTheRecordGenerationFence) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+
+  ASSERT_TRUE(controller.create_temporary_display(make_create_request(), now).status.ok());
+  const auto record = controller.store().find_temporary_display(0x12345678u);
+  ASSERT_TRUE(record);
+  const auto generation = record->generation;
+  ASSERT_NE(generation, 0u);
+
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = lease_id(100);
+  remove.display_id = 0x12345678u;
+  ASSERT_TRUE(controller.remove_temporary_display(remove).ok());
+
+  ASSERT_EQ(backend.departed.size(), 1u);
+  EXPECT_EQ(backend.departed[0], 0x12345678u);
+  ASSERT_EQ(backend.departed_generations.size(), 1u);
+  EXPECT_EQ(backend.departed_generations[0], generation);
+}
+
+TEST(VirtualDisplayDriverController, ReapExpiredDepartsWithTheSnapshotGeneration) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+
+  ASSERT_TRUE(controller.create_temporary_display(make_create_request(), now).status.ok());
+  const auto record = controller.store().find_temporary_display(0x12345678u);
+  ASSERT_TRUE(record);
+
+  const auto removed = controller.reap_expired(now + std::chrono::hours(1));
+
+  EXPECT_EQ(removed, 1u);
+  ASSERT_EQ(backend.departed_generations.size(), 1u);
+  EXPECT_EQ(backend.departed_generations[0], record->generation);
+  EXPECT_FALSE(controller.store().find_temporary_display(0x12345678u));
+}
+
+TEST(VirtualDisplayDriverController, BusyBackendLockDoesNotPoisonLiveDisplayWithPendingDeparture) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+
+  ASSERT_TRUE(controller.create_temporary_display(make_create_request(lease_id(100), 0x111), now).status.ok());
+  ASSERT_TRUE(controller.create_temporary_display(make_create_request(lease_id(102), 0x222), now).status.ok());
+
+  // Hold the backend-call slot via a departure that blocks inside the backend.
+  backend.block_depart = true;
+  vdd::LeaseDisplayRequest remove_blocked {};
+  remove_blocked.lease_id = lease_id(100);
+  remove_blocked.display_id = 0x111;
+  vdd::ControllerStatus blocked_status {};
+  std::thread remover([&]() {
+    blocked_status = controller.remove_temporary_display(remove_blocked);
+  });
+  if (!backend.wait_for_departure(std::chrono::seconds(1))) {
+    backend.unblock_departure();
+    remover.join();
+    FAIL() << "backend departure did not start";
+  }
+
+  // A second remove cannot acquire the backend-call slot within the timeout.
+  // It must report Busy and leave the live record untouched: marking it
+  // pending-departure here would freeze its lease expiry and let the reaper
+  // depart a healthy, in-use display over a mere lock timeout.
+  vdd::LeaseDisplayRequest remove_busy {};
+  remove_busy.lease_id = lease_id(102);
+  remove_busy.display_id = 0x222;
+  const auto busy_status = controller.remove_temporary_display(remove_busy);
+  EXPECT_EQ(busy_status.backend_error, vdd::BackendError::Busy);
+  {
+    const auto untouched = controller.store().find_temporary_display(0x222);
+    ASSERT_TRUE(untouched);
+    EXPECT_FALSE(untouched->pending_departure);
+  }
+
+  backend.unblock_departure();
+  remover.join();
+  EXPECT_TRUE(blocked_status.ok());
+
+  // Once the slot frees up the same remove succeeds normally.
+  backend.block_depart = false;
+  EXPECT_TRUE(controller.remove_temporary_display(remove_busy).ok());
+  EXPECT_FALSE(controller.store().find_temporary_display(0x222));
 }

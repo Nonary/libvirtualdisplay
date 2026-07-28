@@ -2592,11 +2592,16 @@ namespace {
       return result;
     }
 
-    vdd::BackendError depart_temporary_display(const std::uint64_t display_id) override {
-      const auto result = depart_display(display_id);
+    vdd::BackendError depart_temporary_display(const std::uint64_t display_id, const std::uint64_t expected_generation) override {
+      const auto result = depart_display(display_id, expected_generation);
       if (result == vdd::BackendError::None) {
         std::lock_guard lock {mutex_};
-        retained_dpi_values_by_display_id_.erase(display_id);
+        // A fenced departure can report None because the request targeted a
+        // superseded lineage while a newer monitor is still up; only drop the
+        // retained DPI once no monitor remains under this display_id.
+        if (!monitors_.contains(display_id)) {
+          retained_dpi_values_by_display_id_.erase(display_id);
+        }
       }
       return result;
     }
@@ -2960,12 +2965,12 @@ namespace {
 
     void cleanup_finished_retired_swapchains() {
       std::vector<std::unique_ptr<SwapChainProcessor>> finished_processors;
-      std::vector<std::uint64_t> orphaned_late_arrivals;
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> orphaned_late_arrivals;
       {
         std::lock_guard lock {mutex_};
         for (auto &[display_id, record]: monitors_) {
           if (record.orphaned_late_arrival && !record.departing) {
-            orphaned_late_arrivals.push_back(display_id);
+            orphaned_late_arrivals.emplace_back(display_id, record.descriptor.generation);
           }
           const auto before = record.retired_swapchain_processors.size();
           const auto cleaned = collect_finished_retired_swapchain_processors(
@@ -2988,8 +2993,11 @@ namespace {
         }
       }
       finished_processors.clear();
-      for (const auto display_id: orphaned_late_arrivals) {
-        if (depart_display(display_id) != vdd::BackendError::None) {
+      for (const auto &[display_id, generation]: orphaned_late_arrivals) {
+        // Fenced on the orphan's own generation: this retry runs with neither
+        // the controller nor the backend-call lock held, so an unfenced depart
+        // here could retract a monitor a concurrent create just arrived.
+        if (depart_display(display_id, generation) != vdd::BackendError::None) {
           TraceLoggingWrite(
             g_trace_provider,
             "MonitorArrivalLateCleanupRetryDeferred",
@@ -3202,12 +3210,17 @@ namespace {
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalCompletedAfterTimeout");
             {
               std::lock_guard lock {mutex_};
+              // Only tag the record this worker itself arrived. Fencing on our
+              // descriptor's generation keeps a subsequent create's fresh
+              // monitor (same display_id, new generation) out of reach of this
+              // stale cleanup.
               if (auto monitor = monitors_.find(requested_descriptor.display_id);
-                  monitor != monitors_.end()) {
+                  monitor != monitors_.end() &&
+                  monitor->second.descriptor.generation == requested_descriptor.generation) {
                 monitor->second.orphaned_late_arrival = true;
               }
             }
-            if (depart_display(requested_descriptor.display_id) != vdd::BackendError::None) {
+            if (depart_display(requested_descriptor.display_id, requested_descriptor.generation) != vdd::BackendError::None) {
               TraceLoggingWrite(
                 g_trace_provider,
                 "MonitorArrivalLateCleanupFailed",
@@ -3264,6 +3277,44 @@ namespace {
       const bool permanent
     ) {
       const auto descriptor = descriptor_with_runtime_hdr_policy(requested_descriptor);
+
+      // Self-heal: a monitor left behind by a superseded record lineage (stale
+      // departure raced with remove+recreate, or an abandoned late arrival)
+      // blocks every future create for this display_id with DuplicateDisplayId
+      // until the driver restarts. If the resident monitor's generation differs
+      // from the one we are arriving, it is provably abandoned - the store
+      // holds exactly one record per display_id and it is the one arriving -
+      // so retire it first. A deferred/failed departure fails this arrival;
+      // the host's retry then makes forward progress instead of hitting the
+      // same wall.
+      if (!permanent && descriptor.generation != 0) {
+        std::optional<std::uint64_t> stale_generation;
+        {
+          std::lock_guard lock {mutex_};
+          const auto monitor = monitors_.find(descriptor.display_id);
+          if (monitor != monitors_.end() &&
+              !monitor->second.permanent &&
+              !monitor->second.arriving &&
+              !monitor->second.departing &&
+              monitor->second.descriptor.generation != descriptor.generation) {
+            stale_generation = monitor->second.descriptor.generation;
+          }
+        }
+        if (stale_generation) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorArrivalRetiringStaleGeneration",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+            TraceLoggingUInt64(*stale_generation, "StaleGeneration"),
+            TraceLoggingUInt64(descriptor.generation, "ArrivingGeneration")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorArrivalRetiringStaleGeneration");
+          if (depart_display(descriptor.display_id, *stale_generation) != vdd::BackendError::None) {
+            return {vdd::BackendError::Failed, {}, 0};
+          }
+        }
+      }
+
       IDDCX_ADAPTER adapter {};
       WDFOBJECT referenced_adapter {};
       {
@@ -3546,7 +3597,7 @@ namespace {
       return STATUS_TIMEOUT;
     }
 
-    vdd::BackendError depart_display(const std::uint64_t display_id) {
+    vdd::BackendError depart_display(const std::uint64_t display_id, const std::uint64_t expected_generation = 0) {
       IDDCX_MONITOR monitor_handle {};
       std::unique_ptr<CursorProcessor> cursor_processor_to_stop;
       std::unique_ptr<SwapChainProcessor> processor_to_stop;
@@ -3555,6 +3606,24 @@ namespace {
         std::unique_lock lock {mutex_};
         auto monitor = monitors_.find(display_id);
         if (monitor == monitors_.end()) {
+          return vdd::BackendError::None;
+        }
+        if (expected_generation != 0 &&
+            monitor->second.descriptor.generation != 0 &&
+            monitor->second.descriptor.generation != expected_generation) {
+          // The request was issued for a superseded record lineage (the store
+          // record was removed and recreated while the requester held no lock).
+          // The monitor that is up belongs to the current lineage; retracting
+          // it here is exactly the stale-departure race that leaves Windows
+          // with no display while the control plane believes one exists.
+          TraceLoggingWrite(
+            g_trace_provider,
+            "MonitorDepartureSkippedStaleGeneration",
+            TraceLoggingUInt64(display_id, "DisplayId"),
+            TraceLoggingUInt64(expected_generation, "ExpectedGeneration"),
+            TraceLoggingUInt64(monitor->second.descriptor.generation, "CurrentGeneration")
+          );
+          TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "MonitorDepartureSkippedStaleGeneration");
           return vdd::BackendError::None;
         }
         if (monitor->second.arriving) {

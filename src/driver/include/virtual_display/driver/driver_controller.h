@@ -12,6 +12,10 @@ namespace virtual_display::driver {
   enum class BackendError {
     None,
     Failed,
+    // The backend call slot could not be acquired in time; the backend was never
+    // invoked. Callers must not treat this as a display-state failure (no
+    // pending-departure marking) - the operation can simply be retried.
+    Busy,
   };
 
   struct BackendDisplayResult {
@@ -32,6 +36,11 @@ namespace virtual_display::driver {
     std::uint32_t refresh_rate_millihz {};
     std::array<std::byte, kEdidSize> edid {};
     bool retain_identity {true};
+    // Store-record generation this descriptor was built from (0 = not
+    // generation-tracked, e.g. permanent displays). The backend keeps it with
+    // the arrived monitor so departures can be fenced against the exact record
+    // lineage they were issued for.
+    std::uint64_t generation {};
   };
 
   class DisplayDriverBackend {
@@ -41,7 +50,11 @@ namespace virtual_display::driver {
     virtual BackendError reserve_temporary_display_identity(const DisplayDescriptor &descriptor);
     virtual BackendError unreserve_temporary_display_identity(std::uint64_t display_id);
     virtual BackendDisplayResult arrive_temporary_display(const DisplayDescriptor &descriptor) = 0;
-    virtual BackendError depart_temporary_display(std::uint64_t display_id) = 0;
+    // Departs the monitor for display_id only when its arrival generation
+    // matches expected_generation (0 = depart regardless of generation). A
+    // mismatch means the request targets a superseded record lineage; the
+    // backend must leave the current monitor alone and report None.
+    virtual BackendError depart_temporary_display(std::uint64_t display_id, std::uint64_t expected_generation) = 0;
     virtual BackendError set_permanent_display_count(const PermanentDisplayCountRequest &request) = 0;
     virtual BackendError apply_display_manifest(const DisplayManifest &manifest);
     virtual BackendError set_render_adapter(const SetRenderAdapterRequest &request) = 0;

@@ -102,15 +102,19 @@ namespace virtual_display::driver {
     if (const auto existing = store_.find_temporary_display(request.display_id);
         existing && existing->pending_departure) {
       const auto pending_record = *existing;
+      // Depart unfenced (generation 0): the store record is pending departure,
+      // so any backend monitor still parked under this display_id belongs to an
+      // abandoned lineage and must be cleared before the fresh create.
       if (const auto backend_error = call_backend_without_controller_lock(
             backend_call_mutex_,
             controller_lock,
-            BackendError::Failed,
+            BackendError::Busy,
             [&]() {
-              return backend_.depart_temporary_display(existing->display_id);
+              return backend_.depart_temporary_display(existing->display_id, 0);
             });
           backend_error != BackendError::None) {
-        if (temporary_display_generation_is_current(pending_record)) {
+        if (backend_error == BackendError::Failed &&
+            temporary_display_generation_is_current(pending_record)) {
           LeaseDisplayRequest pending {};
           pending.lease_id = pending_record.lease_id;
           pending.display_id = pending_record.display_id;
@@ -158,7 +162,7 @@ namespace virtual_display::driver {
       if (const auto backend_error = call_backend_without_controller_lock(
             backend_call_mutex_,
             controller_lock,
-            BackendError::Failed,
+            BackendError::Busy,
             [&]() {
               return backend_.reserve_temporary_display_identity(descriptor);
             });
@@ -187,7 +191,7 @@ namespace virtual_display::driver {
         (void) call_backend_without_controller_lock(
           backend_call_mutex_,
           controller_lock,
-          BackendError::Failed,
+          BackendError::Busy,
           [&]() {
             return backend_.unreserve_temporary_display_identity(request.display_id);
           }
@@ -202,7 +206,7 @@ namespace virtual_display::driver {
     const auto backend_result = call_backend_without_controller_lock(
       backend_call_mutex_,
       controller_lock,
-      BackendDisplayResult {BackendError::Failed, {}, 0},
+      BackendDisplayResult {BackendError::Busy, {}, 0},
       [&]() {
         return backend_.arrive_temporary_display(descriptor);
       }
@@ -213,7 +217,7 @@ namespace virtual_display::driver {
         if (call_backend_without_controller_lock(
               backend_call_mutex_,
               controller_lock,
-              BackendError::Failed,
+              BackendError::Busy,
               [&]() {
                 return backend_.unreserve_temporary_display_identity(request.display_id);
               }) != BackendError::None) {
@@ -244,9 +248,9 @@ namespace virtual_display::driver {
       (void) call_backend_without_controller_lock(
         backend_call_mutex_,
         controller_lock,
-        BackendError::Failed,
+        BackendError::Busy,
         [&]() {
-          return backend_.depart_temporary_display(request.display_id);
+          return backend_.depart_temporary_display(request.display_id, created_record.generation);
         }
       );
       return {
@@ -258,9 +262,9 @@ namespace virtual_display::driver {
       const auto cleanup_error = call_backend_without_controller_lock(
         backend_call_mutex_,
         controller_lock,
-        BackendError::Failed,
+        BackendError::Busy,
         [&]() {
-          return backend_.depart_temporary_display(request.display_id);
+          return backend_.depart_temporary_display(request.display_id, created_record.generation);
         }
       );
       if (cleanup_error == BackendError::None &&
@@ -303,7 +307,7 @@ namespace virtual_display::driver {
       if (relock_controller) {
         controller_lock->lock();
       }
-      return {{StoreError::None, ValidationError::None, BackendError::Failed}, {}};
+      return {{StoreError::None, ValidationError::None, BackendError::Busy}, {}};
     }
     if (relock_controller) {
       controller_lock->lock();
@@ -334,16 +338,20 @@ namespace virtual_display::driver {
     if (const auto backend_error = call_backend_without_controller_lock(
           backend_call_mutex_,
           controller_lock,
-          BackendError::Failed,
+          BackendError::Busy,
           [&]() {
-            return backend_.depart_temporary_display(request.display_id);
+            return backend_.depart_temporary_display(request.display_id, record->generation);
           });
         backend_error != BackendError::None) {
-      // Only mark OUR record pending-departure. The backend call released the
-      // controller lock, so a concurrent remove+recreate of the same display_id
-      // could have produced a newer record; marking that would let the reaper
-      // depart a healthy, in-use virtual display (ABA). Matches release_lease.
-      if (temporary_display_generation_is_current(*record)) {
+      // Only mark OUR record pending-departure, and only when the backend
+      // actually failed the departure. The backend call released the controller
+      // lock, so a concurrent remove+recreate of the same display_id could have
+      // produced a newer record; marking that would let the reaper depart a
+      // healthy, in-use virtual display (ABA). A Busy result means the backend
+      // was never invoked - leave the record untouched so a mere lock timeout
+      // cannot poison a live display. Matches release_lease.
+      if (backend_error == BackendError::Failed &&
+          temporary_display_generation_is_current(*record)) {
         (void) store_.mark_temporary_display_pending_departure(request);
       }
       return {StoreError::None, ValidationError::None, backend_error};
@@ -383,13 +391,15 @@ namespace virtual_display::driver {
 
     BackendError backend_error = BackendError::None;
     for (const auto &display: displays) {
-      if (call_backend_without_controller_lock(
-            backend_call_mutex_,
-            controller_lock,
-            BackendError::Failed,
-            [&]() {
-              return backend_.depart_temporary_display(display.display_id);
-            }) == BackendError::None) {
+      const auto depart_error = call_backend_without_controller_lock(
+        backend_call_mutex_,
+        controller_lock,
+        BackendError::Busy,
+        [&]() {
+          return backend_.depart_temporary_display(display.display_id, display.generation);
+        }
+      );
+      if (depart_error == BackendError::None) {
         if (temporary_display_generation_is_current(display)) {
           LeaseDisplayRequest remove {};
           remove.lease_id = display.lease_id;
@@ -397,13 +407,17 @@ namespace virtual_display::driver {
           (void) store_.remove_temporary_display(remove);
         }
       } else {
-        if (temporary_display_generation_is_current(display)) {
+        // Busy means the backend was never invoked; do not poison the record.
+        if (depart_error == BackendError::Failed &&
+            temporary_display_generation_is_current(display)) {
           LeaseDisplayRequest pending {};
           pending.lease_id = display.lease_id;
           pending.display_id = display.display_id;
           (void) store_.mark_temporary_display_pending_departure(pending);
         }
-        backend_error = BackendError::Failed;
+        if (backend_error != BackendError::Failed) {
+          backend_error = depart_error;
+        }
       }
     }
 
@@ -467,7 +481,7 @@ namespace virtual_display::driver {
     if (const auto backend_error = call_backend_without_controller_lock(
           backend_call_mutex_,
           controller_lock,
-          BackendError::Failed,
+          BackendError::Busy,
           [&]() {
             return backend_.apply_display_manifest(canonical);
           });
@@ -496,7 +510,7 @@ namespace virtual_display::driver {
     if (const auto backend_error = call_backend_without_controller_lock(
           backend_call_mutex_,
           controller_lock,
-          BackendError::Failed,
+          BackendError::Busy,
           [&]() {
             return backend_.set_render_adapter(request);
           });
@@ -584,13 +598,21 @@ namespace virtual_display::driver {
     std::uint32_t removed = 0;
 
     for (const auto &display: reap_candidates) {
-      if (call_backend_without_controller_lock(
-            backend_call_mutex_,
-            controller_lock,
-            BackendError::Failed,
-            [&]() {
-              return backend_.depart_temporary_display(display.display_id);
-            }) == BackendError::None) {
+      // Fence the backend departure on the snapshot's generation. The snapshot
+      // was taken before the controller lock was released for the backend call,
+      // so the same display_id may since have been removed and recreated; an
+      // unfenced departure here would silently retract the replacement monitor
+      // while its healthy store record survives (the field "created but never
+      // enumerated" wedge).
+      const auto depart_error = call_backend_without_controller_lock(
+        backend_call_mutex_,
+        controller_lock,
+        BackendError::Busy,
+        [&]() {
+          return backend_.depart_temporary_display(display.display_id, display.generation);
+        }
+      );
+      if (depart_error == BackendError::None) {
         LeaseDisplayRequest remove {};
         remove.lease_id = display.lease_id;
         remove.display_id = display.display_id;
@@ -598,7 +620,9 @@ namespace virtual_display::driver {
             store_.remove_temporary_display(remove).error == StoreError::None) {
           ++removed;
         }
-      } else {
+      } else if (depart_error == BackendError::Failed) {
+        // Busy means the backend was never invoked; the candidate stays
+        // expired/pending and the next reaper tick retries naturally.
         if (temporary_display_generation_is_current(display)) {
           LeaseDisplayRequest pending {};
           pending.lease_id = display.lease_id;
@@ -647,6 +671,7 @@ namespace virtual_display::driver {
     descriptor.refresh_rate_millihz = record.refresh_rate_millihz;
     descriptor.edid = create_edid(edid_options_for_temporary_display(record));
     descriptor.retain_identity = record.retain_identity;
+    descriptor.generation = record.generation;
     return descriptor;
   }
 
@@ -681,6 +706,8 @@ namespace virtual_display::driver {
         return "none";
       case BackendError::Failed:
         return "failed";
+      case BackendError::Busy:
+        return "busy";
     }
 
     return "unknown";
