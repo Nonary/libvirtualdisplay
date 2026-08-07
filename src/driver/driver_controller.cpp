@@ -113,20 +113,43 @@ namespace virtual_display::driver {
               return backend_.depart_temporary_display(existing->display_id, 0);
             });
           backend_error != BackendError::None) {
+        bool abandoned = false;
         if (backend_error == BackendError::Failed &&
             temporary_display_generation_is_current(pending_record)) {
-          LeaseDisplayRequest pending {};
-          pending.lease_id = pending_record.lease_id;
-          pending.display_id = pending_record.display_id;
-          (void) store_.mark_temporary_display_pending_departure(pending);
+          if (owner_capability) {
+            // The backend actively refused the departure again. Without an
+            // escape the display_id stays wedged until a driver restart: the
+            // reaper retries the same failing departure forever, reclaim
+            // refuses pending records, and every create aborts right here.
+            // Let the proven owner evict the condemned record and continue on
+            // a fresh connector; the wedged connector stays quarantined and
+            // any stranded backend monitor is retired by the arrival
+            // self-heal once its connector-level state recovers.
+            LeaseDisplayRequest abandon {};
+            abandon.lease_id = pending_record.lease_id;
+            abandon.display_id = pending_record.display_id;
+            abandoned = store_
+                          .abandon_pending_temporary_display(
+                            abandon,
+                            pending_record.generation,
+                            *owner_capability
+                          )
+                          .error == StoreError::None;
+          }
+          if (!abandoned) {
+            LeaseDisplayRequest pending {};
+            pending.lease_id = pending_record.lease_id;
+            pending.display_id = pending_record.display_id;
+            (void) store_.mark_temporary_display_pending_departure(pending);
+          }
         }
-        return {
-          {StoreError::None, ValidationError::None, backend_error},
-          {}
-        };
-      }
-
-      if (temporary_display_generation_is_current(pending_record)) {
+        if (!abandoned) {
+          return {
+            {StoreError::None, ValidationError::None, backend_error},
+            {}
+          };
+        }
+      } else if (temporary_display_generation_is_current(pending_record)) {
         LeaseDisplayRequest remove {};
         remove.lease_id = pending_record.lease_id;
         remove.display_id = pending_record.display_id;

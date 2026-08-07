@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -99,6 +100,15 @@ namespace virtual_display::driver {
       RemoveTemporaryDisplayMode mode = RemoveTemporaryDisplayMode::RetainConnectorReservation
     );
     StoreResult mark_temporary_display_pending_departure(const LeaseDisplayRequest &request);
+    // Evicts a condemned (pending-departure) record whose backend departure
+    // keeps failing, on behalf of its proven owner. The record's connector is
+    // quarantined until the driver restarts so the recreation cannot land on
+    // the wedged connector; the reservation is dropped with the record.
+    StoreResult abandon_pending_temporary_display(
+      const LeaseDisplayRequest &request,
+      std::uint64_t expected_generation,
+      const OwnerCapability &owner_capability
+    );
     StoreResult feed_lease(const LeaseRequest &request, std::chrono::steady_clock::time_point now);
     StoreResult release_lease(const LeaseRequest &request);
     QueryLeaseResult query_lease(std::uint64_t lease_id, std::chrono::steady_clock::time_point now) const;
@@ -150,6 +160,7 @@ namespace virtual_display::driver {
     std::map<std::uint64_t, TemporaryDisplayRecord> displays_by_id_ {};
     std::map<std::uint64_t, LeaseRecord> leases_by_id_ {};
     std::map<std::uint64_t, std::uint32_t> connector_reservations_by_display_id_ {};
+    std::set<std::uint32_t> quarantined_connectors_ {};
     std::uint64_t next_ephemeral_identity_ {1};
     std::uint64_t next_temporary_display_generation_ {1};
   };

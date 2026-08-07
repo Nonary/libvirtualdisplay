@@ -745,6 +745,157 @@ TEST(VirtualDisplayDriverController, ReapExpiredDepartsWithTheSnapshotGeneration
   EXPECT_FALSE(controller.store().find_temporary_display(0x12345678u));
 }
 
+TEST(VirtualDisplayDriverController, SecureReclaimKeepsGenerationFenceValidForDeparturesAndRecreation) {
+  // Field flow (Vibepollo recovery): a host that lost sight of its display
+  // securely reclaims it under a fresh lease, decides the reclaimed display is
+  // not reusable, removes it, and recreates the same display_id. The departure
+  // issued after the reclaim must still carry the original record generation
+  // (reclaim rotates only the lease_id), and the recreation must get a fresh
+  // generation so old-lineage departures cannot retract it.
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+  const auto before = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(before);
+  const auto original_generation = before->generation;
+  ASSERT_NE(original_generation, 0u);
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = owned.owner_capability;
+  ASSERT_TRUE(controller.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1)).status.ok());
+  const auto reclaimed = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(reclaimed);
+  EXPECT_EQ(reclaimed->lease_id, lease_id(101));
+  EXPECT_EQ(reclaimed->generation, original_generation);
+
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = lease_id(101);
+  remove.display_id = owned.display.display_id;
+  ASSERT_TRUE(controller.remove_temporary_display(remove).ok());
+  ASSERT_EQ(backend.departed_generations.size(), 1u);
+  EXPECT_EQ(backend.departed_generations[0], original_generation);
+  EXPECT_FALSE(controller.store().find_temporary_display(owned.display.display_id));
+
+  vdd::CreateTemporaryDisplayOwnedRequest recreated {};
+  recreated.display = make_create_request(lease_id(102));
+  recreated.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(recreated, now + std::chrono::seconds(2)).status.ok());
+  const auto after = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(after);
+  EXPECT_NE(after->generation, original_generation);
+  ASSERT_EQ(backend.arrived.size(), 2u);
+  EXPECT_EQ(backend.arrived[1].generation, after->generation);
+}
+
+TEST(VirtualDisplayDriverController, PersistentDepartFailureLeavesOwnerAnEscapePathWithoutDriverRestart) {
+  // Field wedge (vibeshine#253 family; Vibepollo 1.18.3-stable.4 reports):
+  // when the backend departure fails persistently (wedged IddCx teardown),
+  // every owner-facing path for the display_id fail-closes:
+  //   - remove marks the record pending_departure and fails,
+  //   - the 1 Hz reaper retries the same failing departure forever,
+  //   - secure reclaim refuses pending-departure records,
+  //   - create's pending-departure heal re-departs, fails, and aborts.
+  // Nothing the owning host can do clears the wedge; in the field only a
+  // driver restart (or the "switch driver to SudoVDA and back" workaround,
+  // which restarts the device) recovers. A bounded number of owner retries
+  // with proven capability must eventually make forward progress instead.
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+
+  backend.fail_depart = true;
+
+  // Session teardown fails and leaves the record pending departure.
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = owned.display.lease_id;
+  remove.display_id = owned.display.display_id;
+  const auto remove_status = controller.remove_temporary_display(remove);
+  EXPECT_EQ(remove_status.backend_error, vdd::BackendError::Failed);
+  {
+    const auto record = controller.store().find_temporary_display(owned.display.display_id);
+    ASSERT_TRUE(record);
+    EXPECT_TRUE(record->pending_departure);
+  }
+
+  // The reaper cannot collect it while the backend keeps failing.
+  EXPECT_EQ(controller.reap_expired(now + std::chrono::hours(1)), 0u);
+  EXPECT_TRUE(controller.store().find_temporary_display(owned.display.display_id));
+
+  // Recovery reclaim is refused for pending-departure records.
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.requested_timeout_ms = 60'000;
+  reclaim.owner_capability = owned.owner_capability;
+  EXPECT_EQ(
+    controller.reclaim_temporary_display(reclaim, now + std::chrono::seconds(1)).status.store_error,
+    vdd::StoreError::LeaseNotFound
+  );
+
+  // The host's bounded create retries (attempt 1/3 .. 3/3 in the field logs,
+  // give it a couple extra here) must not all fail while the owner presents
+  // the same capability that created the display.
+  const auto wedged_connector = controller.store().find_temporary_display(owned.display.display_id)->connector_index;
+  bool made_forward_progress = false;
+  for (std::uint64_t attempt = 0; attempt < 5 && !made_forward_progress; ++attempt) {
+    vdd::CreateTemporaryDisplayOwnedRequest retry {};
+    retry.display = make_create_request(lease_id(110 + attempt));
+    retry.owner_capability = owned.owner_capability;
+    made_forward_progress = controller
+                              .create_temporary_display_owned(retry, now + std::chrono::seconds(2 + attempt))
+                              .status.ok();
+  }
+  EXPECT_TRUE(made_forward_progress)
+    << "every owner-facing path fail-closed; only a driver restart clears the display_id";
+
+  // The escape must not reuse the wedged connector: the recreated display gets
+  // a fresh connector and the condemned lineage's connector stays quarantined.
+  const auto recreated = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(recreated);
+  EXPECT_FALSE(recreated->pending_departure);
+  EXPECT_NE(recreated->connector_index, wedged_connector);
+
+  // A stranger presenting the wrong capability must never be able to evict a
+  // pending record: recreate the wedge under a fresh id and check fail-closed
+  // behavior survives for non-owners.
+  backend.fail_depart = false;
+  vdd::CreateTemporaryDisplayOwnedRequest other {};
+  other.display = make_create_request(lease_id(200), 0x777);
+  other.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(other, now).status.ok());
+  backend.fail_depart = true;
+  vdd::LeaseDisplayRequest remove_other {};
+  remove_other.lease_id = lease_id(200);
+  remove_other.display_id = 0x777;
+  EXPECT_EQ(controller.remove_temporary_display(remove_other).backend_error, vdd::BackendError::Failed);
+  vdd::CreateTemporaryDisplayOwnedRequest stranger {};
+  stranger.display = make_create_request(lease_id(201), 0x777);
+  stranger.owner_capability = owner_capability();
+  stranger.owner_capability.bytes[0] ^= 0xff;
+  EXPECT_EQ(
+    controller.create_temporary_display_owned(stranger, now + std::chrono::seconds(1)).status.backend_error,
+    vdd::BackendError::Failed
+  );
+  {
+    const auto still_pending = controller.store().find_temporary_display(0x777);
+    ASSERT_TRUE(still_pending);
+    EXPECT_TRUE(still_pending->pending_departure);
+  }
+}
+
 TEST(VirtualDisplayDriverController, BusyBackendLockDoesNotPoisonLiveDisplayWithPendingDeparture) {
   FakeBackend backend;
   auto controller = make_controller(backend);

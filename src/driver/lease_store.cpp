@@ -348,6 +348,41 @@ namespace virtual_display::driver {
     return {};
   }
 
+  StoreResult DisplayStore::abandon_pending_temporary_display(
+    const LeaseDisplayRequest &request,
+    const std::uint64_t expected_generation,
+    const OwnerCapability &owner_capability
+  ) {
+    if (const auto validation = validate_lease_display_request(request);
+        validation != ValidationError::None) {
+      return validation_failure(validation);
+    }
+
+    const auto display = displays_by_id_.find(request.display_id);
+    if (display == displays_by_id_.end() ||
+        display->second.lease_id != request.lease_id ||
+        display->second.generation != expected_generation ||
+        !display->second.pending_departure) {
+      return {StoreError::DisplayNotFound, ValidationError::None};
+    }
+
+    // Only the proven owner of the condemned record's lease may evict it. A
+    // lease without a stored capability (plain create) cannot be
+    // owner-verified and stays fail-closed.
+    const auto lease = leases_by_id_.find(request.lease_id);
+    if (lease == leases_by_id_.end() ||
+        !lease->second.owner_capability ||
+        !owner_capabilities_equal(*lease->second.owner_capability, owner_capability)) {
+      return {StoreError::LeaseNotFound, ValidationError::None};
+    }
+
+    quarantined_connectors_.insert(display->second.connector_index);
+    connector_reservations_by_display_id_.erase(request.display_id);
+    displays_by_id_.erase(display);
+    remove_lease_if_empty(request.lease_id);
+    return {};
+  }
+
   StoreResult DisplayStore::mark_temporary_display_pending_departure(const LeaseDisplayRequest &request) {
     if (const auto validation = validate_lease_display_request(request);
         validation != ValidationError::None) {
@@ -668,6 +703,7 @@ namespace virtual_display::driver {
          connector_index < connector_limit;
          ++connector_index) {
       if (!connector_index_is_active(connector_index) &&
+          !quarantined_connectors_.contains(connector_index) &&
           (retain_identity ?
              !connector_index_is_reserved_for_other_display(connector_index, display_id) :
              !connector_index_is_reserved(connector_index))) {
@@ -678,7 +714,8 @@ namespace virtual_display::driver {
     for (std::uint32_t connector_index = max_permanent_displays_;
          connector_index < connector_limit;
          ++connector_index) {
-      if (!connector_index_is_active(connector_index)) {
+      if (!connector_index_is_active(connector_index) &&
+          !quarantined_connectors_.contains(connector_index)) {
         remove_connector_reservation(connector_index, display_id);
         return connector_index;
       }

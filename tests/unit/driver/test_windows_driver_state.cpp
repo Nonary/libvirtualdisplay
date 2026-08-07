@@ -155,3 +155,38 @@ TEST(VirtualDisplayWindowsDriverState, RemoveAndMapTemporaryConnectorReservation
   ASSERT_EQ(reservations.size(), 1u);
   EXPECT_EQ(reservations.at(0x6000000000000002ull), vdd::kWindowsDriverMaxPermanentDisplays + 1u);
 }
+
+TEST(VirtualDisplayWindowsDriverState, StaleProfilePinsConnectorAndIdentityAcrossDriverRestarts) {
+  // A temporary display whose departure never completed (host crash, wedged
+  // teardown, power loss) keeps its persisted profile. Every subsequent driver
+  // start restores the same display_id -> connector reservation and the same
+  // EDID identity, so a Windows-side wedge keyed to that (connector, identity)
+  // pair recurs deterministically across reboots; only an explicit
+  // remove_temporary_display_profile (a completed departure) clears it. This
+  // pins the mechanism that makes the field enumeration wedge reboot-proof.
+  const auto stale = make_profile(0x6000000000000001ull, vdd::kWindowsDriverMaxPermanentDisplays);
+
+  auto blob = vdd::serialize_temporary_display_profiles(std::vector {stale});
+  for (int boot = 0; boot < 3; ++boot) {
+    const auto restored = vdd::parse_temporary_display_profiles_blob(blob);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->size(), 1u);
+    EXPECT_EQ((*restored)[0], stale);
+
+    const auto reservations = vdd::temporary_connector_reservations(*restored);
+    ASSERT_EQ(reservations.size(), 1u);
+    EXPECT_EQ(reservations.at(stale.display_id), stale.connector_index);
+
+    // The next session recreates the same display_id; upsert keeps the same
+    // slot and identity rather than rotating to a fresh one.
+    const auto upserted = vdd::upsert_temporary_display_profile(*restored, stale);
+    ASSERT_TRUE(upserted.has_value());
+    blob = vdd::serialize_temporary_display_profiles(*upserted);
+  }
+
+  const auto cleared = vdd::remove_temporary_display_profile(
+    *vdd::parse_temporary_display_profiles_blob(blob),
+    stale.display_id
+  );
+  EXPECT_TRUE(cleared.empty());
+}
