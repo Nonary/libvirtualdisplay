@@ -25,6 +25,17 @@ namespace virtual_display::driver {
     {0x86, 0xef, 0xe4, 0xc6, 0x71, 0x93, 0x2d, 0x63}
   };
 
+  // Remote-session IddCx devices are enumerated once per WTS session. Keep
+  // their control interface distinct from the root/console device so a
+  // machine-level broker cannot accidentally mutate the console display while
+  // opening a seat device (or vice versa).
+  inline constexpr Guid kRemoteDeviceInterfaceGuid {
+    0x2e82b34d,
+    0x53b8,
+    0x49c2,
+    {0x9d, 0x8d, 0x13, 0x46, 0x79, 0x91, 0xc4, 0x87}
+  };
+
   inline constexpr Guid kApiNamespaceGuid {
     0xa2864284,
     0x77fe,

@@ -82,7 +82,17 @@ namespace {
     static_cast<std::size_t>(kHardwareCursorMaxHeight) *
     sizeof(std::uint32_t);
   constexpr wchar_t kTemporaryDisplayProfilesValue[] = L"TemporaryDisplayProfiles";
+#if defined(SUNSHINE_VDD_REMOTE_SESSION_DRIVER)
+  constexpr bool kRemoteSessionDriver = true;
+  constexpr wchar_t kEndpointFriendlyName[] = L"Sunshine Remote Session Display Adapter";
+  constexpr wchar_t kEndpointModelName[] = L"SunshineRemoteSessionDisplay";
+  const GUID kControlInterfaceGuid = vdd::to_windows_guid(vdd::kRemoteDeviceInterfaceGuid);
+#else
+  constexpr bool kRemoteSessionDriver = false;
+  constexpr wchar_t kEndpointFriendlyName[] = L"Sunshine Virtual Display Adapter";
+  constexpr wchar_t kEndpointModelName[] = L"SunshineVirtualDisplay";
   const GUID kControlInterfaceGuid = vdd::to_windows_guid(vdd::kDeviceInterfaceGuid);
+#endif
 
   std::chrono::steady_clock::time_point lease_clock_now() noexcept {
     ULONGLONG unbiased_time_100ns {};
@@ -101,11 +111,13 @@ namespace {
   }
 
   class IddCxBackend;
+  class DeviceState;
   class CursorProcessor;
   class SwapChainProcessor;
 
   struct AdapterContext {
     IddCxBackend *backend {};
+    DeviceState *device_state {};
   };
 
   struct MonitorContext {
@@ -986,6 +998,21 @@ namespace {
   bool runtime_hdr_supported() {
     return has_hdr_iddcx_ddi() &&
            vdd::supports_windows_hdr_toggle(vdd::hdr_output_capabilities());
+  }
+
+  std::optional<vdd::DisplayManifest> initial_display_manifest() {
+    if constexpr (!kRemoteSessionDriver) {
+      return std::nullopt;
+    }
+
+    // A remote session needs a target before Winlogon/DWM can establish the
+    // desktop path. The controller starts with the same manifest so its state
+    // remains authoritative and a later broker update replaces this bootstrap
+    // monitor instead of colliding with an untracked driver-created object.
+    vdd::PermanentDisplayCountRequest request {};
+    request.display_count = 1;
+    vdd::set_default_permanent_display_settings(request);
+    return vdd::display_manifest_from_permanent_settings(request, kMaxPermanentDisplays);
   }
 
   vdd::DisplayDescriptor make_permanent_descriptor(
@@ -2503,9 +2530,16 @@ namespace {
       const auto hdr_capabilities = vdd::hdr_output_capabilities();
       IDDCX_ADAPTER_CAPS caps {};
       caps.Size = sizeof(caps);
-      caps.Flags = has_hdr_iddcx_ddi() && hdr_capabilities.fp16_swapchain ?
-        IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 :
-        IDDCX_ADAPTER_FLAGS_NONE;
+      std::uint32_t adapter_flags = IDDCX_ADAPTER_FLAGS_NONE;
+      if (has_hdr_iddcx_ddi() && hdr_capabilities.fp16_swapchain) {
+        adapter_flags |= IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
+      }
+      if constexpr (kRemoteSessionDriver) {
+        adapter_flags |= IDDCX_ADAPTER_FLAGS_REMOTE_SESSION_DRIVER;
+        adapter_flags |= IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
+        adapter_flags |= IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE;
+      }
+      caps.Flags = static_cast<IDDCX_ADAPTER_FLAGS>(adapter_flags);
       caps.MaxMonitorsSupported = kMaxPermanentDisplays + kMaxTemporaryDisplays;
       caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
       // The virtual sink does not render an endpoint image or apply the OS
@@ -2516,9 +2550,9 @@ namespace {
         IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE :
         IDDCX_FEATURE_IMPLEMENTATION_NONE;
       caps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
-      caps.EndPointDiagnostics.pEndPointFriendlyName = const_cast<PWSTR>(L"Sunshine Virtual Display Adapter");
+      caps.EndPointDiagnostics.pEndPointFriendlyName = const_cast<PWSTR>(kEndpointFriendlyName);
       caps.EndPointDiagnostics.pEndPointManufacturerName = const_cast<PWSTR>(L"Sunshine");
-      caps.EndPointDiagnostics.pEndPointModelName = const_cast<PWSTR>(L"SunshineVirtualDisplay");
+      caps.EndPointDiagnostics.pEndPointModelName = const_cast<PWSTR>(kEndpointModelName);
       caps.EndPointDiagnostics.pHardwareVersion = &endpoint_version;
       caps.EndPointDiagnostics.pFirmwareVersion = &endpoint_version;
 
@@ -2541,6 +2575,9 @@ namespace {
 
       auto *context = GetAdapterContext(adapter_out.AdapterObject);
       context->backend = this;
+      if (auto *device_context = GetDeviceContext(device)) {
+        context->device_state = device_context->state;
+      }
       {
         std::lock_guard lock {mutex_};
         adapter_ = adapter_out.AdapterObject;
@@ -2556,6 +2593,13 @@ namespace {
     }
 
     vdd::BackendError reserve_temporary_display_identity(const vdd::DisplayDescriptor &descriptor) override {
+      if constexpr (kRemoteSessionDriver) {
+        // RemoteDisplayEnum binds this device to one WTS session. Console-user
+        // HKCU is neither the owner nor a safe fallback for that seat, and the
+        // remote monitor does not need a machine-wide identity reservation.
+        return vdd::BackendError::None;
+      }
+
       const auto dpi_value = read_retained_temporary_dpi_value(descriptor);
       // A nullopt dpi_value is ambiguous: it can mean "the user is on
       // recommended scaling / has no retained value" or "the interactive
@@ -2580,6 +2624,10 @@ namespace {
     }
 
     vdd::BackendError unreserve_temporary_display_identity(const std::uint64_t display_id) override {
+      if constexpr (kRemoteSessionDriver) {
+        return vdd::BackendError::None;
+      }
+
       const auto result = remove_temporary_display_profile(driver_, device_, display_id);
       {
         std::lock_guard lock {mutex_};
@@ -3358,7 +3406,9 @@ namespace {
       // Use a digital sink type so Windows avoids WCG-only classification for
       // HDR, but avoid HDMI's legacy bandwidth ceiling that rejects 4K
       // high-refresh virtual modes.
-      monitor_info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
+      monitor_info.MonitorType = kRemoteSessionDriver ?
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER :
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
       monitor_info.ConnectorIndex = descriptor.connector_index;
       monitor_info.MonitorContainerId = vdd::to_windows_guid(descriptor.container_id);
       monitor_info.MonitorDescription.Size = sizeof(monitor_info.MonitorDescription);
@@ -3477,7 +3527,7 @@ namespace {
         TraceLoggingUInt32(arrival_out.OsTargetId, "OsTargetId")
       );
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorArrived");
-      if (!permanent) {
+      if (!permanent && !kRemoteSessionDriver) {
         std::optional<DWORD> retained_dpi_value;
         {
           std::lock_guard lock {mutex_};
@@ -4104,7 +4154,8 @@ namespace {
           vdd::DisplayStore {
             kMaxPermanentDisplays,
             kMaxTemporaryDisplays,
-            load_temporary_connector_reservations(driver, device)
+            load_temporary_connector_reservations(driver, device),
+            initial_display_manifest()
           },
           backend
         },
@@ -4130,6 +4181,40 @@ namespace {
       }
       shutdown_completed_ = true;
       return true;
+    }
+
+    NTSTATUS adapter_init_finished(const IDARG_IN_ADAPTER_INIT_FINISHED *args) {
+      const auto status = backend.adapter_init_finished(args);
+      if (!NT_SUCCESS(status) || !args || !NT_SUCCESS(args->AdapterInitStatus) || !kRemoteSessionDriver) {
+        return status;
+      }
+
+      const auto manifest = initial_display_manifest();
+      if (!manifest) {
+        return status;
+      }
+
+      std::unique_lock lock {controller_mutex, std::defer_lock};
+      if (!lock.try_lock_for(kControllerLockTimeout)) {
+        TraceLoggingWrite(g_trace_provider, "RemoteBootstrapMonitorControllerBusy");
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "RemoteBootstrapMonitorControllerBusy");
+        return STATUS_SUCCESS;
+      }
+
+      const auto result = controller.apply_display_manifest(*manifest, &lock);
+      if (result.ok()) {
+        TraceLoggingWrite(g_trace_provider, "RemoteBootstrapMonitorArrived");
+      } else {
+        TraceLoggingWrite(
+          g_trace_provider,
+          "RemoteBootstrapMonitorFailed",
+          TraceLoggingUInt32(static_cast<std::uint32_t>(result.store_error), "StoreError"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(result.validation_error), "ValidationError"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(result.backend_error), "BackendError")
+        );
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "RemoteBootstrapMonitorFailed");
+      }
+      return STATUS_SUCCESS;
     }
 
     vdd::IoctlDispatchResult dispatch(
@@ -4456,6 +4541,11 @@ NTSTATUS SunshineEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   }
 
   TraceLoggingWrite(g_trace_provider, "DeviceAddSucceeded");
+  TraceLoggingWrite(
+    g_trace_provider,
+    "DisplayDriverRole",
+    TraceLoggingBool(kRemoteSessionDriver, "RemoteSessionDriver")
+  );
   TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "DeviceAddSucceeded");
   return STATUS_SUCCESS;
 }
@@ -4480,7 +4570,10 @@ NTSTATUS SunshineEvtAdapterInitFinished(
     return STATUS_DEVICE_NOT_READY;
   }
 
-  return context->backend->adapter_init_finished(args);
+  if (!context->device_state) {
+    return context->backend->adapter_init_finished(args);
+  }
+  return context->device_state->adapter_init_finished(args);
 }
 
 NTSTATUS SunshineEvtParseMonitorDescription(

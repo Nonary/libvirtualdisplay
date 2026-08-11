@@ -43,6 +43,7 @@ namespace {
   // this function applied to the committed template with the default DriverVer values.
   std::string render_inf(std::string text, const std::string &driverver_date, const std::string &driverver_version) {
     replace_all(text, "@VDD_CONTROL_INTERFACE_GUID@", vdd::format_inf_guid(vdd::kDeviceInterfaceGuid));
+    replace_all(text, "@VDD_REMOTE_CONTROL_INTERFACE_GUID@", vdd::format_inf_guid(vdd::kRemoteDeviceInterfaceGuid));
     replace_all(text, "@VDD_CONTROL_SECURITY_DESCRIPTOR@", vdd::control_interface_security_descriptor());
     replace_all(text, "@VDD_DRIVER_VER_DATE@", driverver_date);
     replace_all(text, "@VDD_DRIVER_VER_VERSION@", driverver_version);

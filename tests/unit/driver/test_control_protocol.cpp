@@ -121,6 +121,10 @@ TEST(VirtualDisplayDriverDeviceIdentity, FormatsControlInterfaceGuidAsInfBraceSt
     vdd::format_inf_guid(vdd::kDeviceInterfaceGuid),
     "{5f894d6c-3a69-48a2-86ef-e4c671932d63}"
   );
+  EXPECT_EQ(
+    vdd::format_inf_guid(vdd::kRemoteDeviceInterfaceGuid),
+    "{2e82b34d-53b8-49c2-9d8d-13467991c487}"
+  );
 
   // Field grouping: the clock-seq bytes (data4[0..1]) follow the third hyphen and the node
   // bytes (data4[2..7]) the fourth, all lower-cased and zero-padded.

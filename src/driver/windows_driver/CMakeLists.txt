@@ -3,6 +3,7 @@ if(NOT WIN32 OR NOT MSVC)
 endif()
 
 set(SUNSHINE_DRIVER_TARGET SunshineVirtualDisplayDriver)
+set(SUNSHINE_REMOTE_DRIVER_TARGET SunshineRemoteDisplayDriver)
 set(SUNSHINE_DRIVER_WDF_VERSION "2.25" CACHE STRING "UMDF version for the Sunshine virtual display driver" FORCE)
 set(SUNSHINE_DRIVER_IDDCX_VERSION "1.10" CACHE STRING "IddCx include/library version for the Sunshine virtual display driver" FORCE)
 set(SUNSHINE_DRIVER_PLATFORM "${CMAKE_VS_PLATFORM_NAME}")
@@ -10,6 +11,11 @@ if(SUNSHINE_DRIVER_INF_GENERATED)
     set(SUNSHINE_DRIVER_INF "${SUNSHINE_DRIVER_INF_GENERATED}")
 else()
     set(SUNSHINE_DRIVER_INF "${CMAKE_CURRENT_SOURCE_DIR}/SunshineVirtualDisplayDriver.inf")
+endif()
+if(SUNSHINE_REMOTE_DRIVER_INF_GENERATED)
+    set(SUNSHINE_REMOTE_DRIVER_INF "${SUNSHINE_REMOTE_DRIVER_INF_GENERATED}")
+else()
+    set(SUNSHINE_REMOTE_DRIVER_INF "${CMAKE_CURRENT_SOURCE_DIR}/SunshineRemoteDisplayDriver.inf")
 endif()
 
 if(NOT SUNSHINE_DRIVER_PLATFORM)
@@ -123,13 +129,6 @@ unset(_sunshine_driver_preferred_usable)
 unset(_sunshine_driver_resolved_sdk_version)
 unset(_sunshine_driver_candidate_root)
 
-add_library(${SUNSHINE_DRIVER_TARGET} SHARED
-        driver_main.cpp
-        "${SUNSHINE_DRIVER_INF}")
-if(TARGET gen_driver_package_inf)
-    add_dependencies(${SUNSHINE_DRIVER_TARGET} gen_driver_package_inf)
-endif()
-
 find_program(SUNSHINE_DRIVER_TRACEWPP
         NAMES TraceWPP.exe tracewpp.exe
         PATHS
@@ -156,68 +155,9 @@ add_custom_command(OUTPUT "${SUNSHINE_DRIVER_WPP_TMH}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/driver_main.cpp"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         VERBATIM)
+# Preserve the established WPP target name for downstream build scripts while
+# sharing the generated trace header between the console and remote drivers.
 add_custom_target(${SUNSHINE_DRIVER_TARGET}WppTrace DEPENDS "${SUNSHINE_DRIVER_WPP_TMH}")
-add_dependencies(${SUNSHINE_DRIVER_TARGET} ${SUNSHINE_DRIVER_TARGET}WppTrace)
-
-target_link_libraries(${SUNSHINE_DRIVER_TARGET}
-        PRIVATE
-        libvirtualdisplay::driver
-        advapi32
-        avrt
-        d3d11
-        dxgi
-        wtsapi32
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/iddcx/${SUNSHINE_DRIVER_IDDCX_VERSION}/IddCxStub.lib"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/wdf/umdf/${SUNSHINE_DRIVER_WDK_ARCH}/${SUNSHINE_DRIVER_WDF_VERSION}/WdfDriverStubUm.lib"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/wpprecorderum.lib"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/ntdll.lib")
-
-target_include_directories(${SUNSHINE_DRIVER_TARGET}
-        PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Include/wdf/umdf/${SUNSHINE_DRIVER_WDF_VERSION}"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/um"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/shared"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/ucrt"
-        "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/um/iddcx/${SUNSHINE_DRIVER_IDDCX_VERSION}")
-
-target_compile_definitions(${SUNSHINE_DRIVER_TARGET}
-        PRIVATE
-        UNICODE
-        _UNICODE
-        NOMINMAX
-        UMDF_DRIVER
-        UMDF_VERSION_MAJOR=2
-        UMDF_VERSION_MINOR=25
-        UMDF_MINIMUM_VERSION_REQUIRED=25
-        _ATL_NO_WIN_SUPPORT
-        IDDCX_VERSION_MAJOR=1
-        IDDCX_VERSION_MINOR=10
-        IDDCX_MINIMUM_VERSION_REQUIRED=4
-        WPP_MACRO_USE_KM_VERSION_FOR_UM=1
-        ENABLE_WPP_RECORDER=1)
-
-set_target_properties(${SUNSHINE_DRIVER_TARGET}
-        PROPERTIES
-        PREFIX ""
-        OUTPUT_NAME "SunshineVirtualDisplayDriver"
-        SUFFIX ".dll")
-
-# Keep the package inputs as real build outputs. A POST_BUILD-only copy does not
-# run when only the INF changes, which can leave pnputil installing a stale driver package.
-set(SUNSHINE_DRIVER_PACKAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/driver-package")
-set(SUNSHINE_DRIVER_PACKAGED_INF "${SUNSHINE_DRIVER_PACKAGE_DIR}/SunshineVirtualDisplayDriver.inf")
-set(SUNSHINE_DRIVER_PACKAGED_DLL "${SUNSHINE_DRIVER_PACKAGE_DIR}/SunshineVirtualDisplayDriver.dll")
-add_custom_command(OUTPUT "${SUNSHINE_DRIVER_PACKAGED_INF}" "${SUNSHINE_DRIVER_PACKAGED_DLL}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${SUNSHINE_DRIVER_PACKAGE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${SUNSHINE_DRIVER_INF}"
-                "${SUNSHINE_DRIVER_PACKAGED_INF}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:${SUNSHINE_DRIVER_TARGET}>"
-                "${SUNSHINE_DRIVER_PACKAGED_DLL}"
-        DEPENDS ${SUNSHINE_DRIVER_TARGET} "${SUNSHINE_DRIVER_INF}"
-        VERBATIM)
 
 find_program(SUNSHINE_DRIVER_INF2CAT
         NAMES Inf2Cat.exe
@@ -230,14 +170,104 @@ if(NOT SUNSHINE_DRIVER_INF2CAT)
     message(FATAL_ERROR "Inf2Cat.exe is required to package ${SUNSHINE_DRIVER_TARGET}")
 endif()
 
-set(SUNSHINE_DRIVER_PACKAGED_CAT "${SUNSHINE_DRIVER_PACKAGE_DIR}/sunshinevirtualdisplaydriver.cat")
-add_custom_command(OUTPUT "${SUNSHINE_DRIVER_PACKAGED_CAT}"
-        COMMAND "${SUNSHINE_DRIVER_INF2CAT}" "/driver:${SUNSHINE_DRIVER_PACKAGE_DIR}" /os:${SUNSHINE_DRIVER_INF2CAT_OS}
-        DEPENDS "${SUNSHINE_DRIVER_PACKAGED_INF}" "${SUNSHINE_DRIVER_PACKAGED_DLL}"
-        VERBATIM)
-add_custom_target(${SUNSHINE_DRIVER_TARGET}PackageFiles ALL DEPENDS "${SUNSHINE_DRIVER_PACKAGED_CAT}")
+function(sunshine_add_display_driver target output_name inf dependency_target package_directory catalog_name)
+    add_library(${target} SHARED
+            driver_main.cpp
+            "${inf}")
+    if(TARGET ${dependency_target})
+        add_dependencies(${target} ${dependency_target})
+    endif()
+    add_dependencies(${target} ${SUNSHINE_DRIVER_TARGET}WppTrace)
 
-install(TARGETS ${SUNSHINE_DRIVER_TARGET} RUNTIME DESTINATION driver)
-install(FILES "$<TARGET_PDB_FILE:${SUNSHINE_DRIVER_TARGET}>" DESTINATION driver OPTIONAL)
-install(FILES "${SUNSHINE_DRIVER_PACKAGED_INF}" DESTINATION driver)
-install(FILES "${SUNSHINE_DRIVER_PACKAGED_CAT}" DESTINATION driver RENAME SunshineVirtualDisplayDriver.cat)
+    target_link_libraries(${target}
+            PRIVATE
+            libvirtualdisplay::driver
+            advapi32
+            avrt
+            d3d11
+            dxgi
+            wtsapi32
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/iddcx/${SUNSHINE_DRIVER_IDDCX_VERSION}/IddCxStub.lib"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/wdf/umdf/${SUNSHINE_DRIVER_WDK_ARCH}/${SUNSHINE_DRIVER_WDF_VERSION}/WdfDriverStubUm.lib"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/wpprecorderum.lib"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Lib/${SUNSHINE_DRIVER_SDK_VERSION}/um/${SUNSHINE_DRIVER_WDK_ARCH}/ntdll.lib")
+
+    target_include_directories(${target}
+            PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Include/wdf/umdf/${SUNSHINE_DRIVER_WDF_VERSION}"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/um"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/shared"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/ucrt"
+            "${SUNSHINE_DRIVER_WDK_ROOT}/Include/${SUNSHINE_DRIVER_SDK_VERSION}/um/iddcx/${SUNSHINE_DRIVER_IDDCX_VERSION}")
+
+    target_compile_definitions(${target}
+            PRIVATE
+            UNICODE
+            _UNICODE
+            NOMINMAX
+            UMDF_DRIVER
+            UMDF_VERSION_MAJOR=2
+            UMDF_VERSION_MINOR=25
+            UMDF_MINIMUM_VERSION_REQUIRED=25
+            _ATL_NO_WIN_SUPPORT
+            IDDCX_VERSION_MAJOR=1
+            IDDCX_VERSION_MINOR=10
+            IDDCX_MINIMUM_VERSION_REQUIRED=4
+            WPP_MACRO_USE_KM_VERSION_FOR_UM=1
+            ENABLE_WPP_RECORDER=1
+            ${ARGN})
+
+    set_target_properties(${target}
+            PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "${output_name}"
+            SUFFIX ".dll")
+
+    # Keep package inputs as real outputs. INF-only edits must refresh the
+    # catalog even when the driver binary itself did not relink.
+    set(package_dir "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/${package_directory}")
+    set(packaged_inf "${package_dir}/${output_name}.inf")
+    set(packaged_dll "${package_dir}/${output_name}.dll")
+    # Inf2Cat normalizes the emitted catalog filename to lower case even when
+    # CatalogFile in the INF uses product casing.
+    string(TOLOWER "${catalog_name}" catalog_file_name)
+    set(packaged_cat "${package_dir}/${catalog_file_name}")
+    add_custom_command(OUTPUT "${packaged_inf}" "${packaged_dll}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${package_dir}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${inf}" "${packaged_inf}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${target}>" "${packaged_dll}"
+            DEPENDS ${target} "${inf}"
+            VERBATIM)
+    add_custom_command(OUTPUT "${packaged_cat}"
+            COMMAND "${SUNSHINE_DRIVER_INF2CAT}" "/driver:${package_dir}" /os:${SUNSHINE_DRIVER_INF2CAT_OS}
+            DEPENDS "${packaged_inf}" "${packaged_dll}"
+            VERBATIM)
+    add_custom_target(${target}PackageFiles ALL DEPENDS "${packaged_cat}")
+
+    install(TARGETS ${target} RUNTIME DESTINATION driver)
+    install(FILES "$<TARGET_PDB_FILE:${target}>" DESTINATION driver OPTIONAL)
+    install(FILES "${packaged_inf}" DESTINATION driver)
+    install(FILES "${packaged_cat}" DESTINATION driver RENAME "${catalog_name}")
+endfunction()
+
+if(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER)
+    sunshine_add_display_driver(
+            ${SUNSHINE_DRIVER_TARGET}
+            SunshineVirtualDisplayDriver
+            "${SUNSHINE_DRIVER_INF}"
+            gen_driver_package_inf
+            driver-package
+            SunshineVirtualDisplayDriver.cat)
+endif()
+
+if(BUILD_SUNSHINE_REMOTE_DISPLAY_DRIVER)
+    sunshine_add_display_driver(
+            ${SUNSHINE_REMOTE_DRIVER_TARGET}
+            SunshineRemoteDisplayDriver
+            "${SUNSHINE_REMOTE_DRIVER_INF}"
+            gen_remote_driver_package_inf
+            remote-driver-package
+            SunshineRemoteDisplayDriver.cat
+            SUNSHINE_VDD_REMOTE_SESSION_DRIVER=1)
+endif()

@@ -1,0 +1,84 @@
+; SunshineRemoteDisplayDriver.inf
+; Clean-room UMDF/IddCx display driver for a Remote Desktop Services session.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=SunshineRemoteDisplayDriver.cat
+DriverVer=@VDD_DRIVER_VER_DATE@,@VDD_DRIVER_VER_VERSION@
+PnpLockdown=1
+
+; RemoteDisplayEnum creates one software device per terminal session after the
+; protocol provider returns the hardware ID below. Preconfiguration makes the
+; UMDF/IddCx stack available during that session-creation transaction.
+[ControlFlags]
+PreConfigureDriver=*
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0...26100
+
+[Standard.NTamd64.10.0...26100]
+%DeviceName%=Device_Install, SUNSHINE_REMOTE_IDDCX
+
+[SourceDisksNames]
+1=%DiskName%,,,""
+
+[SourceDisksFiles]
+SunshineRemoteDisplayDriver.dll=1
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[Device_Install.NT]
+CopyFiles=UMDriverCopy
+
+[Device_Install.NT.hw]
+AddReg=Device_Install_Hw_AddReg
+
+[Device_Install_Hw_AddReg]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",0x00000000,"SunshineRemoteDisplayGroup"
+HKR,,"ConfigVersion",0x00010001,1
+
+[Device_Install.NT.Interfaces]
+AddInterface=@VDD_REMOTE_CONTROL_INTERFACE_GUID@,,ControlInterface
+
+[ControlInterface]
+AddReg=ControlInterface_AddReg
+
+[ControlInterface_AddReg]
+HKR,,Security,,"@VDD_CONTROL_SECURITY_DESCRIPTOR@"
+
+[Device_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[Device_Install.NT.Wdf]
+UmdfService=SunshineRemoteDisplayDriver,SunshineRemoteDisplayDriver_Install
+UmdfServiceOrder=SunshineRemoteDisplayDriver
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+UmdfImpersonationLevel=Identification
+
+[SunshineRemoteDisplayDriver_Install]
+UmdfLibraryVersion=2.25.0
+ServiceBinary=%12%\UMDF\SunshineRemoteDisplayDriver.dll
+UmdfExtensions=IddCx0102
+
+[UMDriverCopy]
+SunshineRemoteDisplayDriver.dll
+
+[Strings]
+ManufacturerName="Sunshine"
+DeviceName="Sunshine Remote Session Display Driver"
+DiskName="Sunshine Remote Session Display Driver Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"

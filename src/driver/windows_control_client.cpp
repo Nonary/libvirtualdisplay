@@ -3,9 +3,13 @@
 #ifdef _WIN32
 
 #include <SetupAPI.h>
+#include <devpkey.h>
 
 #include <algorithm>
+#include <cwchar>
+#include <cwctype>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -60,8 +64,25 @@ namespace virtual_display::driver {
       return nullptr;
     }
 
-    std::vector<std::wstring> enumerate_control_device_paths(std::uint32_t &native_error) {
-      const GUID interface_guid = to_windows_guid(kDeviceInterfaceGuid);
+    struct ControlDevicePath {
+      std::wstring path {};
+      std::wstring instance_id {};
+      std::optional<std::uint32_t> session_id {};
+    };
+
+    GUID control_interface_guid(const WindowsControlDeviceKind kind) {
+      return to_windows_guid(
+        kind == WindowsControlDeviceKind::RemoteSession ?
+          kRemoteDeviceInterfaceGuid :
+          kDeviceInterfaceGuid
+      );
+    }
+
+    std::vector<ControlDevicePath> enumerate_control_device_paths(
+      const WindowsControlDeviceKind kind,
+      std::uint32_t &native_error
+    ) {
+      const GUID interface_guid = control_interface_guid(kind);
       DevInfoSet device_info_set {
         SetupDiGetClassDevsW(
           &interface_guid,
@@ -75,7 +96,7 @@ namespace virtual_display::driver {
         return {};
       }
 
-      std::vector<std::wstring> paths;
+      std::vector<ControlDevicePath> paths;
       native_error = ERROR_FILE_NOT_FOUND;
 
       for (DWORD index = 0;; ++index) {
@@ -101,16 +122,130 @@ namespace virtual_display::driver {
         std::vector<std::byte> detail_buffer(detail_size);
         auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
         detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (!SetupDiGetDeviceInterfaceDetailW(device_info_set.value, &interface_data, detail, detail_size, &detail_size, nullptr)) {
+        SP_DEVINFO_DATA device_info {};
+        device_info.cbSize = sizeof(device_info);
+        if (!SetupDiGetDeviceInterfaceDetailW(
+              device_info_set.value,
+              &interface_data,
+              detail,
+              detail_size,
+              &detail_size,
+              &device_info
+            )) {
           native_error = GetLastError();
           continue;
         }
 
-        paths.emplace_back(detail->DevicePath);
+        ControlDevicePath device_path {};
+        device_path.path = detail->DevicePath;
+
+        DWORD instance_id_size = 0;
+        (void) SetupDiGetDeviceInstanceIdW(
+          device_info_set.value,
+          &device_info,
+          nullptr,
+          0,
+          &instance_id_size
+        );
+        if (instance_id_size > 0) {
+          std::vector<wchar_t> instance_id(instance_id_size);
+          if (SetupDiGetDeviceInstanceIdW(
+                device_info_set.value,
+                &device_info,
+                instance_id.data(),
+                instance_id_size,
+                &instance_id_size
+              )) {
+            device_path.instance_id = instance_id.data();
+          }
+        }
+
+        DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+        DWORD property_size = 0;
+        std::uint32_t session_id = 0;
+        if (SetupDiGetDevicePropertyW(
+              device_info_set.value,
+              &device_info,
+              &DEVPKEY_Device_SessionId,
+              &property_type,
+              reinterpret_cast<PBYTE>(&session_id),
+              sizeof(session_id),
+              &property_size,
+              0
+            ) &&
+            property_type == DEVPROP_TYPE_UINT32 &&
+            property_size == sizeof(session_id)) {
+          device_path.session_id = session_id;
+        }
+
+        paths.push_back(std::move(device_path));
         native_error = ERROR_SUCCESS;
       }
 
       return paths;
+    }
+
+    bool contains_case_insensitive(const std::wstring &value, const std::wstring &needle) {
+      return std::search(
+               value.begin(),
+               value.end(),
+               needle.begin(),
+               needle.end(),
+               [](const wchar_t left, const wchar_t right) {
+                 return std::towupper(left) == std::towupper(right);
+               }
+             ) != value.end();
+    }
+
+    bool matches_remote_session(const ControlDevicePath &device, const std::uint32_t session_id) {
+      if (device.session_id) {
+        return *device.session_id == session_id;
+      }
+
+      // Older stacks may omit DEVPKEY_Device_SessionId. RemoteDisplayEnum also
+      // embeds the session in the instance ID, so retain that as a fail-closed
+      // compatibility fallback rather than opening an arbitrary seat.
+      wchar_t marker[32] {};
+      if (std::swprintf(marker, sizeof(marker) / sizeof(marker[0]), L"SESSIONID_%04X", session_id) < 0) {
+        return false;
+      }
+      return contains_case_insensitive(device.instance_id, marker) ||
+             contains_case_insensitive(device.path, marker);
+    }
+
+    WindowsControlOpenResult open_control_device_paths(
+      const std::vector<ControlDevicePath> &devices,
+      std::uint32_t last_error
+    ) {
+      for (const auto &device : devices) {
+        UniqueHandle handle {
+          CreateFileW(
+            device.path.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            nullptr
+          )
+        };
+        if (handle.value != INVALID_HANDLE_VALUE) {
+          auto transport = std::make_unique<WindowsControlTransport>(handle.release());
+          return {
+            ControlStatus::Success,
+            std::move(transport),
+            0,
+            device.path
+          };
+        }
+
+        last_error = GetLastError();
+      }
+
+      if (last_error == ERROR_SUCCESS || last_error == ERROR_NO_MORE_ITEMS) {
+        last_error = ERROR_FILE_NOT_FOUND;
+      }
+      return {ControlStatus::TransportFailed, {}, last_error, {}};
     }
   }  // namespace
 
@@ -220,8 +355,15 @@ namespace virtual_display::driver {
   }
 
   std::vector<WindowsControlDeviceInfo> enumerate_control_devices(std::uint32_t *native_error) {
+    return enumerate_control_devices(WindowsControlDeviceKind::Console, native_error);
+  }
+
+  std::vector<WindowsControlDeviceInfo> enumerate_control_devices(
+    const WindowsControlDeviceKind kind,
+    std::uint32_t *native_error
+  ) {
     std::uint32_t enumerate_error = ERROR_SUCCESS;
-    auto paths = enumerate_control_device_paths(enumerate_error);
+    auto paths = enumerate_control_device_paths(kind, enumerate_error);
     if (native_error) {
       *native_error = enumerate_error;
     }
@@ -230,10 +372,12 @@ namespace virtual_display::driver {
     devices.reserve(paths.size());
     for (const auto &path : paths) {
       WindowsControlDeviceInfo info {};
-      info.device_path = path;
+      info.device_path = path.path;
+      info.device_instance_id = path.instance_id;
+      info.session_id = path.session_id;
 
       HANDLE handle = CreateFileW(
-        path.c_str(),
+        path.path.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
@@ -254,38 +398,29 @@ namespace virtual_display::driver {
   }
 
   WindowsControlOpenResult open_first_control_device() {
+    return open_first_control_device(WindowsControlDeviceKind::Console);
+  }
+
+  WindowsControlOpenResult open_first_control_device(const WindowsControlDeviceKind kind) {
     std::uint32_t last_error = ERROR_SUCCESS;
-    const auto paths = enumerate_control_device_paths(last_error);
+    auto devices = enumerate_control_device_paths(kind, last_error);
+    return open_control_device_paths(devices, last_error);
+  }
 
-    for (const auto &path : paths) {
-      UniqueHandle handle {
-        CreateFileW(
-          path.c_str(),
-          GENERIC_READ | GENERIC_WRITE,
-          FILE_SHARE_READ | FILE_SHARE_WRITE,
-          nullptr,
-          OPEN_EXISTING,
-          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-          nullptr
-        )
-      };
-      if (handle.value != INVALID_HANDLE_VALUE) {
-        auto transport = std::make_unique<WindowsControlTransport>(handle.release());
-        return {
-          ControlStatus::Success,
-          std::move(transport),
-          0,
-          path
-        };
-      }
-
-      last_error = GetLastError();
-    }
-
-    if (last_error == ERROR_SUCCESS || last_error == ERROR_NO_MORE_ITEMS) {
-      last_error = ERROR_FILE_NOT_FOUND;
-    }
-    return {ControlStatus::TransportFailed, {}, last_error, {}};
+  WindowsControlOpenResult open_remote_control_device_for_session(const std::uint32_t session_id) {
+    std::uint32_t last_error = ERROR_SUCCESS;
+    auto devices = enumerate_control_device_paths(WindowsControlDeviceKind::RemoteSession, last_error);
+    devices.erase(
+      std::remove_if(
+        devices.begin(),
+        devices.end(),
+        [session_id](const auto &device) {
+          return !matches_remote_session(device, session_id);
+        }
+      ),
+      devices.end()
+    );
+    return open_control_device_paths(devices, last_error);
   }
 }  // namespace virtual_display::driver
 

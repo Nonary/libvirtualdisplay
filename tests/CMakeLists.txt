@@ -38,3 +38,8 @@ add_test(NAME driver_inf_in_sync
         COMMAND gen_driver_inf --check
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf.in"
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")
+
+add_test(NAME remote_driver_inf_in_sync
+        COMMAND gen_driver_inf --check
+            "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineRemoteDisplayDriver.inf.in"
+            "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineRemoteDisplayDriver.inf")

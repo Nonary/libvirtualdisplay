@@ -8,10 +8,16 @@
 #include <Windows.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace virtual_display::driver {
+  enum class WindowsControlDeviceKind {
+    Console,
+    RemoteSession
+  };
+
   class WindowsControlTransport final: public ControlTransport {
   public:
     explicit WindowsControlTransport(HANDLE handle);
@@ -52,12 +58,20 @@ namespace virtual_display::driver {
 
   struct WindowsControlDeviceInfo {
     std::wstring device_path {};
+    std::wstring device_instance_id {};
+    std::optional<std::uint32_t> session_id {};
     bool openable {};
     std::uint32_t native_error {};
   };
 
   std::vector<WindowsControlDeviceInfo> enumerate_control_devices(std::uint32_t *native_error = nullptr);
+  std::vector<WindowsControlDeviceInfo> enumerate_control_devices(
+    WindowsControlDeviceKind kind,
+    std::uint32_t *native_error = nullptr
+  );
   WindowsControlOpenResult open_first_control_device();
+  WindowsControlOpenResult open_first_control_device(WindowsControlDeviceKind kind);
+  WindowsControlOpenResult open_remote_control_device_for_session(std::uint32_t session_id);
 }  // namespace virtual_display::driver
 
 #endif

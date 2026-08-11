@@ -43,6 +43,21 @@ cmake -S . -B build-driver -G Ninja -DBUILD_TESTS=OFF -DBUILD_SUNSHINE_VIRTUAL_D
 cmake --build build-driver --target SunshineVirtualDisplayDriver virtualdisplay_tools -j 10
 ```
 
+The root-enumerated driver above owns console-session monitors. Windows terminal
+sessions require a separate `RemoteDisplayEnum` package; a console adapter cannot
+serve both roles. Build the remote-session package from the same display engine
+with:
+
+```powershell
+cmake -S . -B build-driver -G Ninja -DBUILD_TESTS=ON -DBUILD_SUNSHINE_REMOTE_DISPLAY_DRIVER=ON
+cmake --build build-driver --target SunshineRemoteDisplayDriver -j 10
+```
+
+The remote package matches `SUNSHINE_REMOTE_IDDCX`, advertises
+`IDDCX_ADAPTER_FLAGS_REMOTE_SESSION_DRIVER`, and creates one controller-tracked
+bootstrap monitor when its per-session adapter becomes ready. It requires Windows
+build 26100 or newer because its HDR and dynamic-mode contract uses IddCx 1.10.
+
 The Windows driver build requires MSVC and the Windows Driver Kit. Packaging
 also requires `Inf2Cat.exe` from the WDK. Local package builds generate the INF
 and catalog files, but do not sign them; sign the driver package according to
@@ -263,6 +278,14 @@ if (!protocol.ok()) {
 devices and opens the first usable one. It fails when the driver is not
 installed, the device is not started, or Windows denies access. Keep the opened
 transport alive for as long as `ControlClient` uses it.
+
+Remote-session devices use a separate interface class. A session-aware broker can
+select the exact `RemoteDisplayEnum` instance instead of accidentally opening the
+console driver or another seat:
+
+```cpp
+auto opened = vdd::open_remote_control_device_for_session(session_id);
+```
 
 API calls return either `ControlOperationResult` or `ControlResult<T>`. Check
 `ok()` before using output values. `status` reports library/protocol failures;
