@@ -90,6 +90,7 @@ TEST(VirtualDisplayDriverControlProtocol, ComputesBufferedUnknownDeviceIoctlCode
   EXPECT_EQ(vdd::kIoctlSetRenderAdapter, 0x0022a42cu);
   EXPECT_EQ(vdd::kIoctlCreateTemporaryDisplayOwned, 0x0022e430u);
   EXPECT_EQ(vdd::kIoctlReclaimTemporaryDisplay, 0x0022e434u);
+  EXPECT_EQ(vdd::kIoctlSetDisplayHdrState, 0x0022e438u);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionUsesDedicatedNamespace) {
@@ -442,6 +443,24 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesPermanentDisplayCount) {
     vdd::validate_permanent_display_count(request, 2),
     vdd::ValidationError::WrongApiNamespace
   );
+}
+
+TEST(VirtualDisplayDriverControlProtocol, ValidatesDisplayHdrState) {
+  vdd::SetDisplayHdrStateRequest request {};
+  request.display_id = 0x7000000000000001ull;
+
+  EXPECT_EQ(vdd::validate_set_display_hdr_state(request), vdd::ValidationError::None);
+
+  request.enabled = 2;
+  EXPECT_EQ(vdd::validate_set_display_hdr_state(request), vdd::ValidationError::InvalidHdrState);
+
+  request.enabled = 1;
+  request.sdr_white_level_nits = vdd::kMaxSdrWhiteLevelNits + 1;
+  EXPECT_EQ(vdd::validate_set_display_hdr_state(request), vdd::ValidationError::InvalidSdrWhiteLevel);
+
+  request.sdr_white_level_nits = vdd::kDefaultSdrWhiteLevelNits;
+  request.display_id = 0;
+  EXPECT_EQ(vdd::validate_set_display_hdr_state(request), vdd::ValidationError::MissingDisplayId);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ValidatesPermanentDisplaySettings) {

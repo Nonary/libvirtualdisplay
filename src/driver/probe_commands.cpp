@@ -35,6 +35,17 @@ namespace virtual_display::driver {
     return value;
   }
 
+  std::optional<std::uint64_t> parse_probe_u64_token(const std::string_view text) {
+    std::uint64_t value {};
+    const auto *begin = text.data();
+    const auto *end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, value);
+    if (text.empty() || result.ec != std::errc {} || result.ptr != end) {
+      return std::nullopt;
+    }
+    return value;
+  }
+
   std::optional<std::int32_t> parse_probe_i32_token(const std::string_view text) {
     std::int32_t value {};
     const auto *begin = text.data();
@@ -60,6 +71,8 @@ namespace virtual_display::driver {
     };
 
     if (command == "--diagnose" ||
+        command == "--apply-extended-topology-current-session" ||
+        command == "--dump-display-config-current-session" ||
         command == "--apply-extended-topology" ||
         command == "--query-color-profiles" ||
         command == "--check" ||
@@ -67,8 +80,23 @@ namespace virtual_display::driver {
         command == "--apply-manifest-topology") {
       return plan(2, 2);
     }
+    if (command == "--set-hdr-current-session") {
+      return plan(3, 4);
+    }
     if (command == "--set-permanent") {
       return plan(3, 3);
+    }
+    if (command == "--remote-query-permanent") {
+      return plan(3, 3);
+    }
+    if (command == "--remote-query-state") {
+      return plan(3, 3);
+    }
+    if (command == "--remote-set-permanent") {
+      return plan(4, 4);
+    }
+    if (command == "--remote-set-hdr") {
+      return plan(5, 6);
     }
     if (command == "--associate-color-profile") {
       return plan(5, (std::numeric_limits<int>::max)());
@@ -118,7 +146,10 @@ namespace virtual_display::driver {
   }
 
   ProbeCommandExecutionStage probe_command_execution_stage(const std::string_view command) {
-    if (command == "--diagnose") {
+    if (command == "--diagnose" ||
+        command == "--apply-extended-topology-current-session" ||
+        command == "--dump-display-config-current-session" ||
+        command == "--set-hdr-current-session") {
       return ProbeCommandExecutionStage::NoControlDevice;
     }
     if (command == "--apply-extended-topology" ||

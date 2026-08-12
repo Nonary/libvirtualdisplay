@@ -138,6 +138,14 @@ if(WIN32 AND BUILD_VIRTUALDISPLAY_TOOLS)
     target_compile_features(alttab_stress PRIVATE cxx_std_20)
     install(TARGETS alttab_stress RUNTIME DESTINATION tools)
     list(APPEND _libvirtualdisplay_tool_targets alttab_stress)
+
+    # Deterministic HDR10 producer used to prove what a terminal-session app submits
+    # versus what the IddCx consumer receives after desktop composition.
+    add_executable(hdr_session_probe "${PROJECT_SOURCE_DIR}/tools/hdr_session_probe.cpp")
+    target_link_libraries(hdr_session_probe PRIVATE d3d11 dxgi gdi32 user32)
+    target_compile_features(hdr_session_probe PRIVATE cxx_std_20)
+    install(TARGETS hdr_session_probe RUNTIME DESTINATION tools)
+    list(APPEND _libvirtualdisplay_tool_targets hdr_session_probe)
 endif()
 
 if(WIN32 AND BUILD_VIRTUALDISPLAY_VULKAN_LAYER)

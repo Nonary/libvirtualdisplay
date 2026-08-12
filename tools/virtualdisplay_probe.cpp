@@ -8,6 +8,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -91,12 +92,19 @@ namespace {
       << "virtualdisplay_probe commands:\n"
       << "  --diagnose\n"
       << "  --apply-extended-topology\n"
+      << "  --apply-extended-topology-current-session\n"
+      << "  --dump-display-config-current-session\n"
+      << "  --set-hdr-current-session <0|1> [output-path]\n"
       << "  --apply-manifest-topology\n"
       << "  --query-color-profiles\n"
       << "  --associate-color-profile <source_luid high:low> <source_id> <profile> [--advanced-color] [--default]\n"
       << "  --check\n"
       << "  --query-permanent\n"
       << "  --set-permanent <count>\n"
+      << "  --remote-query-permanent <session_id>\n"
+      << "  --remote-query-state <session_id>\n"
+      << "  --remote-set-permanent <session_id> <count>\n"
+      << "  --remote-set-hdr <session_id> <display_id> <0|1> [sdr_white_level_nits]\n"
       << "  --self-test-permanent [count]\n"
       << "  --self-test-temp [width height refresh_hz]\n"
       << "  --self-test-4k240 [timeout_ms]\n"
@@ -191,6 +199,28 @@ namespace {
     }
 
     const auto parsed = vdd::parse_probe_u32_token(argv[index]);
+    if (!parsed) {
+      std::cerr << "invalid " << label << '\n';
+      return false;
+    }
+    value = *parsed;
+    return true;
+  }
+
+  bool read_u64_arg(
+    const int argc,
+    char **argv,
+    const int index,
+    const std::uint64_t fallback,
+    const char *label,
+    std::uint64_t &value
+  ) {
+    if (argc <= index) {
+      value = fallback;
+      return true;
+    }
+
+    const auto parsed = vdd::parse_probe_u64_token(argv[index]);
     if (!parsed) {
       std::cerr << "invalid " << label << '\n';
       return false;
@@ -823,8 +853,20 @@ namespace {
     const std::optional<vdd::AdapterLuid> &adapter_luid = std::nullopt,
     const std::optional<std::uint32_t> &target_id = std::nullopt
   ) {
-    constexpr UINT32 kQueryFlags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
-    auto query = query_display_config_result(kQueryFlags);
+    UINT32 query_flags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
+    auto query = query_display_config_result(query_flags);
+    if (!query.data) {
+      query_flags = QDC_ALL_PATHS;
+      query = query_display_config_result(query_flags);
+    }
+    if (!query.data) {
+      query_flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+      query = query_display_config_result(query_flags);
+    }
+    if (!query.data) {
+      query_flags = QDC_ONLY_ACTIVE_PATHS;
+      query = query_display_config_result(query_flags);
+    }
     if (!query.data) {
       std::cout << "display_config_query_error=1 native_error=" << query.native_error << '\n';
       return;
@@ -832,7 +874,8 @@ namespace {
     auto &display_config = *query.data;
 
     const auto filter_luid = adapter_luid ? vdd::to_windows_luid(*adapter_luid) : LUID {};
-    std::cout << "display_config_paths=" << display_config.paths.size()
+    std::cout << "display_config_query_flags=" << query_flags
+              << " display_config_paths=" << display_config.paths.size()
               << " modes=" << display_config.modes.size() << '\n';
     for (std::size_t index = 0; index < display_config.paths.size(); ++index) {
       const auto &path = display_config.paths[index];
@@ -944,6 +987,118 @@ namespace {
               << " active_color_mode=" << info.active_color_mode
               << " color_encoding=" << static_cast<unsigned int>(info.color_encoding)
               << '\n';
+  }
+
+  bool advanced_color_matches(const AdvancedColorInfo &info, const bool enabled) {
+    if (!enabled) {
+      return !info.active ||
+             (info.v2 && !info.hdr_enabled &&
+              info.active_color_mode != DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR);
+    }
+
+    return info.v2 &&
+           info.supported &&
+           info.active &&
+           info.hdr_supported &&
+           info.hdr_enabled &&
+           info.active_color_mode == DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR &&
+           !info.limited_by_policy &&
+           info.bits_per_color_channel >= 10;
+  }
+
+  int set_current_session_hdr_state(const bool enabled) {
+    UINT32 query_flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+    auto query = query_display_config_result(query_flags);
+    if (!query.data) {
+      query_flags = QDC_ONLY_ACTIVE_PATHS;
+      query = query_display_config_result(query_flags);
+    }
+    if (!query.data) {
+      std::cerr << "current-session HDR path query failed native_error=" << query.native_error << '\n';
+      return 1;
+    }
+
+    std::uint32_t attempted = 0;
+    std::uint32_t matched = 0;
+    for (const auto &path: query.data->paths) {
+      if ((path.flags & DISPLAYCONFIG_PATH_ACTIVE) == 0 || !path.targetInfo.targetAvailable) {
+        continue;
+      }
+
+      const auto adapter_luid = vdd::from_windows_luid(path.targetInfo.adapterId);
+      LONG native_error = ERROR_SUCCESS;
+      const auto before = query_advanced_color(adapter_luid, path.targetInfo.id, &native_error);
+      std::cout << "current_session_hdr_target=" << attempted
+                << " adapter_luid=" << path.targetInfo.adapterId.HighPart << ':' << path.targetInfo.adapterId.LowPart
+                << " target_id=" << path.targetInfo.id << '\n';
+      if (!before) {
+        std::cerr << "current-session advanced-color query failed"
+                  << " target_id=" << path.targetInfo.id
+                  << " native_error=" << native_error << '\n';
+        ++attempted;
+        continue;
+      }
+
+      std::cout << "before_";
+      print_advanced_color(*before);
+      const bool set = before->v2 ?
+        set_hdr_state(adapter_luid, path.targetInfo.id, enabled) :
+        set_advanced_color(adapter_luid, path.targetInfo.id, enabled);
+      if (!set) {
+        std::cerr << "current-session HDR state change failed"
+                  << " target_id=" << path.targetInfo.id
+                  << " native_error=" << GetLastError() << '\n';
+        ++attempted;
+        continue;
+      }
+
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      std::optional<AdvancedColorInfo> after;
+      do {
+        after = query_advanced_color(adapter_luid, path.targetInfo.id, &native_error);
+        if (after && advanced_color_matches(*after, enabled)) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      } while (std::chrono::steady_clock::now() < deadline);
+
+      if ((!after || !advanced_color_matches(*after, enabled)) && before->v2) {
+        std::cout << "current_session_hdr_legacy_fallback=1"
+                  << " target_id=" << path.targetInfo.id << '\n';
+        if (set_advanced_color(adapter_luid, path.targetInfo.id, enabled)) {
+          const auto fallback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          do {
+            after = query_advanced_color(adapter_luid, path.targetInfo.id, &native_error);
+            if (after && advanced_color_matches(*after, enabled)) {
+              break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          } while (std::chrono::steady_clock::now() < fallback_deadline);
+        } else {
+          std::cerr << "current-session legacy advanced-color state change failed"
+                    << " target_id=" << path.targetInfo.id << '\n';
+        }
+      }
+
+      if (after) {
+        std::cout << "after_";
+        print_advanced_color(*after);
+      }
+      if (after && advanced_color_matches(*after, enabled)) {
+        ++matched;
+      } else {
+        std::cerr << "current-session HDR state did not converge"
+                  << " target_id=" << path.targetInfo.id
+                  << " requested=" << (enabled ? 1 : 0)
+                  << " native_error=" << native_error << '\n';
+      }
+      ++attempted;
+    }
+
+    std::cout << "current_session_hdr_requested=" << (enabled ? 1 : 0)
+              << " attempted=" << attempted
+              << " matched=" << matched << '\n';
+    return attempted != 0 && matched == attempted ? 0 : 1;
   }
 
   struct DisplayPathInfo {
@@ -1891,6 +2046,46 @@ int main(const int argc, char **argv) {
     return diagnose_control_devices();
   }
 
+  if (command == "--apply-extended-topology-current-session") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    const LONG result = apply_extended_topology_result();
+    if (result != ERROR_SUCCESS) {
+      std::cerr << "apply current-session extended topology failed native_error=" << result << '\n';
+      return 1;
+    }
+    std::cout << "current_session_extended_topology_applied=1\n";
+    return 0;
+  }
+
+  if (command == "--dump-display-config-current-session") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    dump_display_config_paths();
+    return 0;
+  }
+
+  if (command == "--set-hdr-current-session") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    if (argc == 4) {
+      FILE *redirected = nullptr;
+      if (freopen_s(&redirected, argv[3], "w", stdout) != 0 || redirected == nullptr) {
+        std::cerr << "open HDR proof output failed path=" << argv[3] << '\n';
+        return 2;
+      }
+      std::cerr.rdbuf(std::cout.rdbuf());
+    }
+    std::uint32_t enabled {};
+    if (!read_u32_arg(argc, argv, 2, 1, "HDR state", enabled)) {
+      return 2;
+    }
+    return set_current_session_hdr_state(enabled != 0);
+  }
+
   if (command == "--apply-extended-topology") {
     if (!require_command_arg_count(command, argc)) {
       return 2;
@@ -1962,7 +2157,17 @@ int main(const int argc, char **argv) {
     return associate_color_profile(*source_luid, source_id, widen_ascii(argv[4]), advanced_color, set_default);
   }
 
-  auto opened = vdd::open_first_control_device();
+  const bool remote_query = command == "--remote-query-permanent" || command == "--remote-query-state";
+  const bool remote_set = command == "--remote-set-permanent" || command == "--remote-set-hdr";
+  std::uint32_t remote_session_id {};
+  if ((remote_query || remote_set) &&
+      !read_u32_arg(argc, argv, 2, 0, "remote session id", remote_session_id)) {
+    return 2;
+  }
+
+  auto opened = (remote_query || remote_set) ?
+    vdd::open_remote_control_device_for_session(remote_session_id) :
+    vdd::open_first_control_device();
   if (!opened.ok()) {
     return fail("open control device failed", {opened.status, opened.native_error});
   }
@@ -2002,6 +2207,51 @@ int main(const int argc, char **argv) {
     return 0;
   }
 
+  if (command == "--remote-query-permanent") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    const auto result = client.query_permanent_display_count();
+    if (!result.ok()) {
+      return fail("query remote permanent count failed", result);
+    }
+    std::cout << "remote_session=" << remote_session_id
+              << " permanent=" << result.value.current_display_count
+              << " max=" << result.value.max_display_count
+              << " temporary=" << result.value.temporary_display_count
+              << " mode=" << result.value.width << 'x' << result.value.height << '@'
+              << (result.value.refresh_rate_millihz / 1000.0) << "Hz"
+              << " name=" << result.value.display_name << '\n';
+    return 0;
+  }
+
+  if (command == "--remote-query-state") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    const auto result = client.query_display_state();
+    if (!result.ok()) {
+      return fail("query remote display state failed", result);
+    }
+    std::cout << "remote_session=" << remote_session_id
+              << " permanent=" << result.value.permanent_display_count
+              << " temporary=" << result.value.temporary_display_count
+              << " entries=" << result.value.entry_count << '\n';
+    const auto entry_count = (std::min)(result.value.entry_count, vdd::kMaxDisplayStateEntries);
+    for (std::uint32_t index = 0; index < entry_count; ++index) {
+      const auto &entry = result.value.entries[index];
+      std::cout << "entry=" << index
+                << " kind=" << entry.kind
+                << " flags=0x" << std::hex << entry.flags << std::dec
+                << " display_id=" << entry.display_id
+                << " connector=" << entry.connector_index
+                << " mode=" << entry.width << 'x' << entry.height << '@'
+                << (entry.refresh_rate_millihz / 1000.0) << "Hz"
+                << " name=" << entry.display_name << '\n';
+    }
+    return 0;
+  }
+
   if (command == "--apply-manifest-topology") {
     if (!require_command_arg_count(command, argc)) {
       return 2;
@@ -2024,6 +2274,53 @@ int main(const int argc, char **argv) {
     std::cout << "permanent=" << result.value.current_display_count
               << " max=" << result.value.max_display_count
               << " temporary=" << result.value.temporary_display_count << '\n';
+    return 0;
+  }
+
+  if (command == "--remote-set-permanent") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    vdd::PermanentDisplayCountRequest request {};
+    if (!read_u32_arg(argc, argv, 3, 0, "permanent count", request.display_count)) {
+      return 2;
+    }
+    const auto result = client.set_permanent_display_count(request);
+    if (!result.ok()) {
+      return fail("set remote permanent count failed", result);
+    }
+    std::cout << "remote_session=" << remote_session_id
+              << " permanent=" << result.value.current_display_count
+              << " max=" << result.value.max_display_count
+              << " temporary=" << result.value.temporary_display_count << '\n';
+    return 0;
+  }
+
+  if (command == "--remote-set-hdr") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    vdd::SetDisplayHdrStateRequest request {};
+    if (!read_u64_arg(argc, argv, 3, 0, "display id", request.display_id) ||
+        !read_u32_arg(argc, argv, 4, 0, "HDR enabled state", request.enabled) ||
+        !read_u32_arg(
+          argc,
+          argv,
+          5,
+          vdd::kDefaultSdrWhiteLevelNits,
+          "SDR white level",
+          request.sdr_white_level_nits
+        )) {
+      return 2;
+    }
+    const auto result = client.set_display_hdr_state(request);
+    if (!result.ok()) {
+      return fail("set remote HDR state failed", result);
+    }
+    std::cout << "remote_session=" << remote_session_id
+              << " display_id=" << request.display_id
+              << " hdr_enabled=" << request.enabled
+              << " sdr_white_level_nits=" << request.sdr_white_level_nits << '\n';
     return 0;
   }
 

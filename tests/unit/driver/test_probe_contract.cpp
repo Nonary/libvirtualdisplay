@@ -29,6 +29,10 @@ TEST(VirtualDisplayProbeContract, ParsesIntegerTokensExactly) {
   EXPECT_FALSE(vdd::parse_probe_u32_token("-1").has_value());
   EXPECT_FALSE(vdd::parse_probe_u32_token("4294967296").has_value());
 
+  EXPECT_EQ(vdd::parse_probe_u64_token("8070450532247928833"), 8070450532247928833ull);
+  EXPECT_EQ(vdd::parse_probe_u64_token("18446744073709551615"), (std::numeric_limits<std::uint64_t>::max)());
+  EXPECT_FALSE(vdd::parse_probe_u64_token("18446744073709551616").has_value());
+
   EXPECT_EQ(vdd::parse_probe_i32_token("-2147483648"), (std::numeric_limits<std::int32_t>::min)());
   EXPECT_EQ(vdd::parse_probe_i32_token("2147483647"), (std::numeric_limits<std::int32_t>::max)());
   EXPECT_FALSE(vdd::parse_probe_i32_token("").has_value());
@@ -58,6 +62,9 @@ TEST(VirtualDisplayProbeContract, PlansProbeCommandArgcBoundsAndExecutionStage) 
 
   constexpr std::array kPlans {
     ExpectedPlan {"--diagnose", 2, 2, vdd::ProbeCommandExecutionStage::NoControlDevice},
+    ExpectedPlan {"--apply-extended-topology-current-session", 2, 2, vdd::ProbeCommandExecutionStage::NoControlDevice},
+    ExpectedPlan {"--dump-display-config-current-session", 2, 2, vdd::ProbeCommandExecutionStage::NoControlDevice},
+    ExpectedPlan {"--set-hdr-current-session", 3, 4, vdd::ProbeCommandExecutionStage::NoControlDevice},
     ExpectedPlan {"--apply-extended-topology", 2, 2, vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice},
     ExpectedPlan {"--query-color-profiles", 2, 2, vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice},
     ExpectedPlan {"--associate-color-profile", 5, (std::numeric_limits<int>::max)(), vdd::ProbeCommandExecutionStage::ActiveSessionBeforeControlDevice},
@@ -65,6 +72,10 @@ TEST(VirtualDisplayProbeContract, PlansProbeCommandArgcBoundsAndExecutionStage) 
     ExpectedPlan {"--query-permanent", 2, 2, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--apply-manifest-topology", 2, 2, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},
     ExpectedPlan {"--set-permanent", 3, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
+    ExpectedPlan {"--remote-query-permanent", 3, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
+    ExpectedPlan {"--remote-query-state", 3, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
+    ExpectedPlan {"--remote-set-permanent", 4, 4, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
+    ExpectedPlan {"--remote-set-hdr", 5, 6, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-permanent", 2, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-temp", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-4k240", 2, 3, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},

@@ -44,7 +44,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 7;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 8;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
   inline constexpr std::uint16_t kMinimumCompatibleProtocolVersionMinor = 6;
 
@@ -68,6 +68,9 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kDefaultHdrMaxLuminanceNits = 1000;
   inline constexpr std::uint32_t kMinHdrMaxLuminanceNits = 400;
   inline constexpr std::uint32_t kMaxHdrMaxLuminanceNits = 2000;
+  inline constexpr std::uint32_t kDefaultSdrWhiteLevelNits = 80;
+  inline constexpr std::uint32_t kMinSdrWhiteLevelNits = 80;
+  inline constexpr std::uint32_t kMaxSdrWhiteLevelNits = 480;
   inline constexpr std::uint32_t kCreateTemporaryDisplayFlagEphemeralIdentity = 0x00000001u;
   inline constexpr std::uint32_t kCreateTemporaryDisplayKnownFlags =
     kCreateTemporaryDisplayFlagEphemeralIdentity;
@@ -107,6 +110,7 @@ namespace virtual_display::driver {
     SetRenderAdapter = 0x90b,
     CreateTemporaryDisplayOwned = 0x90c,
     ReclaimTemporaryDisplay = 0x90d,
+    SetDisplayHdrState = 0x90e,
   };
 
   enum class IoctlAccess : std::uint32_t {
@@ -153,6 +157,8 @@ namespace virtual_display::driver {
     ioctl_code(IoctlFunction::CreateTemporaryDisplayOwned, IoctlAccess::ReadWrite);
   inline constexpr std::uint32_t kIoctlReclaimTemporaryDisplay =
     ioctl_code(IoctlFunction::ReclaimTemporaryDisplay, IoctlAccess::ReadWrite);
+  inline constexpr std::uint32_t kIoctlSetDisplayHdrState =
+    ioctl_code(IoctlFunction::SetDisplayHdrState, IoctlAccess::ReadWrite);
 
   struct ProtocolVersion {
     Guid api_namespace {kApiNamespaceGuid};
@@ -199,6 +205,15 @@ namespace virtual_display::driver {
   struct SetRenderAdapterRequest {
     Guid api_namespace {kApiNamespaceGuid};
     AdapterLuid adapter_luid {};
+    std::uint32_t flags {};
+    std::uint32_t reserved {};
+  };
+
+  struct SetDisplayHdrStateRequest {
+    Guid api_namespace {kApiNamespaceGuid};
+    std::uint64_t display_id {};
+    std::uint32_t enabled {};
+    std::uint32_t sdr_white_level_nits {kDefaultSdrWhiteLevelNits};
     std::uint32_t flags {};
     std::uint32_t reserved {};
   };
@@ -353,6 +368,8 @@ namespace virtual_display::driver {
     InvalidHeight,
     InvalidPhysicalSize,
     InvalidHdrLuminance,
+    InvalidHdrState,
+    InvalidSdrWhiteLevel,
     InvalidRefreshRate,
     InvalidDisplayName,
     PermanentDisplayCountTooHigh,
@@ -427,6 +444,7 @@ namespace virtual_display::driver {
     ValidatedCreateTemporaryDisplay *validated = nullptr
   );
   ValidationError validate_reclaim_temporary_display(const ReclaimTemporaryDisplayRequest &request);
+  ValidationError validate_set_display_hdr_state(const SetDisplayHdrStateRequest &request);
   ValidationError validate_lease_display_request(const LeaseDisplayRequest &request);
   ValidationError validate_lease_request(const LeaseRequest &request);
   ValidationError validate_permanent_display_count(
@@ -452,6 +470,7 @@ namespace virtual_display::driver {
   static_assert(sizeof(ReclaimTemporaryDisplayRequest) == 72);
   static_assert(sizeof(ReclaimTemporaryDisplayResult) == 48);
   static_assert(sizeof(SetRenderAdapterRequest) == 32);
+  static_assert(sizeof(SetDisplayHdrStateRequest) == 40);
   static_assert(sizeof(LeaseDisplayRequest) == 32);
   static_assert(sizeof(LeaseRequest) == 32);
   static_assert(sizeof(QueryLeaseResult) == 48);

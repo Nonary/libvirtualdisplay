@@ -233,6 +233,30 @@ namespace virtual_display::driver {
     return ValidationError::None;
   }
 
+  ValidationError validate_set_display_hdr_state(const SetDisplayHdrStateRequest &request) {
+    if (!is_valid_api_namespace(request.api_namespace)) {
+      return ValidationError::WrongApiNamespace;
+    }
+    if (request.display_id == 0) {
+      return ValidationError::MissingDisplayId;
+    }
+    if (request.enabled > 1) {
+      return ValidationError::InvalidHdrState;
+    }
+    if (request.sdr_white_level_nits < kMinSdrWhiteLevelNits ||
+        request.sdr_white_level_nits > kMaxSdrWhiteLevelNits) {
+      return ValidationError::InvalidSdrWhiteLevel;
+    }
+    if (request.flags != 0) {
+      return ValidationError::InvalidFlags;
+    }
+    if (request.reserved != 0) {
+      return ValidationError::InvalidReservedField;
+    }
+
+    return ValidationError::None;
+  }
+
   ValidationError validate_lease_display_request(const LeaseDisplayRequest &request) {
     if (!is_valid_api_namespace(request.api_namespace)) {
       return ValidationError::WrongApiNamespace;
@@ -430,6 +454,10 @@ namespace virtual_display::driver {
         return "invalid_physical_size";
       case ValidationError::InvalidHdrLuminance:
         return "invalid_hdr_luminance";
+      case ValidationError::InvalidHdrState:
+        return "invalid_hdr_state";
+      case ValidationError::InvalidSdrWhiteLevel:
+        return "invalid_sdr_white_level";
       case ValidationError::InvalidRefreshRate:
         return "invalid_refresh_rate";
       case ValidationError::InvalidDisplayName:

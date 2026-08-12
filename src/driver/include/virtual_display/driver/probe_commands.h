@@ -26,6 +26,7 @@ namespace virtual_display::driver {
   std::uint32_t saturating_u32(std::uint64_t value);
   std::uint32_t refresh_millihz_from_hz(std::uint32_t refresh_hz);
   std::optional<std::uint32_t> parse_probe_u32_token(std::string_view text);
+  std::optional<std::uint64_t> parse_probe_u64_token(std::string_view text);
   std::optional<std::int32_t> parse_probe_i32_token(std::string_view text);
   bool probe_arg_count_valid(int argc, int minimum, int maximum);
   std::optional<ProbeCommandPlan> probe_command_plan(std::string_view command);

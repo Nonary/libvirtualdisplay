@@ -155,6 +155,9 @@ namespace {
     bool arriving {};
     bool departing {};
     bool orphaned_late_arrival {};
+    bool display_config_initialized {};
+    bool hdr_requested {};
+    std::uint32_t sdr_white_level_nits {vdd::kDefaultSdrWhiteLevelNits};
     std::uint32_t assign_callbacks_in_flight {};
     std::uint32_t unassign_callbacks_in_flight {};
     IDDCX_DEFAULT_HDR_METADATA_TYPE default_hdr_metadata_type {IDDCX_HDRMETADATA_TYPE_UNINITIALIZED};
@@ -1273,6 +1276,7 @@ namespace {
     IDDCX_TARGET_MODE2 mode {};
     mode.Size = sizeof(mode);
     mode.TargetVideoSignalInfo.targetVideoSignalInfo = make_signal_info(shape, false);
+    mode.RequiredBandwidth = 0;
     populate_rgb_wire_bits(mode.BitsPerComponent, preferred_rgb_bits_per_component());
     return mode;
   }
@@ -2158,6 +2162,8 @@ namespace {
         for (;;) {
           IDXGIResource *surface_ptr = nullptr;
           HRESULT acquire_result = E_FAIL;
+          bool has_metadata2 = false;
+          IDDCX_METADATA2 metadata2 {};
           if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
             IDARG_IN_RELEASEANDACQUIREBUFFER2 input {};
             input.Size = sizeof(input);
@@ -2165,6 +2171,8 @@ namespace {
             acquired.MetaData.Size = sizeof(acquired.MetaData);
             acquire_result = IddCxSwapChainReleaseAndAcquireBuffer2(swapchain_, &input, &acquired);
             surface_ptr = acquired.MetaData.pSurface;
+            has_metadata2 = true;
+            metadata2 = acquired.MetaData;
           } else {
             IDARG_OUT_RELEASEANDACQUIREBUFFER acquired {};
             acquire_result = IddCxSwapChainReleaseAndAcquireBuffer(swapchain_, &acquired);
@@ -2212,6 +2220,25 @@ namespace {
 
           Microsoft::WRL::ComPtr<IDXGIResource> surface;
           surface.Attach(surface_ptr);
+          if (!first_frame_logged_.exchange(true, std::memory_order_acq_rel)) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            D3D11_TEXTURE2D_DESC description {};
+            if (surface && SUCCEEDED(surface.As(&texture)) && texture) {
+              texture->GetDesc(&description);
+            }
+            TraceLoggingWrite(
+              g_trace_provider,
+              "SwapChainFirstFrame",
+              TraceLoggingUInt32(description.Width, "Width"),
+              TraceLoggingUInt32(description.Height, "Height"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(description.Format), "Format"),
+              TraceLoggingBool(has_metadata2, "HasMetadata2"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(metadata2.SurfaceColorSpace), "SurfaceColorSpace"),
+              TraceLoggingUInt32(metadata2.SdrWhiteLevel, "SdrWhiteLevelNits"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(metadata2.ValidFlags), "MetadataValidFlags"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(metadata2.Hdr10FrameMetaData.Type), "HdrMetadataType")
+            );
+          }
           // Drop the acquired surface before reporting the frame complete so
           // IddCx can reclaim the buffer during unassign/departure.
           surface.Reset();
@@ -2259,6 +2286,7 @@ namespace {
     HANDLE next_surface_available_ {};
     HANDLE stop_event_ {};
     std::atomic<bool> stop_requested_ {false};
+    std::atomic<bool> first_frame_logged_ {false};
     std::thread worker_ {};
     std::mutex assignment_mutex_ {};
     std::condition_variable assignment_changed_ {};
@@ -2589,7 +2617,15 @@ namespace {
     }
 
     vdd::BackendDisplayResult arrive_temporary_display(const vdd::DisplayDescriptor &descriptor) override {
-      return arrive_display(descriptor, false);
+      auto result = arrive_display(descriptor, false);
+      if constexpr (kRemoteSessionDriver) {
+        if (result.error == vdd::BackendError::None &&
+            update_remote_display_config("TemporaryMonitorArrival") != vdd::BackendError::None) {
+          (void) depart_display(descriptor.display_id, descriptor.generation);
+          result = {vdd::BackendError::Failed, {}, 0};
+        }
+      }
+      return result;
     }
 
     vdd::BackendError reserve_temporary_display_identity(const vdd::DisplayDescriptor &descriptor) override {
@@ -2685,6 +2721,9 @@ namespace {
           for (const auto &restore_descriptor: active_permanent_descriptors) {
             (void) arrive_display(restore_descriptor, true);
           }
+          if constexpr (kRemoteSessionDriver) {
+            (void) update_remote_display_config("PermanentManifestDepartureRollback");
+          }
           return vdd::BackendError::Failed;
         }
       }
@@ -2700,11 +2739,73 @@ namespace {
           for (const auto &restore_descriptor: active_permanent_descriptors) {
             (void) arrive_display(restore_descriptor, true);
           }
+          if constexpr (kRemoteSessionDriver) {
+            (void) update_remote_display_config("PermanentManifestArrivalRollback");
+          }
           return vdd::BackendError::Failed;
         }
         added.push_back(descriptor.display_id);
       }
 
+      if constexpr (kRemoteSessionDriver) {
+        if (update_remote_display_config("PermanentManifestApplied") != vdd::BackendError::None) {
+          for (const auto display_id: added) {
+            (void) depart_display(display_id);
+          }
+          for (const auto &restore_descriptor: active_permanent_descriptors) {
+            (void) arrive_display(restore_descriptor, true);
+          }
+          (void) update_remote_display_config("PermanentManifestConfigRollback");
+          return vdd::BackendError::Failed;
+        }
+      }
+
+      return vdd::BackendError::None;
+    }
+
+    vdd::BackendError set_display_hdr_state(const vdd::SetDisplayHdrStateRequest &request) override {
+      if constexpr (!kRemoteSessionDriver) {
+        return vdd::BackendError::Failed;
+      }
+
+      bool old_hdr_requested = false;
+      std::uint32_t old_sdr_white_level_nits = vdd::kDefaultSdrWhiteLevelNits;
+      {
+        std::lock_guard lock {mutex_};
+        const auto monitor = monitors_.find(request.display_id);
+        if (monitor == monitors_.end() || monitor->second.arriving || monitor->second.departing) {
+          return vdd::BackendError::Failed;
+        }
+        if (request.enabled != 0 &&
+            (!runtime_hdr_supported() || !vdd::has_hdr_static_metadata(monitor->second.descriptor.edid))) {
+          return vdd::BackendError::Failed;
+        }
+        old_hdr_requested = monitor->second.hdr_requested;
+        old_sdr_white_level_nits = monitor->second.sdr_white_level_nits;
+        monitor->second.hdr_requested = request.enabled != 0;
+        monitor->second.sdr_white_level_nits = request.sdr_white_level_nits;
+      }
+
+      const auto result = update_remote_display_config("SetDisplayHdrState");
+      if (result != vdd::BackendError::None) {
+        {
+          std::lock_guard lock {mutex_};
+          if (const auto monitor = monitors_.find(request.display_id); monitor != monitors_.end()) {
+            monitor->second.hdr_requested = old_hdr_requested;
+            monitor->second.sdr_white_level_nits = old_sdr_white_level_nits;
+          }
+        }
+        (void) update_remote_display_config("SetDisplayHdrStateRollback");
+        return result;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "RemoteDisplayHdrStateSet",
+        TraceLoggingUInt64(request.display_id, "DisplayId"),
+        TraceLoggingBool(request.enabled != 0, "Enabled"),
+        TraceLoggingUInt32(request.sdr_white_level_nits, "SdrWhiteLevelNits")
+      );
       return vdd::BackendError::None;
     }
 
@@ -2918,6 +3019,16 @@ namespace {
         } else {
           (void) setup_hardware_cursor(path.MonitorObject);
         }
+        TraceLoggingWrite(
+          g_trace_provider,
+          "CommitModes2Path",
+          TraceLoggingUInt32(index, "PathIndex"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(path.Flags), "Flags"),
+          TraceLoggingUInt32(path.TargetVideoSignalInfo.activeSize.cx, "Width"),
+          TraceLoggingUInt32(path.TargetVideoSignalInfo.activeSize.cy, "Height"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(path.WireFormatInfo.ColorSpace), "ColorSpace"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(path.WireFormatInfo.BitsPerComponent.Rgb), "RgbBitsPerComponent")
+        );
       }
 
       return STATUS_SUCCESS;
@@ -3057,6 +3168,176 @@ namespace {
     }
 
   private:
+    vdd::BackendError update_remote_display_config(const char *source) {
+      if constexpr (!kRemoteSessionDriver) {
+        return vdd::BackendError::Failed;
+      }
+      if (!IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes2) ||
+          !IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterDisplayConfigUpdate2)) {
+        TraceLoggingWrite(g_trace_provider, "RemoteDisplayConfigDdiUnavailable");
+        return vdd::BackendError::Failed;
+      }
+
+      struct RemoteMonitorSnapshot {
+        std::uint64_t display_id {};
+        IDDCX_MONITOR monitor {};
+        vdd::DisplayDescriptor descriptor {};
+        bool display_config_initialized {};
+        bool hdr_requested {};
+        std::uint32_t sdr_white_level_nits {vdd::kDefaultSdrWhiteLevelNits};
+      };
+
+      IDDCX_ADAPTER adapter {};
+      std::vector<RemoteMonitorSnapshot> monitors;
+      std::vector<WdfObjectReferenceGuard> monitor_references;
+      WdfObjectReferenceGuard adapter_reference;
+      {
+        std::lock_guard lock {mutex_};
+        if (shutting_down_ || !adapter_ready_ || !adapter_) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "RemoteDisplayConfigBlockedAdapterNotReady",
+            TraceLoggingBool(shutting_down_, "ShuttingDown"),
+            TraceLoggingBool(adapter_ready_, "AdapterReady")
+          );
+          return vdd::BackendError::Failed;
+        }
+
+        adapter = adapter_;
+        adapter_reference = WdfObjectReferenceGuard {reinterpret_cast<WDFOBJECT>(adapter)};
+        monitors.reserve(monitors_.size());
+        monitor_references.reserve(monitors_.size());
+        for (const auto &[display_id, record]: monitors_) {
+          if (record.arriving || record.departing || !record.monitor) {
+            continue;
+          }
+          monitors.push_back({
+            display_id,
+            record.monitor,
+            record.descriptor,
+            record.display_config_initialized,
+            record.hdr_requested,
+            record.sdr_white_level_nits
+          });
+          monitor_references.emplace_back(reinterpret_cast<WDFOBJECT>(record.monitor));
+        }
+      }
+
+      if (monitors.empty()) {
+        TraceLoggingWrite(g_trace_provider, "RemoteDisplayConfigNoMonitors");
+        return vdd::BackendError::Failed;
+      }
+      std::sort(monitors.begin(), monitors.end(), [](const auto &left, const auto &right) {
+        return left.descriptor.connector_index < right.descriptor.connector_index;
+      });
+
+      for (const auto &monitor: monitors) {
+        const auto requested_shape = mode_shape_from_descriptor(monitor.descriptor);
+        const auto [shapes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
+          std::optional<ModeShape> {requested_shape},
+          &requested_shape
+        );
+        (void) preferred_index;
+        if (shapes.empty()) {
+          return vdd::BackendError::Failed;
+        }
+
+        std::vector<IDDCX_TARGET_MODE2> target_modes;
+        target_modes.reserve(shapes.size());
+        for (const auto &shape: shapes) {
+          target_modes.push_back(make_target_mode2(shape));
+        }
+
+        IDARG_IN_UPDATEMODES2 update_modes {};
+        update_modes.Reason = IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
+        update_modes.TargetModeCount = static_cast<UINT>(target_modes.size());
+        update_modes.pTargetModes = target_modes.data();
+        const auto status = IddCxMonitorUpdateModes2(monitor.monitor, &update_modes);
+        TraceLoggingWrite(
+          g_trace_provider,
+          "RemoteMonitorModesUpdated",
+          TraceLoggingString(source, "Source"),
+          TraceLoggingUInt64(monitor.display_id, "DisplayId"),
+          TraceLoggingUInt32(update_modes.TargetModeCount, "ModeCount"),
+          TraceLoggingInt32(status, "Status")
+        );
+        if (!NT_SUCCESS(status)) {
+          return vdd::BackendError::Failed;
+        }
+      }
+
+      std::vector<IDDCX_DISPLAYCONFIGPATH2> paths(monitors.size());
+      LONG position_x = 0;
+      std::uint32_t hdr_path_count = 0;
+      for (std::size_t index = 0; index < monitors.size(); ++index) {
+        const auto &monitor = monitors[index];
+        auto &path = paths[index];
+        path.Size = sizeof(path);
+        path.Flags = IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID;
+        path.MonitorObject = monitor.monitor;
+        path.Mode.Position = {position_x, 0};
+        path.Mode.Resolution = {monitor.descriptor.width, monitor.descriptor.height};
+        path.Mode.Rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+        path.Mode.RefreshRate = {monitor.descriptor.refresh_rate_millihz, 1000};
+        path.Mode.VSyncFreqDivider = 1;
+        path.Mode.MonitorColorMode = monitor.hdr_requested ?
+          IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_HDR10 :
+          IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_SDR;
+        path.MonitorScaleFactor = 100;
+        if (!monitor.display_config_initialized) {
+          path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID;
+        }
+        if (monitor.hdr_requested) {
+          ++hdr_path_count;
+          path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_COLORIMETRY_VALID |
+                        IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SDRWHITELEVEL_VALID;
+          path.MonitorColorimetry.RedPoint = {725, 299};
+          path.MonitorColorimetry.GreenPoint = {174, 816};
+          path.MonitorColorimetry.BluePoint = {134, 47};
+          path.MonitorColorimetry.WhitePoint = {320, 337};
+          path.MonitorColorimetry.MinLuminance = 50;
+          path.MonitorColorimetry.MaxLuminance = 10'000'000;
+          path.MonitorColorimetry.MaxFullFrameLuminance = 4'000'000;
+          path.MonitorColorimetry.BitsPerComponent.Rgb = static_cast<IDDCX_BITS_PER_COMPONENT>(
+            IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10
+          );
+          path.MonitorColorimetry.Flags = static_cast<IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS>(
+            IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS_BT2020RGB |
+            IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS_ST2084
+          );
+          path.MonitorSdrWhiteLevel = monitor.sdr_white_level_nits;
+        }
+        position_x += static_cast<LONG>(monitor.descriptor.width);
+      }
+
+      IDARG_IN_ADAPTERDISPLAYCONFIGUPDATE2 update {};
+      update.PathCount = static_cast<UINT>(paths.size());
+      update.pPaths = paths.data();
+      const auto hr = IddCxAdapterDisplayConfigUpdate2(adapter, &update);
+      TraceLoggingWrite(
+        g_trace_provider,
+        "RemoteDisplayConfigUpdated",
+        TraceLoggingString(source, "Source"),
+        TraceLoggingUInt32(update.PathCount, "PathCount"),
+        TraceLoggingUInt32(hdr_path_count, "HdrPathCount"),
+        TraceLoggingUInt32(static_cast<std::uint32_t>(hr), "HResult")
+      );
+      if (FAILED(hr)) {
+        return vdd::BackendError::Failed;
+      }
+
+      {
+        std::lock_guard lock {mutex_};
+        for (const auto &snapshot: monitors) {
+          if (const auto current = monitors_.find(snapshot.display_id);
+              current != monitors_.end() && current->second.monitor == snapshot.monitor) {
+            current->second.display_config_initialized = true;
+          }
+        }
+      }
+      return vdd::BackendError::None;
+    }
+
     NTSTATUS setup_hardware_cursor(IDDCX_MONITOR monitor) {
       if (!monitor) {
         return STATUS_INVALID_PARAMETER;

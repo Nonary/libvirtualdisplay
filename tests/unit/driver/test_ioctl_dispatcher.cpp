@@ -51,8 +51,14 @@ namespace {
       return vdd::BackendError::None;
     }
 
+    vdd::BackendError set_display_hdr_state(const vdd::SetDisplayHdrStateRequest &request) override {
+      hdr_state_requests.push_back(request);
+      return fail_hdr_state ? vdd::BackendError::Failed : vdd::BackendError::None;
+    }
+
     bool fail_arrive {};
     bool fail_depart {};
+    bool fail_hdr_state {};
     std::uint32_t next_target_id {12};
     std::vector<vdd::DisplayDescriptor> arrived {};
     std::vector<std::uint64_t> departed {};
@@ -60,6 +66,7 @@ namespace {
     std::vector<vdd::PermanentDisplayCountRequest> permanent_settings {};
     std::vector<vdd::DisplayManifest> manifests {};
     std::vector<vdd::SetRenderAdapterRequest> render_adapter_requests {};
+    std::vector<vdd::SetDisplayHdrStateRequest> hdr_state_requests {};
   };
 
   struct Harness {
@@ -686,6 +693,40 @@ TEST(VirtualDisplayDriverIoctlDispatcher, SetPermanentDisplayCountRejectsShortOu
   EXPECT_EQ(result.bytes_returned, 0u);
   EXPECT_TRUE(harness.backend.permanent_counts.empty());
   EXPECT_EQ(harness.controller.query_permanent_display_count().current_display_count, 0u);
+}
+
+TEST(VirtualDisplayDriverIoctlDispatcher, SetDisplayHdrStateValidatesAndInvokesBackend) {
+  Harness harness;
+  vdd::SetDisplayHdrStateRequest request {};
+  request.display_id = 0x7000000000000001ull;
+  request.enabled = 1;
+  request.sdr_white_level_nits = 203;
+
+  const auto result = harness.dispatcher.dispatch(
+    vdd::kIoctlSetDisplayHdrState,
+    &request,
+    sizeof(request),
+    nullptr,
+    0,
+    std::chrono::steady_clock::now()
+  );
+
+  EXPECT_EQ(result.status, vdd::IoctlStatus::Success);
+  ASSERT_EQ(harness.backend.hdr_state_requests.size(), 1u);
+  EXPECT_EQ(harness.backend.hdr_state_requests[0].display_id, request.display_id);
+  EXPECT_EQ(harness.backend.hdr_state_requests[0].sdr_white_level_nits, 203u);
+
+  request.enabled = 2;
+  const auto invalid = harness.dispatcher.dispatch(
+    vdd::kIoctlSetDisplayHdrState,
+    &request,
+    sizeof(request),
+    nullptr,
+    0,
+    std::chrono::steady_clock::now()
+  );
+  EXPECT_EQ(invalid.status, vdd::IoctlStatus::InvalidRequest);
+  EXPECT_EQ(harness.backend.hdr_state_requests.size(), 1u);
 }
 
 TEST(VirtualDisplayDriverIoctlDispatcher, RejectsUnknownIoctl) {
