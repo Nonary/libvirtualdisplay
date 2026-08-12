@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include <SetupAPI.h>
+#include <initguid.h>
 #include <devpkey.h>
 
 #include <algorithm>
