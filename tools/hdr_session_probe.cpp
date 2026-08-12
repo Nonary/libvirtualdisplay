@@ -6,6 +6,11 @@
 
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
+#include <Windows.Graphics.Capture.Interop.h>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -18,6 +23,10 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <cmath>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -26,10 +35,52 @@
 
 using Microsoft::WRL::ComPtr;
 
+extern "C" {
+  HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(
+    IDXGIDevice *dxgi_device,
+    IInspectable **graphics_device
+  );
+}
+
+struct
+#if WINRT_IMPL_HAS_DECLSPEC_UUID
+  __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1"))
+#endif
+  IDirect3DDxgiInterfaceAccess: IUnknown {
+  virtual HRESULT __stdcall GetInterface(REFIID id, IUnknown **object) = 0;
+};
+
+#if !WINRT_IMPL_HAS_DECLSPEC_UUID
+static constexpr GUID GUID__IDirect3DDxgiInterfaceAccess = {
+  0xA9B3D012,
+  0x3DF2,
+  0x4EE3,
+  {0xB8, 0xD1, 0x86, 0x95, 0xF4, 0x57, 0xD3, 0xC1}
+};
+
+template<>
+constexpr auto __mingw_uuidof<IDirect3DDxgiInterfaceAccess>() -> GUID const & {
+  return GUID__IDirect3DDxgiInterfaceAccess;
+}
+#endif
+
+using GraphicsCaptureItem = winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
+using Direct3D11CaptureFramePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool;
+using GraphicsCaptureSession = winrt::Windows::Graphics::Capture::GraphicsCaptureSession;
+using DirectXPixelFormat = winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+using IDirect3DDevice = winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+using SizeInt32 = winrt::Windows::Graphics::SizeInt32;
+
 namespace {
   struct Options {
     std::filesystem::path output_prefix {L"hdr-session-proof"};
     std::uint32_t duration_seconds {30};
+    enum class WgcMode {
+      none,
+      window,
+      monitor,
+      both,
+    } wgc_mode {WgcMode::none};
   };
 
   struct OutputSelection {
@@ -37,6 +88,59 @@ namespace {
     ComPtr<IDXGIOutput> output;
     DXGI_OUTPUT_DESC description {};
   };
+
+  struct WgcCaptureResult {
+    UINT width {};
+    UINT height {};
+    UINT row_pitch {};
+    DXGI_FORMAT format {DXGI_FORMAT_UNKNOWN};
+    std::uint64_t fnv1a64 {};
+    std::array<float, 4> minimum {
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+    };
+    std::array<float, 4> maximum {
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+    };
+    std::array<std::array<float, 4>, 5> band_centers {};
+    std::uint64_t non_finite_count {};
+    bool any_rgb_greater_than_one {};
+  };
+
+  float half_to_float(const std::uint16_t value) {
+    const int sign = (value >> 15) != 0 ? -1 : 1;
+    const int exponent = (value >> 10) & 0x1f;
+    const int mantissa = value & 0x3ff;
+    if (exponent == 0) {
+      return static_cast<float>(sign) * std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+    }
+    if (exponent == 0x1f) {
+      if (mantissa == 0) {
+        return sign < 0 ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+      }
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    return static_cast<float>(sign) * std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, exponent - 15);
+  }
+
+  std::string wgc_mode_name(const Options::WgcMode mode) {
+    switch (mode) {
+    case Options::WgcMode::window:
+      return "window";
+    case Options::WgcMode::monitor:
+      return "monitor";
+    case Options::WgcMode::both:
+      return "both";
+    case Options::WgcMode::none:
+      return "none";
+    }
+    return "unknown";
+  }
 
   std::string narrow_ascii(const std::wstring_view value) {
     std::string result;
@@ -73,6 +177,17 @@ namespace {
         options.output_prefix = argv[++index];
       } else if (argument == L"--duration-seconds" && index + 1 < argc) {
         if (!parse_u32(argv[++index], options.duration_seconds) || options.duration_seconds == 0) {
+          return false;
+        }
+      } else if (argument == L"--wgc-mode" && index + 1 < argc) {
+        const std::wstring_view mode {argv[++index]};
+        if (mode == L"window") {
+          options.wgc_mode = Options::WgcMode::window;
+        } else if (mode == L"monitor") {
+          options.wgc_mode = Options::WgcMode::monitor;
+        } else if (mode == L"both") {
+          options.wgc_mode = Options::WgcMode::both;
+        } else {
           return false;
         }
       } else {
@@ -183,6 +298,360 @@ namespace {
     return capture.good();
   }
 
+  bool create_graphics_capture_item(
+    HWND window,
+    HMONITOR monitor,
+    GraphicsCaptureItem &item,
+    std::ostream &log,
+    const std::string_view label
+  ) {
+    try {
+      auto activation_factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+      const HRESULT result = window ? activation_factory->CreateForWindow(
+        window,
+        winrt::guid_of<GraphicsCaptureItem>(),
+        winrt::put_abi(item)
+      ) : activation_factory->CreateForMonitor(
+        monitor,
+        winrt::guid_of<GraphicsCaptureItem>(),
+        winrt::put_abi(item)
+      );
+      log << "wgc_" << label << "_item_result=" << hex_hresult(result) << '\n';
+      return SUCCEEDED(result) && item;
+    } catch (const winrt::hresult_error &error) {
+      log << "wgc_" << label << "_item_exception=" << hex_hresult(error.code().value) << '\n';
+      return false;
+    }
+  }
+
+  class WgcCapture {
+  public:
+    WgcCapture(
+      std::string label,
+      GraphicsCaptureItem item,
+      IDirect3DDevice winrt_device,
+      ID3D11Device *device,
+      ID3D11DeviceContext *context,
+      std::mutex &context_mutex,
+      std::filesystem::path output_path,
+      std::ostream &log
+    ):
+      label_(std::move(label)),
+      item_(std::move(item)),
+      winrt_device_(std::move(winrt_device)),
+      device_(device),
+      context_(context),
+      context_mutex_(context_mutex),
+      output_path_(std::move(output_path)),
+      log_(log) {}
+
+    WgcCapture(const WgcCapture &) = delete;
+    WgcCapture &operator=(const WgcCapture &) = delete;
+
+    ~WgcCapture() {
+      stop();
+    }
+
+    bool start() {
+      try {
+        const auto item_size = item_.Size();
+        if (item_size.Width <= 0 || item_size.Height <= 0) {
+          set_failure("invalid_item_size");
+          return false;
+        }
+        width_ = static_cast<UINT>(item_size.Width);
+        height_ = static_cast<UINT>(item_size.Height);
+        frame_pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(
+          winrt_device_,
+          DirectXPixelFormat::R16G16B16A16Float,
+          2,
+          SizeInt32 {item_size.Width, item_size.Height}
+        );
+        if (!frame_pool_) {
+          set_failure("frame_pool_null");
+          return false;
+        }
+        frame_arrived_token_ = frame_pool_.FrameArrived([this](
+          Direct3D11CaptureFramePool const &sender,
+          winrt::Windows::Foundation::IInspectable const &
+        ) {
+          process_frame(sender);
+        });
+        closed_token_ = item_.Closed([this](
+          GraphicsCaptureItem const &,
+          winrt::Windows::Foundation::IInspectable const &
+        ) {
+          set_failure("capture_item_closed");
+        });
+        capture_session_ = frame_pool_.CreateCaptureSession(item_);
+        capture_session_.StartCapture();
+        log_ << "wgc_" << label_ << "_started=1\n"
+             << "wgc_" << label_ << "_item_width=" << width_ << '\n'
+             << "wgc_" << label_ << "_item_height=" << height_ << '\n'
+             << "wgc_" << label_ << "_requested_format="
+             << static_cast<std::uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT) << '\n';
+        return true;
+      } catch (const winrt::hresult_error &error) {
+        set_failure(std::string("start_exception_") + hex_hresult(error.code().value));
+        return false;
+      }
+    }
+
+    bool complete() const {
+      std::lock_guard lock(state_mutex_);
+      return complete_;
+    }
+
+    bool failed() const {
+      std::lock_guard lock(state_mutex_);
+      return failed_;
+    }
+
+    void timeout() {
+      set_failure("timeout");
+    }
+
+    bool succeeded() const {
+      std::lock_guard lock(state_mutex_);
+      return complete_ && !failed_;
+    }
+
+  private:
+    bool enter_callback() {
+      std::lock_guard lock(state_mutex_);
+      if (stopping_ || complete_ || failed_) {
+        return false;
+      }
+      ++active_callbacks_;
+      return true;
+    }
+
+    void leave_callback() {
+      std::lock_guard lock(state_mutex_);
+      --active_callbacks_;
+      state_cv_.notify_all();
+    }
+
+    void set_failure(const std::string_view reason) {
+      std::lock_guard lock(state_mutex_);
+      if (!complete_ && !failed_) {
+        failed_ = true;
+        failure_reason_ = reason;
+        log_ << "wgc_" << label_ << "_failure=" << failure_reason_ << '\n';
+      }
+    }
+
+    void process_frame(Direct3D11CaptureFramePool const &sender) {
+      if (!enter_callback()) {
+        return;
+      }
+      try {
+        auto frame = sender.TryGetNextFrame();
+        while (auto next = sender.TryGetNextFrame()) {
+          frame = std::move(next);
+        }
+        if (!frame) {
+          leave_callback();
+          return;
+        }
+
+        auto surface = frame.Surface();
+        ComPtr<IDirect3DDxgiInterfaceAccess> surface_access;
+        HRESULT result = winrt::get_unknown(surface)->QueryInterface(
+          __uuidof(IDirect3DDxgiInterfaceAccess),
+          reinterpret_cast<void **>(surface_access.GetAddressOf())
+        );
+        if (FAILED(result)) {
+          set_failure(std::string("surface_access_") + hex_hresult(result));
+          leave_callback();
+          return;
+        }
+
+        ComPtr<ID3D11Texture2D> source;
+        result = surface_access->GetInterface(
+          __uuidof(ID3D11Texture2D),
+          reinterpret_cast<IUnknown **>(source.GetAddressOf())
+        );
+        if (FAILED(result) || !source) {
+          set_failure(std::string("surface_texture_") + hex_hresult(result));
+          leave_callback();
+          return;
+        }
+
+        D3D11_TEXTURE2D_DESC source_description {};
+        source->GetDesc(&source_description);
+        if (source_description.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+          set_failure("unexpected_format");
+          leave_callback();
+          return;
+        }
+        D3D11_TEXTURE2D_DESC staging_description = source_description;
+        staging_description.Usage = D3D11_USAGE_STAGING;
+        staging_description.BindFlags = 0;
+        staging_description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_description.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        result = device_->CreateTexture2D(&staging_description, nullptr, &staging);
+        if (FAILED(result)) {
+          set_failure(std::string("create_staging_") + hex_hresult(result));
+          leave_callback();
+          return;
+        }
+
+        const std::uint32_t packed_row_bytes = source_description.Width * 4u * sizeof(std::uint16_t);
+        std::vector<std::uint8_t> packed(
+          static_cast<std::size_t>(packed_row_bytes) * source_description.Height
+        );
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        {
+          std::lock_guard context_lock(context_mutex_);
+          context_->CopyResource(staging.Get(), source.Get());
+          result = context_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+          if (FAILED(result)) {
+            set_failure(std::string("map_staging_") + hex_hresult(result));
+            leave_callback();
+            return;
+          }
+          for (UINT y = 0; y < source_description.Height; ++y) {
+            const auto *row = static_cast<const std::uint8_t *>(mapped.pData) + y * mapped.RowPitch;
+            std::copy_n(row, packed_row_bytes, packed.data() + static_cast<std::size_t>(y) * packed_row_bytes);
+          }
+          context_->Unmap(staging.Get(), 0);
+        }
+
+        WgcCaptureResult capture_result;
+        capture_result.width = source_description.Width;
+        capture_result.height = source_description.Height;
+        capture_result.row_pitch = mapped.RowPitch;
+        capture_result.format = source_description.Format;
+        capture_result.fnv1a64 = 1469598103934665603ull;
+        for (std::size_t index = 0; index < packed.size(); ++index) {
+          capture_result.fnv1a64 ^= packed[index];
+          capture_result.fnv1a64 *= 1099511628211ull;
+        }
+        const auto *pixels = reinterpret_cast<const std::uint16_t *>(packed.data());
+        for (UINT y = 0; y < capture_result.height; ++y) {
+          for (UINT x = 0; x < capture_result.width; ++x) {
+            const auto *pixel = pixels + (static_cast<std::size_t>(y) * capture_result.width + x) * 4;
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+              const float value = half_to_float(pixel[channel]);
+              if (!std::isfinite(value)) {
+                ++capture_result.non_finite_count;
+              } else {
+                capture_result.minimum[channel] = (std::min)(capture_result.minimum[channel], value);
+                capture_result.maximum[channel] = (std::max)(capture_result.maximum[channel], value);
+              }
+              if (channel < 3 && std::isfinite(value) && value > 1.0f) {
+                capture_result.any_rgb_greater_than_one = true;
+              }
+            }
+          }
+        }
+        for (std::size_t band = 0; band < capture_result.band_centers.size(); ++band) {
+          const UINT x = static_cast<UINT>((static_cast<std::uint64_t>(2 * band + 1) * capture_result.width) / 10);
+          const UINT y = capture_result.height / 2;
+          const auto *pixel = pixels + (static_cast<std::size_t>(y) * capture_result.width + x) * 4;
+          for (std::size_t channel = 0; channel < 4; ++channel) {
+            capture_result.band_centers[band][channel] = half_to_float(pixel[channel]);
+          }
+        }
+
+        std::ofstream capture {output_path_, std::ios::binary | std::ios::trunc};
+        capture.write(reinterpret_cast<const char *>(packed.data()), static_cast<std::streamsize>(packed.size()));
+        if (!capture.good()) {
+          set_failure("write_raw");
+          leave_callback();
+          return;
+        }
+        {
+          std::lock_guard lock(state_mutex_);
+          result_ = capture_result;
+          complete_ = true;
+        }
+        log_ << "wgc_" << label_ << "_path=" << narrow_ascii(output_path_.wstring()) << '\n'
+             << "wgc_" << label_ << "_width=" << capture_result.width << '\n'
+             << "wgc_" << label_ << "_height=" << capture_result.height << '\n'
+             << "wgc_" << label_ << "_format=" << static_cast<std::uint32_t>(capture_result.format) << '\n'
+             << "wgc_" << label_ << "_row_pitch=" << capture_result.row_pitch << '\n'
+             << "wgc_" << label_ << "_packed_row_bytes=" << packed_row_bytes << '\n'
+             << "wgc_" << label_ << "_fnv1a64=0x" << std::hex << std::uppercase << capture_result.fnv1a64 << std::dec << '\n'
+             << "wgc_" << label_ << "_non_finite_count=" << capture_result.non_finite_count << '\n'
+             << "wgc_" << label_ << "_any_rgb_greater_than_one=" << (capture_result.any_rgb_greater_than_one ? 1 : 0) << '\n';
+        for (std::size_t channel = 0; channel < 4; ++channel) {
+          log_ << "wgc_" << label_ << "_min_" << channel << '=' << capture_result.minimum[channel] << '\n'
+               << "wgc_" << label_ << "_max_" << channel << '=' << capture_result.maximum[channel] << '\n';
+        }
+        for (std::size_t band = 0; band < capture_result.band_centers.size(); ++band) {
+          log_ << "wgc_" << label_ << "_band_" << band << '='
+               << capture_result.band_centers[band][0] << ','
+               << capture_result.band_centers[band][1] << ','
+               << capture_result.band_centers[band][2] << ','
+               << capture_result.band_centers[band][3] << '\n';
+        }
+      } catch (const winrt::hresult_error &error) {
+        set_failure(std::string("frame_exception_") + hex_hresult(error.code().value));
+      } catch (...) {
+        set_failure("frame_exception_unknown");
+      }
+      leave_callback();
+    }
+
+    void stop() noexcept {
+      {
+        std::lock_guard lock(state_mutex_);
+        if (stopping_) {
+          return;
+        }
+        stopping_ = true;
+      }
+      try {
+        if (frame_pool_ && frame_arrived_token_.value != 0) {
+          frame_pool_.FrameArrived(frame_arrived_token_);
+          frame_arrived_token_.value = 0;
+        }
+        if (item_ && closed_token_.value != 0) {
+          item_.Closed(closed_token_);
+          closed_token_.value = 0;
+        }
+        if (capture_session_) {
+          capture_session_.Close();
+          capture_session_ = nullptr;
+        }
+        if (frame_pool_) {
+          frame_pool_.Close();
+          frame_pool_ = nullptr;
+        }
+      } catch (...) {
+        // Cleanup is best effort; the bounded owner lifetime still releases all WinRT references.
+      }
+      std::unique_lock lock(state_mutex_);
+      state_cv_.wait(lock, [this] { return active_callbacks_ == 0; });
+    }
+
+    std::string label_;
+    GraphicsCaptureItem item_ {nullptr};
+    IDirect3DDevice winrt_device_ {nullptr};
+    ID3D11Device *device_ {};
+    ID3D11DeviceContext *context_ {};
+    std::mutex &context_mutex_;
+    std::filesystem::path output_path_;
+    std::ostream &log_;
+    UINT width_ {};
+    UINT height_ {};
+    Direct3D11CaptureFramePool frame_pool_ {nullptr};
+    GraphicsCaptureSession capture_session_ {nullptr};
+    winrt::event_token frame_arrived_token_ {};
+    winrt::event_token closed_token_ {};
+    mutable std::mutex state_mutex_;
+    std::condition_variable state_cv_;
+    WgcCaptureResult result_ {};
+    std::string failure_reason_;
+    std::size_t active_callbacks_ {};
+    bool stopping_ {};
+    bool complete_ {};
+    bool failed_ {};
+  };
+
   bool write_composed_bmp(const RECT &rectangle, const std::filesystem::path &path, std::ostream &log) {
     const LONG width = rectangle.right - rectangle.left;
     const LONG height = rectangle.bottom - rectangle.top;
@@ -248,7 +717,7 @@ namespace {
 int wmain(const int argc, wchar_t **argv) {
   Options options;
   if (!parse_options(argc, argv, options)) {
-    std::cerr << "usage: hdr_session_probe [--output-prefix <path>] [--duration-seconds <seconds>]\n";
+    std::cerr << "usage: hdr_session_probe [--output-prefix <path>] [--duration-seconds <seconds>] [--wgc-mode window|monitor|both]\n";
     return 2;
   }
 
@@ -259,7 +728,8 @@ int wmain(const int argc, wchar_t **argv) {
   const auto log_path = options.output_prefix.wstring() + L".log";
   const auto source_path = options.output_prefix.wstring() + L"-source-r10g10b10a2.raw";
   const auto composed_path = options.output_prefix.wstring() + L"-composed-bgra8.bmp";
-  std::ofstream log {log_path, std::ios::trunc};
+  std::ofstream log;
+  log.open(log_path.c_str(), std::ios::trunc);
   if (!log) {
     std::cerr << "could not open proof log\n";
     return 1;
@@ -270,7 +740,8 @@ int wmain(const int argc, wchar_t **argv) {
   ProcessIdToSessionId(GetCurrentProcessId(), &session_id);
   log << "process_id=" << GetCurrentProcessId() << '\n'
       << "session_id=" << session_id << '\n'
-      << "duration_seconds=" << options.duration_seconds << '\n';
+      << "duration_seconds=" << options.duration_seconds << '\n'
+      << "wgc_mode=" << wgc_mode_name(options.wgc_mode) << '\n';
 
   ComPtr<IDXGIFactory2> factory;
   HRESULT result = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -423,6 +894,67 @@ int wmain(const int argc, wchar_t **argv) {
     return 1;
   }
 
+  std::mutex d3d_context_mutex;
+  std::unique_ptr<WgcCapture> wgc_window;
+  std::unique_ptr<WgcCapture> wgc_monitor;
+  if (options.wgc_mode != Options::WgcMode::none) {
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+      ComPtr<IDXGIDevice> dxgi_device;
+      result = device.As(&dxgi_device);
+      winrt::com_ptr<::IDirect3DDevice> interop_device;
+      if (SUCCEEDED(result)) {
+        result = CreateDirect3D11DeviceFromDXGIDevice(
+          dxgi_device.Get(),
+          reinterpret_cast<::IInspectable **>(winrt::put_abi(interop_device))
+        );
+      }
+      IDirect3DDevice winrt_device = interop_device.try_as<IDirect3DDevice>();
+      log << "wgc_create_interop_device_result=" << hex_hresult(result) << '\n'
+          << "wgc_interop_device_available=" << (winrt_device ? 1 : 0) << '\n';
+      if (FAILED(result) || !winrt_device) {
+      } else {
+        const HMONITOR monitor = MonitorFromRect(&rectangle, MONITOR_DEFAULTTONEAREST);
+        const bool want_window = options.wgc_mode == Options::WgcMode::window || options.wgc_mode == Options::WgcMode::both;
+        const bool want_monitor = options.wgc_mode == Options::WgcMode::monitor || options.wgc_mode == Options::WgcMode::both;
+        if (want_window) {
+          GraphicsCaptureItem item {nullptr};
+          if (create_graphics_capture_item(window, nullptr, item, log, "window")) {
+            wgc_window = std::make_unique<WgcCapture>(
+              "window",
+              std::move(item),
+              winrt_device,
+              device.Get(),
+              context.Get(),
+              d3d_context_mutex,
+              options.output_prefix.wstring() + L"-wgc-window-r16g16b16a16f.raw",
+              log
+            );
+          } else {
+          }
+        }
+        if (want_monitor) {
+          GraphicsCaptureItem item {nullptr};
+          if (create_graphics_capture_item(nullptr, monitor, item, log, "monitor")) {
+            wgc_monitor = std::make_unique<WgcCapture>(
+              "monitor",
+              std::move(item),
+              winrt_device,
+              device.Get(),
+              context.Get(),
+              d3d_context_mutex,
+              options.output_prefix.wstring() + L"-wgc-monitor-r16g16b16a16f.raw",
+              log
+            );
+          } else {
+          }
+        }
+      }
+    } catch (const winrt::hresult_error &error) {
+      log << "wgc_setup_exception=" << hex_hresult(error.code().value) << '\n';
+    }
+  }
+
   const std::array<std::array<float, 4>, 5> colors {{
     {0.0f, 0.0f, 0.0f, 1.0f},
     {0.508078f, 0.508078f, 0.508078f, 1.0f},
@@ -433,6 +965,8 @@ int wmain(const int argc, wchar_t **argv) {
 
   bool source_captured = false;
   bool composed_captured = false;
+  bool wgc_started = false;
+  auto wgc_start_time = std::chrono::steady_clock::now();
   std::uint64_t present_count = 0;
   const auto start = std::chrono::steady_clock::now();
   const auto deadline = start + std::chrono::seconds(options.duration_seconds);
@@ -482,8 +1016,32 @@ int wmain(const int argc, wchar_t **argv) {
     // Present does not reliably block to the compositor cadence in a terminal
     // session. Keep this diagnostic producer near 60 FPS instead of spinning.
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    if (!wgc_started && options.wgc_mode != Options::WgcMode::none && present_count >= 3) {
+      const bool window_started = !wgc_window || wgc_window->start();
+      const bool monitor_started = !wgc_monitor || wgc_monitor->start();
+      wgc_started = true;
+      wgc_start_time = std::chrono::steady_clock::now();
+      log << "wgc_window_start_result=" << (window_started ? 1 : 0) << '\n'
+          << "wgc_monitor_start_result=" << (monitor_started ? 1 : 0) << '\n';
+    }
+    if (wgc_started && options.wgc_mode != Options::WgcMode::none &&
+        std::chrono::steady_clock::now() - wgc_start_time > std::chrono::seconds(8) &&
+        ((!wgc_window || wgc_window->complete() || wgc_window->failed()) &&
+         (!wgc_monitor || wgc_monitor->complete() || wgc_monitor->failed()))) {
+      // Both requested items have either produced a frame or failed independently.
+      break;
+    }
     if (!composed_captured && std::chrono::steady_clock::now() - start >= std::chrono::seconds(2)) {
       composed_captured = write_composed_bmp(rectangle, composed_path, log);
+    }
+  }
+
+  if (wgc_started) {
+    if (wgc_window && !wgc_window->complete() && !wgc_window->failed()) {
+      wgc_window->timeout();
+    }
+    if (wgc_monitor && !wgc_monitor->complete() && !wgc_monitor->failed()) {
+      wgc_monitor->timeout();
     }
   }
 
@@ -492,5 +1050,12 @@ int wmain(const int argc, wchar_t **argv) {
   if (IsWindow(window)) {
     DestroyWindow(window);
   }
-  return source_captured && composed_captured && SUCCEEDED(color_set_result) ? 0 : 1;
+  const bool wgc_completed = options.wgc_mode == Options::WgcMode::none || (
+    (options.wgc_mode == Options::WgcMode::window && wgc_window && wgc_window->succeeded()) ||
+    (options.wgc_mode == Options::WgcMode::monitor && wgc_monitor && wgc_monitor->succeeded()) ||
+    (options.wgc_mode == Options::WgcMode::both && wgc_window && wgc_monitor &&
+      wgc_window->succeeded() && wgc_monitor->succeeded())
+  );
+  log << "wgc_completed=" << (wgc_completed ? 1 : 0) << '\n';
+  return source_captured && composed_captured && SUCCEEDED(color_set_result) && wgc_completed ? 0 : 1;
 }

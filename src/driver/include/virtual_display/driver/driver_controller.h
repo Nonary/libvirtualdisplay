@@ -36,6 +36,8 @@ namespace virtual_display::driver {
     std::uint32_t refresh_rate_millihz {};
     std::array<std::byte, kEdidSize> edid {};
     bool retain_identity {true};
+    bool initial_remote_hdr_requested {};
+    std::uint32_t initial_sdr_white_level_nits {kDefaultSdrWhiteLevelNits};
     // Store-record generation this descriptor was built from (0 = not
     // generation-tracked, e.g. permanent displays). The backend keeps it with
     // the arrived monitor so departures can be fenced against the exact record

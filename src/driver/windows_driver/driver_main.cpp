@@ -1003,6 +1003,12 @@ namespace {
            vdd::supports_windows_hdr_toggle(vdd::hdr_output_capabilities());
   }
 
+  #if defined(SUNSHINE_VDD_PROOF_INITIAL_HDR)
+    inline constexpr bool kProofInitialRemoteHdrCompiled = true;
+  #else
+    inline constexpr bool kProofInitialRemoteHdrCompiled = false;
+  #endif
+
   std::optional<vdd::DisplayManifest> initial_display_manifest() {
     if constexpr (!kRemoteSessionDriver) {
       return std::nullopt;
@@ -1015,7 +1021,22 @@ namespace {
     vdd::PermanentDisplayCountRequest request {};
     request.display_count = 1;
     vdd::set_default_permanent_display_settings(request);
-    return vdd::display_manifest_from_permanent_settings(request, kMaxPermanentDisplays);
+    auto manifest = vdd::apply_initial_remote_hdr_proof_intent(
+      vdd::display_manifest_from_permanent_settings(request, kMaxPermanentDisplays),
+      kProofInitialRemoteHdrCompiled
+    );
+    TraceLoggingWrite(
+      g_trace_provider,
+      "RemoteBootstrapInitialManifestConstructed",
+      TraceLoggingBool(kProofInitialRemoteHdrCompiled, "CompiledInitialHdrProof"),
+      TraceLoggingUInt32(manifest.profile_count, "ProfileCount"),
+      TraceLoggingUInt32(manifest.profiles[0].flags, "FirstProfileFlags"),
+      TraceLoggingBool(
+        (manifest.profiles[0].flags & vdd::kDisplayManifestProfileFlagInitialRemoteHdr) != 0,
+        "InitialHdrIntent"
+      )
+    );
+    return manifest;
   }
 
   vdd::DisplayDescriptor make_permanent_descriptor(
@@ -1082,6 +1103,9 @@ namespace {
     descriptor.physical_height_mm = options.physical_height_mm;
     descriptor.refresh_rate_millihz = options.refresh_rate_millihz;
     descriptor.edid = vdd::create_edid(options);
+    descriptor.initial_remote_hdr_requested =
+      (profile.flags & vdd::kDisplayManifestProfileFlagInitialRemoteHdr) != 0;
+    descriptor.initial_sdr_white_level_nits = vdd::kDefaultSdrWhiteLevelNits;
     return descriptor;
   }
 
@@ -3168,7 +3192,10 @@ namespace {
     }
 
   private:
-    vdd::BackendError update_remote_display_config(const char *source) {
+    vdd::BackendError update_remote_display_config(
+      const char *source,
+      const std::optional<std::uint64_t> include_arriving_display_id = std::nullopt
+    ) {
       if constexpr (!kRemoteSessionDriver) {
         return vdd::BackendError::Failed;
       }
@@ -3182,6 +3209,7 @@ namespace {
         std::uint64_t display_id {};
         IDDCX_MONITOR monitor {};
         vdd::DisplayDescriptor descriptor {};
+        bool arriving {};
         bool display_config_initialized {};
         bool hdr_requested {};
         std::uint32_t sdr_white_level_nits {vdd::kDefaultSdrWhiteLevelNits};
@@ -3208,13 +3236,16 @@ namespace {
         monitors.reserve(monitors_.size());
         monitor_references.reserve(monitors_.size());
         for (const auto &[display_id, record]: monitors_) {
-          if (record.arriving || record.departing || !record.monitor) {
+          const bool include_arriving = include_arriving_display_id &&
+                                        display_id == *include_arriving_display_id;
+          if ((record.arriving && !include_arriving) || record.departing || !record.monitor) {
             continue;
           }
           monitors.push_back({
             display_id,
             record.monitor,
             record.descriptor,
+            record.arriving,
             record.display_config_initialized,
             record.hdr_requested,
             record.sdr_white_level_nits
@@ -3232,6 +3263,15 @@ namespace {
       });
 
       for (const auto &monitor: monitors) {
+        if (monitor.arriving) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "RemoteMonitorModesDeferredUntilArrival",
+            TraceLoggingString(source, "Source"),
+            TraceLoggingUInt64(monitor.display_id, "DisplayId")
+          );
+          continue;
+        }
         const auto requested_shape = mode_shape_from_descriptor(monitor.descriptor);
         const auto [shapes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
           std::optional<ModeShape> {requested_shape},
@@ -3678,6 +3718,8 @@ namespace {
       record.descriptor = descriptor;
       record.permanent = permanent;
       record.arriving = true;
+      record.hdr_requested = kRemoteSessionDriver && descriptor.initial_remote_hdr_requested;
+      record.sdr_white_level_nits = descriptor.initial_sdr_white_level_nits;
 
       WDF_OBJECT_ATTRIBUTES monitor_attributes;
       WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&monitor_attributes, MonitorContext);
@@ -3762,6 +3804,42 @@ namespace {
         WdfObjectDelete(create_out.MonitorObject);
         unregister_monitor_description_mode(descriptor);
         return {vdd::BackendError::Failed, {}, 0};
+      }
+
+      if constexpr (kRemoteSessionDriver) {
+        if (descriptor.initial_remote_hdr_requested) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "InitialRemoteHdrConfigBeforeArrival",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+            TraceLoggingBool(vdd::has_hdr_static_metadata(descriptor.edid), "EdidHdrStaticMetadata"),
+            TraceLoggingUInt32(descriptor.initial_sdr_white_level_nits, "SdrWhiteLevelNits")
+          );
+          const auto initial_config_result = update_remote_display_config(
+                "InitialHdrBeforeMonitorArrival",
+                descriptor.display_id
+              );
+          TraceLoggingWrite(
+            g_trace_provider,
+            "InitialRemoteHdrDisplayConfigResult",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+            TraceLoggingBool(initial_config_result == vdd::BackendError::None, "Succeeded")
+          );
+          if (initial_config_result != vdd::BackendError::None) {
+            TraceLoggingWrite(
+              g_trace_provider,
+              "InitialRemoteHdrConfigBeforeArrivalFailed",
+              TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+            );
+            {
+              std::lock_guard lock {mutex_};
+              monitors_.erase(descriptor.display_id);
+            }
+            WdfObjectDelete(create_out.MonitorObject);
+            unregister_monitor_description_mode(descriptor);
+            return {vdd::BackendError::Failed, {}, 0};
+          }
+        }
       }
 
       IDARG_OUT_MONITORARRIVAL arrival_out {};

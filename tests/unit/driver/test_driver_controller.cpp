@@ -333,6 +333,21 @@ TEST(VirtualDisplayDriverController, CreateEphemeralTemporaryDisplaySkipsIdentit
   EXPECT_EQ(backend.events, (std::vector<std::string> {"arrive"}));
 }
 
+TEST(VirtualDisplayDriverController, CarriesInitialRemoteHdrIntentIntoFirstArrivalDescriptor) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  auto request = make_create_request();
+  request.flags = vdd::kCreateTemporaryDisplayFlagInitialRemoteHdr;
+
+  const auto created = controller.create_temporary_display(request, std::chrono::steady_clock::now());
+
+  ASSERT_TRUE(created.status.ok());
+  ASSERT_EQ(backend.arrived.size(), 1u);
+  EXPECT_TRUE(backend.arrived.front().initial_remote_hdr_requested);
+  EXPECT_EQ(backend.arrived.front().initial_sdr_white_level_nits, vdd::kDefaultSdrWhiteLevelNits);
+  EXPECT_TRUE(vdd::has_hdr_static_metadata(backend.arrived.front().edid));
+}
+
 TEST(VirtualDisplayDriverController, CreateTemporaryDisplayRollsBackStoreWhenIdentityReserveFails) {
   FakeBackend backend;
   backend.fail_reserve = true;

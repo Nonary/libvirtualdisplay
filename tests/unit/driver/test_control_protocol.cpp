@@ -197,6 +197,13 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesCreateRequest) {
   EXPECT_EQ(validated.display_name, "Sunshine Display");
 }
 
+TEST(VirtualDisplayDriverControlProtocol, ValidatesInitialRemoteHdrCreateFlag) {
+  auto request = valid_create_request();
+  request.flags = vdd::kCreateTemporaryDisplayFlagInitialRemoteHdr;
+
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
+}
+
 TEST(VirtualDisplayDriverControlProtocol, CanonicalizesDisplayNames) {
   auto request = valid_create_request();
   std::fill(std::begin(request.display_name), std::end(request.display_name), '\0');

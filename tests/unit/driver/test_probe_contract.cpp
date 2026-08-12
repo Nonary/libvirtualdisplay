@@ -80,6 +80,7 @@ TEST(VirtualDisplayProbeContract, PlansProbeCommandArgcBoundsAndExecutionStage) 
     ExpectedPlan {"--self-test-temp", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-4k240", 2, 3, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},
     ExpectedPlan {"--self-test-hdr", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},
+    ExpectedPlan {"--self-test-initial-remote-hdr", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},
     ExpectedPlan {"--self-test-lease-expiry", 2, 6, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--qa-multi-temp-lease", 2, 4, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},
     ExpectedPlan {"--qa-temp-identity-retention", 2, 6, vdd::ProbeCommandExecutionStage::ControlDeviceBeforeActiveSession},

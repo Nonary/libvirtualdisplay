@@ -15,6 +15,7 @@ namespace virtual_display::driver {
     const PermanentDisplayCountRequest &request,
     std::uint32_t max_display_count
   );
+  DisplayManifest apply_initial_remote_hdr_proof_intent(DisplayManifest manifest, bool enabled);
   PermanentDisplayCountRequest permanent_settings_from_display_manifest(const DisplayManifest &manifest);
 
   enum class StoreError {
@@ -44,6 +45,7 @@ namespace virtual_display::driver {
     std::uint64_t identity_display_id {};
     std::uint64_t generation {};
     bool pending_departure {};
+    bool initial_remote_hdr_requested {};
     std::uint32_t hdr_max_luminance_nits {kDefaultHdrMaxLuminanceNits};
   };
 

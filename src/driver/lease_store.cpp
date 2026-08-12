@@ -72,6 +72,13 @@ namespace virtual_display::driver {
     return manifest;
   }
 
+  DisplayManifest apply_initial_remote_hdr_proof_intent(DisplayManifest manifest, const bool enabled) {
+    if (enabled && manifest.profile_count != 0) {
+      manifest.profiles[0].flags |= kDisplayManifestProfileFlagInitialRemoteHdr;
+    }
+    return manifest;
+  }
+
   PermanentDisplayCountRequest permanent_settings_from_display_manifest(const DisplayManifest &manifest) {
     PermanentDisplayCountRequest request {};
     request.display_count = manifest.profile_count;
@@ -235,6 +242,7 @@ namespace virtual_display::driver {
         identity_display_id,
         next_temporary_display_generation_++,
         false,
+        (validated.request.flags & kCreateTemporaryDisplayFlagInitialRemoteHdr) != 0,
         validated.request.hdr_max_luminance_nits
       }
     );

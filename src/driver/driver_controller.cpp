@@ -725,6 +725,8 @@ namespace virtual_display::driver {
     descriptor.refresh_rate_millihz = record.refresh_rate_millihz;
     descriptor.edid = create_edid(edid_options_for_temporary_display(record));
     descriptor.retain_identity = record.retain_identity;
+    descriptor.initial_remote_hdr_requested = record.initial_remote_hdr_requested;
+    descriptor.initial_sdr_white_level_nits = kDefaultSdrWhiteLevelNits;
     descriptor.generation = record.generation;
     return descriptor;
   }

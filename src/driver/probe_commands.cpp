@@ -109,7 +109,8 @@ namespace virtual_display::driver {
       return plan(2, 4);
     }
     if (command == "--self-test-temp" ||
-        command == "--self-test-hdr") {
+        command == "--self-test-hdr" ||
+        command == "--self-test-initial-remote-hdr") {
       return plan(2, 5);
     }
     if (command == "--self-test-lease-expiry" ||
@@ -138,6 +139,7 @@ namespace virtual_display::driver {
            command == "--associate-color-profile" ||
            command == "--self-test-4k240" ||
            command == "--self-test-hdr" ||
+           command == "--self-test-initial-remote-hdr" ||
            command == "--qa-temp-identity-retention" ||
            command == "--qa-temp-lease" ||
            command == "--qa-multi-temp-lease" ||

@@ -281,6 +281,18 @@ TEST(VirtualDisplayDriverLeaseStore, EphemeralIdentitySkipsActiveEdidCollision) 
   EXPECT_EQ(record->identity_display_id, 0x6000000000000002ull);
 }
 
+TEST(VirtualDisplayDriverLeaseStore, PreservesInitialRemoteHdrCreateIntent) {
+  vdd::DisplayStore store {2, 4};
+  const auto now = std::chrono::steady_clock::now();
+  auto request = make_create_request();
+  request.flags = vdd::kCreateTemporaryDisplayFlagInitialRemoteHdr;
+
+  ASSERT_EQ(store.create_temporary_display(request, now).status.error, vdd::StoreError::None);
+  const auto record = store.find_temporary_display(request.display_id);
+  ASSERT_TRUE(record);
+  EXPECT_TRUE(record->initial_remote_hdr_requested);
+}
+
 TEST(VirtualDisplayDriverLeaseStore, RejectsTemporaryDisplayLimit) {
   vdd::DisplayStore store {2, 1};
   const auto now = std::chrono::steady_clock::now();
@@ -664,6 +676,21 @@ TEST(VirtualDisplayDriverLeaseStore, ConvertsPermanentSettingsToDisplayManifest)
   EXPECT_EQ(manifest.profiles[0].allowed_modes[0].width, 3840u);
   EXPECT_EQ(manifest.profiles[0].allowed_modes[0].refresh_rate_millihz, 144'000u);
   EXPECT_EQ(vdd::trim_display_name(manifest.profiles[0].display_name), "Desk Display");
+}
+
+TEST(VirtualDisplayDriverLeaseStore, AppliesCompiledInitialRemoteHdrIntentOnlyWhenEnabled) {
+  vdd::PermanentDisplayCountRequest request {};
+  request.display_count = 1;
+  vdd::set_default_permanent_display_settings(request);
+  const auto normal_manifest = vdd::apply_initial_remote_hdr_proof_intent(
+    vdd::display_manifest_from_permanent_settings(request, 4),
+    false
+  );
+  const auto manifest = vdd::apply_initial_remote_hdr_proof_intent(normal_manifest, true);
+
+  EXPECT_EQ(vdd::validate_display_manifest(manifest, 4), vdd::ValidationError::None);
+  EXPECT_EQ(normal_manifest.profiles[0].flags & vdd::kDisplayManifestProfileFlagInitialRemoteHdr, 0u);
+  EXPECT_NE(manifest.profiles[0].flags & vdd::kDisplayManifestProfileFlagInitialRemoteHdr, 0u);
 }
 
 TEST(VirtualDisplayDriverLeaseStore, AppliesDisplayManifestAsPermanentState) {

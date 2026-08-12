@@ -109,6 +109,7 @@ namespace {
       << "  --self-test-temp [width height refresh_hz]\n"
       << "  --self-test-4k240 [timeout_ms]\n"
       << "  --self-test-hdr [width height refresh_hz]\n"
+      << "  --self-test-initial-remote-hdr [width height refresh_hz]\n"
       << "  --self-test-lease-expiry [width height refresh_hz timeout_ms]\n"
       << "  --qa-multi-temp-lease [count timeout_ms]\n"
       << "  --qa-temp-identity-retention [width height refresh_hz timeout_ms]\n"
@@ -2551,6 +2552,55 @@ int main(const int argc, char **argv) {
               << " target_id=" << created.value.target_id
               << " connector_index=" << created.value.connector_index << '\n';
     return 0;
+  }
+
+  if (command == "--self-test-initial-remote-hdr") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    std::uint32_t width {};
+    std::uint32_t height {};
+    std::uint32_t refresh_hz {};
+    if (!read_u32_arg(argc, argv, 2, 1920u, "width", width) ||
+        !read_u32_arg(argc, argv, 3, 1080u, "height", height) ||
+        !read_u32_arg(argc, argv, 4, 60u, "refresh_hz", refresh_hz)) {
+      return 2;
+    }
+    auto request = make_temporary_request(width, height, refresh_hz);
+    request.flags |= vdd::kCreateTemporaryDisplayFlagInitialRemoteHdr;
+
+    const auto created = client.create_temporary_display(request);
+    if (!created.ok()) {
+      return fail("create initial-remote-HDR proof display failed", created);
+    }
+    const auto remove_created = [&]() {
+      return client.remove_temporary_display({vdd::kApiNamespaceGuid, request.lease_id, request.display_id});
+    };
+
+    LONG native_error = ERROR_SUCCESS;
+    const auto state = wait_for_advanced_color(
+      created.value.os_adapter_luid,
+      created.value.target_id,
+      true,
+      &native_error
+    );
+    const auto removed = remove_created();
+    if (!removed.ok()) {
+      return fail("remove initial-remote-HDR proof display failed", removed);
+    }
+    if (!state) {
+      std::cerr << "initial remote HDR proof query failed native_error=" << native_error << '\n';
+      return 1;
+    }
+    print_advanced_color(*state);
+    const bool initial_hdr = state->v2 && state->supported && state->active &&
+                             state->hdr_supported && state->hdr_enabled &&
+                             !state->limited_by_policy && state->bits_per_color_channel >= 10;
+    std::cout << "initial_remote_hdr=" << (initial_hdr ? 1 : 0)
+              << " created_display_id=" << created.value.display_id
+              << " target_id=" << created.value.target_id
+              << " connector_index=" << created.value.connector_index << '\n';
+    return initial_hdr ? 0 : 1;
   }
 
   if (command == "--self-test-lease-expiry") {

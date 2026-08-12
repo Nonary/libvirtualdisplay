@@ -270,4 +270,8 @@ if(BUILD_SUNSHINE_REMOTE_DISPLAY_DRIVER)
             remote-driver-package
             SunshineRemoteDisplayDriver.cat
             SUNSHINE_VDD_REMOTE_SESSION_DRIVER=1)
+    if(SUNSHINE_REMOTE_DISPLAY_PROOF_INITIAL_HDR)
+        target_compile_definitions(${SUNSHINE_REMOTE_DRIVER_TARGET}
+                PRIVATE SUNSHINE_VDD_PROOF_INITIAL_HDR=1)
+    endif()
 endif()

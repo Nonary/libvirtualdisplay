@@ -72,8 +72,13 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kMinSdrWhiteLevelNits = 80;
   inline constexpr std::uint32_t kMaxSdrWhiteLevelNits = 480;
   inline constexpr std::uint32_t kCreateTemporaryDisplayFlagEphemeralIdentity = 0x00000001u;
+  // Proof-only remote-session experiment: request the first remote display
+  // configuration as HDR before the monitor is reported present to IddCx.
+  // The console IDD deliberately ignores this flag.
+  inline constexpr std::uint32_t kCreateTemporaryDisplayFlagInitialRemoteHdr = 0x00000002u;
   inline constexpr std::uint32_t kCreateTemporaryDisplayKnownFlags =
-    kCreateTemporaryDisplayFlagEphemeralIdentity;
+    kCreateTemporaryDisplayFlagEphemeralIdentity |
+    kCreateTemporaryDisplayFlagInitialRemoteHdr;
   inline constexpr std::uint32_t kPermanentDisplayCountKnownFlags = 0;
   inline constexpr std::uint32_t kMaxDisplayStateEntries = 16;
   inline constexpr std::uint32_t kDisplayStateKindPermanent = 1;
@@ -86,10 +91,14 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kDisplayManifestProfileFlagHdrSupported = 0x00000001u;
   inline constexpr std::uint32_t kDisplayManifestProfileFlagRetainIdentity = 0x00000002u;
   inline constexpr std::uint32_t kDisplayManifestProfileFlagPermanentIdentity = 0x00000004u;
+  // Proof-only: initialize a remote session's first display-config path as HDR.
+  // This is meaningful only to the remote IDD and remains off in normal manifests.
+  inline constexpr std::uint32_t kDisplayManifestProfileFlagInitialRemoteHdr = 0x00000008u;
   inline constexpr std::uint32_t kDisplayManifestProfileKnownFlags =
     kDisplayManifestProfileFlagHdrSupported |
     kDisplayManifestProfileFlagRetainIdentity |
-    kDisplayManifestProfileFlagPermanentIdentity;
+    kDisplayManifestProfileFlagPermanentIdentity |
+    kDisplayManifestProfileFlagInitialRemoteHdr;
   inline constexpr std::uint32_t kDisplayManifestLayoutPolicyNone = 0;
   inline constexpr std::uint32_t kDisplayManifestLayoutPolicyApply = 1;
   inline constexpr std::uint32_t kDisplayManifestLayoutPolicyApplyAndPersist = 2;
