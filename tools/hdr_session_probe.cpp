@@ -81,6 +81,7 @@ namespace {
       monitor,
       both,
     } wgc_mode {WgcMode::none};
+    bool exclusive_fullscreen {false};
   };
 
   struct OutputSelection {
@@ -190,6 +191,8 @@ namespace {
         } else {
           return false;
         }
+      } else if (argument == L"--exclusive-fullscreen") {
+        options.exclusive_fullscreen = true;
       } else {
         return false;
       }
@@ -717,7 +720,7 @@ namespace {
 int wmain(const int argc, wchar_t **argv) {
   Options options;
   if (!parse_options(argc, argv, options)) {
-    std::cerr << "usage: hdr_session_probe [--output-prefix <path>] [--duration-seconds <seconds>] [--wgc-mode window|monitor|both]\n";
+    std::cerr << "usage: hdr_session_probe [--output-prefix <path>] [--duration-seconds <seconds>] [--wgc-mode window|monitor|both] [--exclusive-fullscreen]\n";
     return 2;
   }
 
@@ -844,6 +847,24 @@ int wmain(const int argc, wchar_t **argv) {
     return 1;
   }
   factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+
+  HRESULT fullscreen_result = S_FALSE;
+  HRESULT resize_target_result = S_FALSE;
+  if (options.exclusive_fullscreen) {
+    fullscreen_result = swapchain1->SetFullscreenState(TRUE, selected.output.Get());
+    DXGI_MODE_DESC target_mode {};
+    target_mode.Width = width;
+    target_mode.Height = height;
+    target_mode.RefreshRate.Numerator = 60;
+    target_mode.RefreshRate.Denominator = 1;
+    target_mode.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    target_mode.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+    target_mode.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+    resize_target_result = SUCCEEDED(fullscreen_result) ? swapchain1->ResizeTarget(&target_mode) : fullscreen_result;
+  }
+  log << "exclusive_fullscreen_requested=" << (options.exclusive_fullscreen ? 1 : 0) << '\n'
+      << "set_fullscreen_state_result=" << hex_hresult(fullscreen_result) << '\n'
+      << "resize_target_result=" << hex_hresult(resize_target_result) << '\n';
 
   ComPtr<IDXGISwapChain3> swapchain3;
   result = swapchain1.As(&swapchain3);
@@ -1047,6 +1068,9 @@ int wmain(const int argc, wchar_t **argv) {
 
   log << "present_count=" << present_count << '\n'
       << "proof_completed=1\n";
+  if (options.exclusive_fullscreen) {
+    log << "leave_fullscreen_result=" << hex_hresult(swapchain1->SetFullscreenState(FALSE, nullptr)) << '\n';
+  }
   if (IsWindow(window)) {
     DestroyWindow(window);
   }

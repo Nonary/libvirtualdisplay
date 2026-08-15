@@ -274,4 +274,12 @@ if(BUILD_SUNSHINE_REMOTE_DISPLAY_DRIVER)
         target_compile_definitions(${SUNSHINE_REMOTE_DRIVER_TARGET}
                 PRIVATE SUNSHINE_VDD_PROOF_INITIAL_HDR=1)
     endif()
+    if(SUNSHINE_REMOTE_DISPLAY_PROOF_DUO_HDR_WIRE)
+        target_compile_definitions(${SUNSHINE_REMOTE_DRIVER_TARGET}
+                PRIVATE SUNSHINE_VDD_PROOF_DUO_HDR_WIRE=1)
+    endif()
+    if(SUNSHINE_REMOTE_DISPLAY_PROOF_WCG_PRIME_HDR)
+        target_compile_definitions(${SUNSHINE_REMOTE_DRIVER_TARGET}
+                PRIVATE SUNSHINE_VDD_PROOF_WCG_PRIME_HDR=1)
+    endif()
 endif()

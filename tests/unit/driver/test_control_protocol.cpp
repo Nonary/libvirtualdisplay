@@ -106,7 +106,7 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants)
   // Behavioral replacement for the test that scraped README.md for the version prose: it
   // asserts the formatter that is the single source of truth for the dotted version, rather
   // than that a string happens to appear in a checked-in document.
-  EXPECT_EQ(vdd::protocol_version_string(), "3.7.0");
+  EXPECT_EQ(vdd::protocol_version_string(), "3.8.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {

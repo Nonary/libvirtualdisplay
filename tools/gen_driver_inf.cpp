@@ -41,10 +41,20 @@ namespace {
 
   // Pure: template text -> rendered INF. The committed INF is, by construction, exactly
   // this function applied to the committed template with the default DriverVer values.
-  std::string render_inf(std::string text, const std::string &driverver_date, const std::string &driverver_version) {
+  std::string render_inf(
+    std::string text,
+    const std::string &driverver_date,
+    const std::string &driverver_version,
+    const std::string &control_security_descriptor,
+    const std::string &device_security_descriptor
+  ) {
     replace_all(text, "@VDD_CONTROL_INTERFACE_GUID@", vdd::format_inf_guid(vdd::kDeviceInterfaceGuid));
     replace_all(text, "@VDD_REMOTE_CONTROL_INTERFACE_GUID@", vdd::format_inf_guid(vdd::kRemoteDeviceInterfaceGuid));
-    replace_all(text, "@VDD_CONTROL_SECURITY_DESCRIPTOR@", vdd::control_interface_security_descriptor());
+    replace_all(text, "@VDD_CONTROL_SECURITY_DESCRIPTOR@", control_security_descriptor);
+    const std::string device_security_entry = device_security_descriptor.empty() ?
+      std::string {} :
+      "HKR,,Security,,\"" + device_security_descriptor + "\"";
+    replace_all(text, "@VDD_REMOTE_DEVICE_SECURITY_ENTRY@", device_security_entry);
     replace_all(text, "@VDD_DRIVER_VER_DATE@", driverver_date);
     replace_all(text, "@VDD_DRIVER_VER_VERSION@", driverver_version);
     return text;
@@ -57,6 +67,8 @@ int main(int argc, char **argv) {
   bool check = false;
   std::string driverver_date = kDefaultDriverVerDate;
   std::string driverver_version = kDefaultDriverVerVersion;
+  std::string control_security_descriptor = vdd::control_interface_security_descriptor();
+  std::string device_security_descriptor;
   for (auto it = args.begin(); it != args.end();) {
     if (*it == "--check") {
       check = true;
@@ -75,13 +87,27 @@ int main(int argc, char **argv) {
       }
       driverver_version = *std::next(it);
       it = args.erase(it, std::next(it, 2));
+    } else if (*it == "--control-security-descriptor") {
+      if (std::next(it) == args.end()) {
+        std::cerr << "gen_driver_inf: --control-security-descriptor requires a value\n";
+        return 2;
+      }
+      control_security_descriptor = *std::next(it);
+      it = args.erase(it, std::next(it, 2));
+    } else if (*it == "--device-security-descriptor") {
+      if (std::next(it) == args.end()) {
+        std::cerr << "gen_driver_inf: --device-security-descriptor requires a value\n";
+        return 2;
+      }
+      device_security_descriptor = *std::next(it);
+      it = args.erase(it, std::next(it, 2));
     } else {
       ++it;
     }
   }
 
   if (args.size() != 2) {
-    std::cerr << "usage: gen_driver_inf [--check] [--driverver-date MM/DD/YYYY] [--driverver-version A.B.C.D] <template.inf.in> <output.inf>\n";
+    std::cerr << "usage: gen_driver_inf [--check] [--driverver-date MM/DD/YYYY] [--driverver-version A.B.C.D] [--control-security-descriptor SDDL] [--device-security-descriptor SDDL] <template.inf.in> <output.inf>\n";
     return 2;
   }
 
@@ -92,7 +118,13 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  const std::string generated = render_inf(template_text, driverver_date, driverver_version);
+  const std::string generated = render_inf(
+    template_text,
+    driverver_date,
+    driverver_version,
+    control_security_descriptor,
+    device_security_descriptor
+  );
 
   if (check) {
     const std::string committed = read_file_binary(args[1], ok);

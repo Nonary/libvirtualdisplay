@@ -80,8 +80,39 @@ namespace virtual_display::driver {
         command == "--apply-manifest-topology") {
       return plan(2, 2);
     }
+    if (command == "--query-vidpn-ownership-current-session" ||
+        command == "--probe-displaymanager-acquire-arriving-target" ||
+        command == "--query-private-functionalize-current-session" ||
+        command == "--probe-displaymanager-fp16-functionalize-current-session" ||
+        command == "--probe-displaymanager-desktop-hdr-functionalize-current-session" ||
+        command == "--probe-displaymanager-desktop-owner2-hdr-functionalize-current-session" ||
+        command == "--probe-idd-hdr-functionalize-current-session" ||
+        command == "--probe-idd-hdr-functionalize-shared-owner-current-session" ||
+        command == "--probe-idd-hdr-functionalize-nongdi-source-current-session" ||
+        command == "--probe-displaymanager-fp16-enforce-functionalize-current-session") {
+      return plan(2, 3);
+    }
+    if (command == "--query-hdr-target" ||
+        command == "--launch-displaymanager-owner2-probe-in-session" ||
+        command == "--query-d3dkmt-current-mode" ||
+        command == "--query-d3dkmt-mode-list" ||
+        command == "--probe-idd-hdr-gate") {
+      return plan(4, 4);
+    }
+    if (command == "--set-hdr-target") {
+      return plan(5, 5);
+    }
     if (command == "--set-hdr-current-session") {
       return plan(3, 4);
+    }
+    if (command == "--probe-wcg-prime-hdr-inherited-token") {
+      return plan(6, 6);
+    }
+    if (command == "--probe-wcg-prime-hdr-native-user") {
+      return plan(5, 5);
+    }
+    if (command == "--remote-current-session-wcg-to-hdr") {
+      return plan(4, 4);
     }
     if (command == "--set-permanent") {
       return plan(3, 3);
@@ -109,6 +140,7 @@ namespace virtual_display::driver {
       return plan(2, 4);
     }
     if (command == "--self-test-temp" ||
+        command == "--probe-displaymanager-acquire-new-temp-target" ||
         command == "--self-test-hdr" ||
         command == "--self-test-initial-remote-hdr") {
       return plan(2, 5);
@@ -150,7 +182,26 @@ namespace virtual_display::driver {
   ProbeCommandExecutionStage probe_command_execution_stage(const std::string_view command) {
     if (command == "--diagnose" ||
         command == "--apply-extended-topology-current-session" ||
+        command == "--probe-idd-hdr-functionalize-current-session" ||
+        command == "--probe-idd-hdr-functionalize-shared-owner-current-session" ||
+        command == "--probe-idd-hdr-functionalize-nongdi-source-current-session" ||
+        command == "--probe-wcg-prime-hdr-inherited-token" ||
+        command == "--probe-wcg-prime-hdr-native-user" ||
+        command == "--remote-current-session-wcg-to-hdr" ||
+        command == "--query-private-functionalize-current-session" ||
+        command == "--launch-displaymanager-owner2-probe-in-session" ||
+        command == "--probe-displaymanager-acquire-arriving-target" ||
+        command == "--probe-displaymanager-fp16-functionalize-current-session" ||
+        command == "--probe-displaymanager-desktop-hdr-functionalize-current-session" ||
+        command == "--probe-displaymanager-desktop-owner2-hdr-functionalize-current-session" ||
+        command == "--probe-displaymanager-fp16-enforce-functionalize-current-session" ||
         command == "--dump-display-config-current-session" ||
+        command == "--query-vidpn-ownership-current-session" ||
+        command == "--query-hdr-target" ||
+        command == "--query-d3dkmt-current-mode" ||
+        command == "--query-d3dkmt-mode-list" ||
+        command == "--set-hdr-target" ||
+        command == "--probe-idd-hdr-gate" ||
         command == "--set-hdr-current-session") {
       return ProbeCommandExecutionStage::NoControlDevice;
     }

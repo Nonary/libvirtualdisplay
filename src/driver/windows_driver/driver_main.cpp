@@ -75,6 +75,13 @@ namespace {
   constexpr auto kMonitorArrivalTimeout = std::chrono::milliseconds(500);
   constexpr auto kMonitorDepartureTimeout = std::chrono::milliseconds(500);
   constexpr auto kRenderAdapterTimeout = std::chrono::milliseconds(500);
+  constexpr std::array kLateHdrReassertDelays {
+    std::chrono::milliseconds(100),
+    std::chrono::milliseconds(250),
+    std::chrono::milliseconds(500),
+    std::chrono::milliseconds(1000),
+    std::chrono::milliseconds(2000)
+  };
   constexpr std::uint32_t kHardwareCursorMaxWidth = 256;
   constexpr std::uint32_t kHardwareCursorMaxHeight = 256;
   constexpr std::size_t kHardwareCursorShapeBufferBytes =
@@ -157,6 +164,8 @@ namespace {
     bool orphaned_late_arrival {};
     bool display_config_initialized {};
     bool hdr_requested {};
+    bool wcg_prime_bypassed {};
+    bool late_hdr_reassert_in_flight {};
     std::uint32_t sdr_white_level_nits {vdd::kDefaultSdrWhiteLevelNits};
     std::uint32_t assign_callbacks_in_flight {};
     std::uint32_t unassign_callbacks_in_flight {};
@@ -1009,6 +1018,18 @@ namespace {
     inline constexpr bool kProofInitialRemoteHdrCompiled = false;
   #endif
 
+  #if defined(SUNSHINE_VDD_PROOF_DUO_HDR_WIRE)
+    inline constexpr bool kProofDuoHdrWireCompiled = true;
+  #else
+    inline constexpr bool kProofDuoHdrWireCompiled = false;
+  #endif
+
+  #if defined(SUNSHINE_VDD_PROOF_WCG_PRIME_HDR)
+    inline constexpr bool kProofWcgPrimeHdrCompiled = true;
+  #else
+    inline constexpr bool kProofWcgPrimeHdrCompiled = false;
+  #endif
+
   std::optional<vdd::DisplayManifest> initial_display_manifest() {
     if constexpr (!kRemoteSessionDriver) {
       return std::nullopt;
@@ -1204,6 +1225,15 @@ namespace {
   }
 
   IDDCX_BITS_PER_COMPONENT preferred_rgb_bits_per_component() {
+    if constexpr (kRemoteSessionDriver && kProofDuoHdrWireCompiled) {
+      // Duo 1.6.0 stopped advertising FP16 as a monitor wire format after
+      // KB5094126.  Keep FP16 source processing in the adapter capabilities,
+      // but publish the monitor/target contract as 8- or 10-bpc RGB.
+      return static_cast<IDDCX_BITS_PER_COMPONENT>(
+        IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10
+      );
+    }
+
     const auto capabilities = vdd::hdr_output_capabilities();
     if (capabilities.output_bits.rgb_10bpc) {
       return IDDCX_BITS_PER_COMPONENT_10;
@@ -2588,10 +2618,16 @@ namespace {
       }
       if constexpr (kRemoteSessionDriver) {
         adapter_flags |= IDDCX_ADAPTER_FLAGS_REMOTE_SESSION_DRIVER;
-        adapter_flags |= IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
         adapter_flags |= IDDCX_ADAPTER_FLAGS_REMOTE_ALL_TARGET_MODES_MONITOR_COMPATIBLE;
+        adapter_flags |= IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
       }
       caps.Flags = static_cast<IDDCX_ADAPTER_FLAGS>(adapter_flags);
+      TraceLoggingWrite(
+        g_trace_provider,
+        "AdapterFlagsConstructed",
+        TraceLoggingBool(kRemoteSessionDriver, "RemoteSessionDriverBuild"),
+        TraceLoggingUInt32(adapter_flags, "AdapterFlags")
+      );
       caps.MaxMonitorsSupported = kMaxPermanentDisplays + kMaxTemporaryDisplays;
       caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
       // The virtual sink does not render an endpoint image or apply the OS
@@ -2793,6 +2829,7 @@ namespace {
       }
 
       bool old_hdr_requested = false;
+      bool old_wcg_prime_bypassed = false;
       std::uint32_t old_sdr_white_level_nits = vdd::kDefaultSdrWhiteLevelNits;
       {
         std::lock_guard lock {mutex_};
@@ -2805,8 +2842,16 @@ namespace {
           return vdd::BackendError::Failed;
         }
         old_hdr_requested = monitor->second.hdr_requested;
+        old_wcg_prime_bypassed = monitor->second.wcg_prime_bypassed;
         old_sdr_white_level_nits = monitor->second.sdr_white_level_nits;
         monitor->second.hdr_requested = request.enabled != 0;
+        if constexpr (kProofWcgPrimeHdrCompiled) {
+          // An initial HDR descriptor is deliberately published as SDR-WCG so
+          // Windows can build a remote FP16 source mode first. Repeating the
+          // enabled request is the proof-only, explicit transition to HDR;
+          // this keeps the priming interval under the test harness's control.
+          monitor->second.wcg_prime_bypassed = request.enabled != 0 && old_hdr_requested;
+        }
         monitor->second.sdr_white_level_nits = request.sdr_white_level_nits;
       }
 
@@ -2816,6 +2861,7 @@ namespace {
           std::lock_guard lock {mutex_};
           if (const auto monitor = monitors_.find(request.display_id); monitor != monitors_.end()) {
             monitor->second.hdr_requested = old_hdr_requested;
+            monitor->second.wcg_prime_bypassed = old_wcg_prime_bypassed;
             monitor->second.sdr_white_level_nits = old_sdr_white_level_nits;
           }
         }
@@ -2828,6 +2874,10 @@ namespace {
         "RemoteDisplayHdrStateSet",
         TraceLoggingUInt64(request.display_id, "DisplayId"),
         TraceLoggingBool(request.enabled != 0, "Enabled"),
+        TraceLoggingBool(
+          kProofWcgPrimeHdrCompiled && request.enabled != 0 && old_hdr_requested,
+          "WcgPrimeBypassed"
+        ),
         TraceLoggingUInt32(request.sdr_white_level_nits, "SdrWhiteLevelNits")
       );
       return vdd::BackendError::None;
@@ -3053,6 +3103,7 @@ namespace {
           TraceLoggingUInt32(static_cast<std::uint32_t>(path.WireFormatInfo.ColorSpace), "ColorSpace"),
           TraceLoggingUInt32(static_cast<std::uint32_t>(path.WireFormatInfo.BitsPerComponent.Rgb), "RgbBitsPerComponent")
         );
+
       }
 
       return STATUS_SUCCESS;
@@ -3062,25 +3113,30 @@ namespace {
       {
         std::unique_lock lock {mutex_};
         shutting_down_ = true;
+        departure_cv_.notify_all();
         if (monitor_arrivals_in_flight_ > 0 ||
             monitor_departures_in_flight_ > 0 ||
-            render_adapter_calls_in_flight_ > 0) {
+            render_adapter_calls_in_flight_ > 0 ||
+            late_hdr_reassert_calls_in_flight_ > 0) {
           departure_cv_.wait_for(lock, kMonitorDepartureTimeout, [&]() {
             return monitor_arrivals_in_flight_ == 0 &&
                    monitor_departures_in_flight_ == 0 &&
-                   render_adapter_calls_in_flight_ == 0;
+                   render_adapter_calls_in_flight_ == 0 &&
+                   late_hdr_reassert_calls_in_flight_ == 0;
           });
         }
 
         if (monitor_arrivals_in_flight_ > 0 ||
             monitor_departures_in_flight_ > 0 ||
-            render_adapter_calls_in_flight_ > 0) {
+            render_adapter_calls_in_flight_ > 0 ||
+            late_hdr_reassert_calls_in_flight_ > 0) {
           TraceLoggingWrite(
             g_trace_provider,
             "BackendShutdownDeferredForInFlightLifecycle",
             TraceLoggingUInt32(monitor_arrivals_in_flight_, "ArrivalsInFlight"),
             TraceLoggingUInt32(monitor_departures_in_flight_, "DeparturesInFlight"),
-            TraceLoggingUInt32(render_adapter_calls_in_flight_, "RenderAdapterCallsInFlight")
+            TraceLoggingUInt32(render_adapter_calls_in_flight_, "RenderAdapterCallsInFlight"),
+            TraceLoggingUInt32(late_hdr_reassert_calls_in_flight_, "LateHdrReassertCallsInFlight")
           );
           TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "BackendShutdownDeferredForInFlightLifecycle");
           return false;
@@ -3212,6 +3268,7 @@ namespace {
         bool arriving {};
         bool display_config_initialized {};
         bool hdr_requested {};
+        bool wcg_prime_bypassed {};
         std::uint32_t sdr_white_level_nits {vdd::kDefaultSdrWhiteLevelNits};
       };
 
@@ -3248,6 +3305,7 @@ namespace {
             record.arriving,
             record.display_config_initialized,
             record.hdr_requested,
+            record.wcg_prime_bypassed,
             record.sdr_white_level_nits
           });
           monitor_references.emplace_back(reinterpret_cast<WDFOBJECT>(record.monitor));
@@ -3309,9 +3367,13 @@ namespace {
       std::vector<IDDCX_DISPLAYCONFIGPATH2> paths(monitors.size());
       LONG position_x = 0;
       std::uint32_t hdr_path_count = 0;
+      std::uint32_t wcg_prime_path_count = 0;
       for (std::size_t index = 0; index < monitors.size(); ++index) {
         const auto &monitor = monitors[index];
         auto &path = paths[index];
+        const bool wcg_prime = kProofWcgPrimeHdrCompiled &&
+                               monitor.hdr_requested &&
+                               !monitor.wcg_prime_bypassed;
         path.Size = sizeof(path);
         path.Flags = IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID;
         path.MonitorObject = monitor.monitor;
@@ -3320,32 +3382,60 @@ namespace {
         path.Mode.Rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
         path.Mode.RefreshRate = {monitor.descriptor.refresh_rate_millihz, 1000};
         path.Mode.VSyncFreqDivider = 1;
-        path.Mode.MonitorColorMode = monitor.hdr_requested ?
-          IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_HDR10 :
-          IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_SDR;
+        path.Mode.MonitorColorMode = wcg_prime ?
+          IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_SDRWCG :
+          (monitor.hdr_requested ?
+            IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_HDR10 :
+            IDDCX_DISPLAYCONFIG_MONITOR_COLORMODE_SDR);
         path.MonitorScaleFactor = 100;
-        if (!monitor.display_config_initialized) {
+        if (!monitor.display_config_initialized ||
+            (kProofDuoHdrWireCompiled && monitor.hdr_requested)) {
           path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID;
         }
         if (monitor.hdr_requested) {
           ++hdr_path_count;
-          path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_COLORIMETRY_VALID |
-                        IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SDRWHITELEVEL_VALID;
-          path.MonitorColorimetry.RedPoint = {725, 299};
+          path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_COLORIMETRY_VALID;
+          if (wcg_prime) {
+            ++wcg_prime_path_count;
+          } else {
+            path.Flags |= IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SDRWHITELEVEL_VALID;
+          }
+          path.MonitorColorimetry.RedPoint = {kProofDuoHdrWireCompiled ? 724u : 725u, 299};
           path.MonitorColorimetry.GreenPoint = {174, 816};
           path.MonitorColorimetry.BluePoint = {134, 47};
-          path.MonitorColorimetry.WhitePoint = {320, 337};
-          path.MonitorColorimetry.MinLuminance = 50;
+          path.MonitorColorimetry.WhitePoint = {320, kProofDuoHdrWireCompiled ? 336u : 337u};
+          path.MonitorColorimetry.MinLuminance = kProofDuoHdrWireCompiled ? 0 : 50;
           path.MonitorColorimetry.MaxLuminance = 10'000'000;
-          path.MonitorColorimetry.MaxFullFrameLuminance = 4'000'000;
-          path.MonitorColorimetry.BitsPerComponent.Rgb = static_cast<IDDCX_BITS_PER_COMPONENT>(
-            IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10
-          );
+          path.MonitorColorimetry.MaxFullFrameLuminance =
+            kProofDuoHdrWireCompiled ? 10'000'000 : 4'000'000;
+          path.MonitorColorimetry.BitsPerComponent.Rgb = kProofDuoHdrWireCompiled ?
+            IDDCX_BITS_PER_COMPONENT_10 :
+            static_cast<IDDCX_BITS_PER_COMPONENT>(
+              IDDCX_BITS_PER_COMPONENT_8 | IDDCX_BITS_PER_COMPONENT_10
+            );
           path.MonitorColorimetry.Flags = static_cast<IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS>(
             IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS_BT2020RGB |
             IDDCX_DISPLAYCONFIG_MONITOR_COLORIMETRY_FLAGS_ST2084
           );
           path.MonitorSdrWhiteLevel = monitor.sdr_white_level_nits;
+          TraceLoggingWrite(
+            g_trace_provider,
+            "RemoteDuoHdrWireProofPathConstructed",
+            TraceLoggingBool(kProofDuoHdrWireCompiled, "CompiledProof"),
+            TraceLoggingBool(wcg_prime, "WcgPrime"),
+            TraceLoggingUInt64(monitor.display_id, "DisplayId"),
+            TraceLoggingUInt32(static_cast<std::uint32_t>(path.Flags), "PathFlags"),
+            TraceLoggingUInt32(
+              static_cast<std::uint32_t>(path.MonitorColorimetry.BitsPerComponent.Rgb),
+              "RgbBitsPerComponent"
+            ),
+            TraceLoggingUInt32(path.MonitorColorimetry.MinLuminance, "MinLuminance"),
+            TraceLoggingUInt32(path.MonitorColorimetry.MaxLuminance, "MaxLuminance"),
+            TraceLoggingUInt32(
+              path.MonitorColorimetry.MaxFullFrameLuminance,
+              "MaxFullFrameLuminance"
+            )
+          );
         }
         position_x += static_cast<LONG>(monitor.descriptor.width);
       }
@@ -3360,6 +3450,7 @@ namespace {
         TraceLoggingString(source, "Source"),
         TraceLoggingUInt32(update.PathCount, "PathCount"),
         TraceLoggingUInt32(hdr_path_count, "HdrPathCount"),
+        TraceLoggingUInt32(wcg_prime_path_count, "WcgPrimePathCount"),
         TraceLoggingUInt32(static_cast<std::uint32_t>(hr), "HResult")
       );
       if (FAILED(hr)) {
@@ -3507,7 +3598,8 @@ namespace {
     void clear_lifecycle_unhealthy_if_settled_locked() {
       if (monitor_arrivals_in_flight_ == 0 &&
           monitor_departures_in_flight_ == 0 &&
-          render_adapter_calls_in_flight_ == 0) {
+          render_adapter_calls_in_flight_ == 0 &&
+          late_hdr_reassert_calls_in_flight_ == 0) {
         lifecycle_unhealthy_ = false;
       }
     }
@@ -3532,6 +3624,134 @@ namespace {
         clear_lifecycle_unhealthy_if_settled_locked();
       }
       departure_cv_.notify_all();
+    }
+
+    void finish_late_hdr_reassert(
+      const std::uint64_t display_id,
+      const std::uint64_t generation,
+      const IDDCX_MONITOR monitor
+    ) {
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(display_id, monitor);
+        if (record != monitors_.end() && record->second.descriptor.generation == generation) {
+          record->second.late_hdr_reassert_in_flight = false;
+        }
+        if (late_hdr_reassert_calls_in_flight_ > 0) {
+          --late_hdr_reassert_calls_in_flight_;
+        }
+        clear_lifecycle_unhealthy_if_settled_locked();
+      }
+      departure_cv_.notify_all();
+    }
+
+    void run_late_hdr_reassert(
+      const std::uint64_t display_id,
+      const std::uint64_t generation,
+      const IDDCX_MONITOR monitor
+    ) {
+      for (std::size_t attempt = 0; attempt < kLateHdrReassertDelays.size(); ++attempt) {
+        const auto delay = kLateHdrReassertDelays[attempt];
+        {
+          std::unique_lock lock {mutex_};
+          if (departure_cv_.wait_for(lock, delay, [&]() {
+                return shutting_down_;
+              })) {
+            TraceLoggingWrite(
+              g_trace_provider,
+              "LateRemoteHdrReassertCancelled",
+              TraceLoggingUInt64(display_id, "DisplayId"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(attempt + 1), "Attempt"),
+              TraceLoggingBool(true, "ShuttingDown")
+            );
+            break;
+          }
+
+          const auto record = find_current_monitor_locked(display_id, monitor);
+          if (record == monitors_.end() ||
+              record->second.descriptor.generation != generation ||
+              record->second.arriving ||
+              record->second.departing ||
+              !record->second.hdr_requested ||
+              !record->second.late_hdr_reassert_in_flight) {
+            TraceLoggingWrite(
+              g_trace_provider,
+              "LateRemoteHdrReassertCancelled",
+              TraceLoggingUInt64(display_id, "DisplayId"),
+              TraceLoggingUInt32(static_cast<std::uint32_t>(attempt + 1), "Attempt"),
+              TraceLoggingBool(false, "ShuttingDown")
+            );
+            break;
+          }
+        }
+
+        const auto result = update_remote_display_config("SwapChainAssignedHdrReassert");
+        TraceLoggingWrite(
+          g_trace_provider,
+          "LateRemoteHdrReassertAttempt",
+          TraceLoggingUInt64(display_id, "DisplayId"),
+          TraceLoggingUInt64(generation, "Generation"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(attempt + 1), "Attempt"),
+          TraceLoggingUInt32(static_cast<std::uint32_t>(delay.count()), "DelayMilliseconds"),
+          TraceLoggingBool(result == vdd::BackendError::None, "Succeeded")
+        );
+      }
+
+      finish_late_hdr_reassert(display_id, generation, monitor);
+    }
+
+    void schedule_late_hdr_reassert(
+      const std::uint64_t display_id,
+      const IDDCX_MONITOR monitor
+    ) {
+      if constexpr (!kRemoteSessionDriver ||
+                    !kProofDuoHdrWireCompiled ||
+                    kProofWcgPrimeHdrCompiled) {
+        return;
+      }
+
+      std::uint64_t generation {};
+      {
+        std::lock_guard lock {mutex_};
+        const auto record = find_current_monitor_locked(display_id, monitor);
+        if (record == monitors_.end() ||
+            record->second.arriving ||
+            record->second.departing ||
+            !record->second.hdr_requested ||
+            record->second.late_hdr_reassert_in_flight ||
+            shutting_down_) {
+          return;
+        }
+        generation = record->second.descriptor.generation;
+        record->second.late_hdr_reassert_in_flight = true;
+        ++late_hdr_reassert_calls_in_flight_;
+      }
+
+      try {
+        std::thread([this, display_id, generation, monitor]() {
+          run_late_hdr_reassert(display_id, generation, monitor);
+        }).detach();
+      } catch (...) {
+        finish_late_hdr_reassert(display_id, generation, monitor);
+        TraceLoggingWrite(
+          g_trace_provider,
+          "LateRemoteHdrReassertScheduleFailed",
+          TraceLoggingUInt64(display_id, "DisplayId"),
+          TraceLoggingUInt64(generation, "Generation")
+        );
+        return;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "LateRemoteHdrReassertScheduled",
+        TraceLoggingUInt64(display_id, "DisplayId"),
+        TraceLoggingUInt64(generation, "Generation"),
+        TraceLoggingUInt32(
+          static_cast<std::uint32_t>(kLateHdrReassertDelays.size()),
+          "AttemptCount"
+        )
+      );
     }
 
     vdd::BackendDisplayResult arrive_display(const vdd::DisplayDescriptor &requested_descriptor, const bool permanent) {
@@ -3645,7 +3865,7 @@ namespace {
       const vdd::DisplayDescriptor &requested_descriptor,
       const bool permanent
     ) {
-      const auto descriptor = descriptor_with_runtime_hdr_policy(requested_descriptor);
+      auto descriptor = descriptor_with_runtime_hdr_policy(requested_descriptor);
 
       // Self-heal: a monitor left behind by a superseded record lineage (stale
       // departure raced with remove+recreate, or an abandoned late arrival)
@@ -3806,42 +4026,6 @@ namespace {
         return {vdd::BackendError::Failed, {}, 0};
       }
 
-      if constexpr (kRemoteSessionDriver) {
-        if (descriptor.initial_remote_hdr_requested) {
-          TraceLoggingWrite(
-            g_trace_provider,
-            "InitialRemoteHdrConfigBeforeArrival",
-            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
-            TraceLoggingBool(vdd::has_hdr_static_metadata(descriptor.edid), "EdidHdrStaticMetadata"),
-            TraceLoggingUInt32(descriptor.initial_sdr_white_level_nits, "SdrWhiteLevelNits")
-          );
-          const auto initial_config_result = update_remote_display_config(
-                "InitialHdrBeforeMonitorArrival",
-                descriptor.display_id
-              );
-          TraceLoggingWrite(
-            g_trace_provider,
-            "InitialRemoteHdrDisplayConfigResult",
-            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
-            TraceLoggingBool(initial_config_result == vdd::BackendError::None, "Succeeded")
-          );
-          if (initial_config_result != vdd::BackendError::None) {
-            TraceLoggingWrite(
-              g_trace_provider,
-              "InitialRemoteHdrConfigBeforeArrivalFailed",
-              TraceLoggingUInt64(descriptor.display_id, "DisplayId")
-            );
-            {
-              std::lock_guard lock {mutex_};
-              monitors_.erase(descriptor.display_id);
-            }
-            WdfObjectDelete(create_out.MonitorObject);
-            unregister_monitor_description_mode(descriptor);
-            return {vdd::BackendError::Failed, {}, 0};
-          }
-        }
-      }
-
       IDARG_OUT_MONITORARRIVAL arrival_out {};
       status = IddCxMonitorArrival(create_out.MonitorObject, &arrival_out);
       if (!NT_SUCCESS(status)) {
@@ -3877,12 +4061,44 @@ namespace {
         monitor->second.arriving = false;
       }
 
+      if constexpr (kRemoteSessionDriver) {
+        if (descriptor.initial_remote_hdr_requested) {
+          TraceLoggingWrite(
+            g_trace_provider,
+            "InitialRemoteHdrConfigAfterArrival",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+            TraceLoggingBool(vdd::has_hdr_static_metadata(descriptor.edid), "EdidHdrStaticMetadata"),
+            TraceLoggingUInt32(descriptor.initial_sdr_white_level_nits, "SdrWhiteLevelNits")
+          );
+          const auto initial_config_result = update_remote_display_config(
+            "InitialHdrAfterMonitorArrival"
+          );
+          TraceLoggingWrite(
+            g_trace_provider,
+            "InitialRemoteHdrDisplayConfigResult",
+            TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
+            TraceLoggingBool(initial_config_result == vdd::BackendError::None, "Succeeded")
+          );
+          if (initial_config_result != vdd::BackendError::None) {
+            TraceLoggingWrite(
+              g_trace_provider,
+              "InitialRemoteHdrConfigAfterArrivalFailed",
+              TraceLoggingUInt64(descriptor.display_id, "DisplayId")
+            );
+            (void) depart_display(descriptor.display_id, descriptor.generation);
+            return {vdd::BackendError::Failed, {}, 0};
+          }
+        }
+      }
+
       TraceLoggingWrite(
         g_trace_provider,
         "MonitorArrived",
         TraceLoggingUInt64(descriptor.display_id, "DisplayId"),
         TraceLoggingUInt32(descriptor.connector_index, "ConnectorIndex"),
         TraceLoggingBool(permanent, "Permanent"),
+        TraceLoggingInt32(arrival_out.OsAdapterLuid.HighPart, "OsAdapterLuidHighPart"),
+        TraceLoggingUInt32(arrival_out.OsAdapterLuid.LowPart, "OsAdapterLuidLowPart"),
         TraceLoggingUInt32(arrival_out.OsTargetId, "OsTargetId")
       );
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "MonitorArrived");
@@ -4275,6 +4491,11 @@ namespace {
         TraceLoggingUInt32(args->RenderAdapterLuid.LowPart, "RenderAdapterLow")
       );
       TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_SWAPCHAIN, "SwapChainAssigned");
+      // IddCx calls CommitModes2 with an SDR/8-bpc wire format after the
+      // post-arrival HDR update and before this callback. Reassert from a
+      // bounded worker so the experiment occurs after this callback unwinds;
+      // calling IddCx display-config APIs re-entrantly here can deadlock.
+      schedule_late_hdr_reassert(context->display_id, monitor);
       return STATUS_SUCCESS;
     }
 
@@ -4499,6 +4720,7 @@ namespace {
     std::uint32_t monitor_arrivals_in_flight_ {};
     std::uint32_t monitor_departures_in_flight_ {};
     std::uint32_t render_adapter_calls_in_flight_ {};
+    std::uint32_t late_hdr_reassert_calls_in_flight_ {};
     bool lifecycle_unhealthy_ {};
     NTSTATUS adapter_init_status_ {STATUS_DEVICE_NOT_READY};
     std::map<std::uint64_t, MonitorRecord> monitors_ {};

@@ -42,7 +42,7 @@ AddReg=Device_Install_Hw_AddReg
 HKR,,"UpperFilters",0x00010000,"IndirectKmd"
 HKR,"WUDF","DeviceGroupId",0x00000000,"SunshineRemoteDisplayGroup"
 HKR,,"ConfigVersion",0x00010001,1
-
+@VDD_REMOTE_DEVICE_SECURITY_ENTRY@
 [Device_Install.NT.Interfaces]
 AddInterface=@VDD_REMOTE_CONTROL_INTERFACE_GUID@,,ControlInterface
 

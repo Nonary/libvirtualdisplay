@@ -17,6 +17,8 @@ endif()
 option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
 option(BUILD_SUNSHINE_REMOTE_DISPLAY_DRIVER "Build the per-terminal-session UMDF/IddCx Sunshine remote display driver" OFF)
 option(SUNSHINE_REMOTE_DISPLAY_PROOF_INITIAL_HDR "Compile the proof-only initial HDR path into the remote display driver" OFF)
+option(SUNSHINE_REMOTE_DISPLAY_PROOF_DUO_HDR_WIRE "Compile the proof-only Duo-equivalent HDR wire contract into the remote display driver" OFF)
+option(SUNSHINE_REMOTE_DISPLAY_PROOF_WCG_PRIME_HDR "Compile the proof-only SDR-WCG source-mode priming path into the remote display driver" OFF)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     set(_libvirtualdisplay_tool_default ON)
 else()
@@ -91,11 +93,24 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR BUILD_SUNSHINE_VIRTUAL_DISPLAY_DR
     add_custom_target(gen_driver_package_inf DEPENDS "${SUNSHINE_DRIVER_INF_GENERATED}")
 
     set(SUNSHINE_REMOTE_DRIVER_INF_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/windows_driver/SunshineRemoteDisplayDriver.inf")
+    set(_sunshine_remote_inf_security_args)
+    if(SUNSHINE_REMOTE_DISPLAY_PROOF_WCG_PRIME_HDR)
+        # Proof-only: the transition helper runs under the authentic terminal-session
+        # user, so grant that user class read/write access to the session-scoped
+        # control interface. The normal generated and committed INF retain the
+        # service-SID-only descriptor from device_identity.
+        list(APPEND _sunshine_remote_inf_security_args
+            --control-security-descriptor
+            "D:P(A\;\;GA\;\;\;SY)(A\;\;GA\;\;\;BA)(A\;\;GRGW\;\;\;BU)"
+            --device-security-descriptor
+            "D:P(A\;\;GA\;\;\;SY)(A\;\;GA\;\;\;BA)(A\;\;GRGW\;\;\;BU)")
+    endif()
     add_custom_command(OUTPUT "${SUNSHINE_REMOTE_DRIVER_INF_GENERATED}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/windows_driver"
             COMMAND gen_driver_inf
                 --driverver-date "${LIBVIRTUALDISPLAY_DRIVER_DATE}"
                 --driverver-version "${LIBVIRTUALDISPLAY_DRIVER_VERSION}"
+                ${_sunshine_remote_inf_security_args}
                 "${SUNSHINE_REMOTE_DRIVER_INF_TEMPLATE}"
                 "${SUNSHINE_REMOTE_DRIVER_INF_GENERATED}"
             DEPENDS gen_driver_inf "${SUNSHINE_REMOTE_DRIVER_INF_TEMPLATE}"
@@ -112,7 +127,10 @@ set(_libvirtualdisplay_tool_targets)
 
 if(WIN32 AND BUILD_VIRTUALDISPLAY_PROBE)
     add_executable(virtualdisplay_probe "${PROJECT_SOURCE_DIR}/tools/virtualdisplay_probe.cpp")
-    target_link_libraries(virtualdisplay_probe PRIVATE libvirtualdisplay::driver advapi32 d3d11 dxgi mscms)
+    target_link_libraries(virtualdisplay_probe PRIVATE libvirtualdisplay::driver advapi32 d3d11 dxgi gdi32 mscms wtsapi32)
+    if(MSVC)
+      target_link_libraries(virtualdisplay_probe PRIVATE ole32 windowsapp)
+    endif()
     target_compile_features(virtualdisplay_probe PRIVATE cxx_std_20)
     install(TARGETS virtualdisplay_probe RUNTIME DESTINATION tools)
     list(APPEND _libvirtualdisplay_tool_targets virtualdisplay_probe)
