@@ -257,6 +257,31 @@ namespace virtual_display::driver {
     return ValidationError::None;
   }
 
+  ValidationError validate_set_display_mode(const SetDisplayModeRequest &request) {
+    if (!is_valid_api_namespace(request.api_namespace)) {
+      return ValidationError::WrongApiNamespace;
+    }
+    if (request.display_id == 0) {
+      return ValidationError::MissingDisplayId;
+    }
+    if (const auto mode_validation = validate_display_mode(
+          request.width,
+          request.height,
+          request.refresh_rate_millihz
+        );
+        mode_validation != ValidationError::None) {
+      return mode_validation;
+    }
+    if (request.flags != 0) {
+      return ValidationError::InvalidFlags;
+    }
+    if (request.reserved != 0) {
+      return ValidationError::InvalidReservedField;
+    }
+
+    return ValidationError::None;
+  }
+
   ValidationError validate_lease_display_request(const LeaseDisplayRequest &request) {
     if (!is_valid_api_namespace(request.api_namespace)) {
       return ValidationError::WrongApiNamespace;

@@ -277,6 +277,15 @@ namespace virtual_display::driver {
         return result_from_controller(controller_.set_display_hdr_state(request, controller_lock));
       }
 
+      case kIoctlSetDisplayMode: {
+        SetDisplayModeRequest request {};
+        if (!read_input(input, input_size, request)) {
+          return {IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+
+        return result_from_controller(controller_.set_display_mode(request, controller_lock));
+      }
+
       default:
         return {IoctlStatus::InvalidIoctl, 0, {}};
     }

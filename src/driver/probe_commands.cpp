@@ -129,6 +129,9 @@ namespace virtual_display::driver {
     if (command == "--remote-set-hdr") {
       return plan(5, 6);
     }
+    if (command == "--remote-set-mode") {
+      return plan(7, 7);
+    }
     if (command == "--associate-color-profile") {
       return plan(5, (std::numeric_limits<int>::max)());
     }

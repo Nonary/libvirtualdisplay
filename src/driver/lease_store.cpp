@@ -532,6 +532,36 @@ namespace virtual_display::driver {
     return {};
   }
 
+  StoreResult DisplayStore::set_display_mode(const SetDisplayModeRequest &request) {
+    if (const auto validation = validate_set_display_mode(request);
+        validation != ValidationError::None) {
+      return validation_failure(validation);
+    }
+
+    for (std::uint32_t index = 0; index < display_manifest_.profile_count; ++index) {
+      auto &profile = display_manifest_.profiles[index];
+      if (profile.display_id != request.display_id) {
+        continue;
+      }
+
+      profile.native_mode_index = 0;
+      profile.allowed_mode_count = 1;
+      profile.allowed_modes[0] = {request.width, request.height, request.refresh_rate_millihz};
+      permanent_display_settings_ = permanent_settings_from_display_manifest(display_manifest_);
+      return {};
+    }
+
+    if (auto display = displays_by_id_.find(request.display_id);
+        display != displays_by_id_.end() && !display->second.pending_departure) {
+      display->second.width = request.width;
+      display->second.height = request.height;
+      display->second.refresh_rate_millihz = request.refresh_rate_millihz;
+      return {};
+    }
+
+    return {StoreError::DisplayNotFound, ValidationError::None};
+  }
+
   PermanentDisplayCountResult DisplayStore::query_permanent_display_count() const {
     PermanentDisplayCountResult result {};
     result.current_display_count = permanent_display_count_;

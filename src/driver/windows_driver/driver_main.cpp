@@ -2883,6 +2883,56 @@ namespace {
       return vdd::BackendError::None;
     }
 
+    vdd::BackendError set_display_mode(const vdd::SetDisplayModeRequest &request) override {
+      if constexpr (!kRemoteSessionDriver) {
+        return vdd::BackendError::Failed;
+      }
+
+      vdd::DisplayMode old_mode {};
+      {
+        std::lock_guard lock {mutex_};
+        const auto monitor = monitors_.find(request.display_id);
+        if (monitor == monitors_.end() || monitor->second.arriving || monitor->second.departing) {
+          return vdd::BackendError::Failed;
+        }
+        old_mode = {
+          monitor->second.descriptor.width,
+          monitor->second.descriptor.height,
+          monitor->second.descriptor.refresh_rate_millihz
+        };
+        monitor->second.descriptor.width = request.width;
+        monitor->second.descriptor.height = request.height;
+        monitor->second.descriptor.refresh_rate_millihz = request.refresh_rate_millihz;
+      }
+
+      const auto result = update_remote_display_config("SetDisplayMode");
+      if (result != vdd::BackendError::None) {
+        {
+          std::lock_guard lock {mutex_};
+          if (const auto monitor = monitors_.find(request.display_id); monitor != monitors_.end()) {
+            monitor->second.descriptor.width = old_mode.width;
+            monitor->second.descriptor.height = old_mode.height;
+            monitor->second.descriptor.refresh_rate_millihz = old_mode.refresh_rate_millihz;
+          }
+        }
+        (void) update_remote_display_config("SetDisplayModeRollback");
+        return result;
+      }
+
+      TraceLoggingWrite(
+        g_trace_provider,
+        "RemoteDisplayModeSet",
+        TraceLoggingUInt64(request.display_id, "DisplayId"),
+        TraceLoggingUInt32(old_mode.width, "OldWidth"),
+        TraceLoggingUInt32(old_mode.height, "OldHeight"),
+        TraceLoggingUInt32(old_mode.refresh_rate_millihz, "OldRefreshRateMilliHz"),
+        TraceLoggingUInt32(request.width, "Width"),
+        TraceLoggingUInt32(request.height, "Height"),
+        TraceLoggingUInt32(request.refresh_rate_millihz, "RefreshRateMilliHz")
+      );
+      return vdd::BackendError::None;
+    }
+
     vdd::BackendError set_render_adapter(const vdd::SetRenderAdapterRequest &request) override {
       const auto preferred_render_adapter = vdd::to_windows_luid(request.adapter_luid);
       IDDCX_ADAPTER adapter {};

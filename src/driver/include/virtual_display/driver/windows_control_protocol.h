@@ -85,6 +85,8 @@ namespace virtual_display::driver {
     CTL_CODE(FILE_DEVICE_UNKNOWN, static_cast<DWORD>(IoctlFunction::ReclaimTemporaryDisplay), METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA);
   inline constexpr DWORD kWinIoctlSetDisplayHdrState =
     CTL_CODE(FILE_DEVICE_UNKNOWN, static_cast<DWORD>(IoctlFunction::SetDisplayHdrState), METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA);
+  inline constexpr DWORD kWinIoctlSetDisplayMode =
+    CTL_CODE(FILE_DEVICE_UNKNOWN, static_cast<DWORD>(IoctlFunction::SetDisplayMode), METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA);
 
   static_assert(sizeof(GUID) == sizeof(Guid));
   static_assert(sizeof(LUID) == sizeof(AdapterLuid));
@@ -103,6 +105,7 @@ namespace virtual_display::driver {
   static_assert(kWinIoctlCreateTemporaryDisplayOwned == kIoctlCreateTemporaryDisplayOwned);
   static_assert(kWinIoctlReclaimTemporaryDisplay == kIoctlReclaimTemporaryDisplay);
   static_assert(kWinIoctlSetDisplayHdrState == kIoctlSetDisplayHdrState);
+  static_assert(kWinIoctlSetDisplayMode == kIoctlSetDisplayMode);
 }  // namespace virtual_display::driver
 
 #endif

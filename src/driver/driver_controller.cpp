@@ -571,6 +571,33 @@ namespace virtual_display::driver {
     return {};
   }
 
+  ControllerStatus DriverController::set_display_mode(const SetDisplayModeRequest &request) {
+    return set_display_mode(request, nullptr);
+  }
+
+  ControllerStatus DriverController::set_display_mode(
+    const SetDisplayModeRequest &request,
+    std::unique_lock<std::timed_mutex> *controller_lock
+  ) {
+    if (const auto validation = validate_set_display_mode(request);
+        validation != ValidationError::None) {
+      return {StoreError::ValidationFailed, validation, BackendError::None};
+    }
+
+    if (const auto backend_error = call_backend_without_controller_lock(
+          backend_call_mutex_,
+          controller_lock,
+          BackendError::Busy,
+          [&]() {
+            return backend_.set_display_mode(request);
+          });
+        backend_error != BackendError::None) {
+      return {StoreError::None, ValidationError::None, backend_error};
+    }
+
+    return from_store_result(store_.set_display_mode(request));
+  }
+
   const DisplayManifest &DriverController::query_display_manifest() const {
     return store_.display_manifest();
   }
@@ -702,6 +729,10 @@ namespace virtual_display::driver {
   }
 
   BackendError DisplayDriverBackend::set_display_hdr_state(const SetDisplayHdrStateRequest &) {
+    return BackendError::Failed;
+  }
+
+  BackendError DisplayDriverBackend::set_display_mode(const SetDisplayModeRequest &) {
     return BackendError::Failed;
   }
 

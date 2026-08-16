@@ -140,6 +140,7 @@ namespace {
       << "  --remote-query-state <session_id>\n"
       << "  --remote-set-permanent <session_id> <count>\n"
       << "  --remote-set-hdr <session_id> <display_id> <0|1> [sdr_white_level_nits]\n"
+      << "  --remote-set-mode <session_id> <display_id> <width> <height> <refresh_millihz>\n"
       << "  --self-test-permanent [count]\n"
       << "  --self-test-temp [width height refresh_hz]\n"
       << "  --self-test-4k240 [timeout_ms]\n"
@@ -2644,6 +2645,7 @@ namespace {
     std::cout << "display_config_query_flags=" << query_flags
               << " display_config_paths=" << display_config.paths.size()
               << " modes=" << display_config.modes.size() << '\n';
+    const bool virtual_mode_aware = (query_flags & QDC_VIRTUAL_MODE_AWARE) != 0;
     for (std::size_t index = 0; index < display_config.paths.size(); ++index) {
       const auto &path = display_config.paths[index];
       const bool matches_filter =
@@ -2669,6 +2671,38 @@ namespace {
                 << " tech=" << static_cast<unsigned int>(path.targetInfo.outputTechnology)
                 << " status=" << static_cast<unsigned int>(path.targetInfo.statusFlags)
                 << '\n';
+
+      const auto source_index = virtual_mode_aware ?
+        path.sourceInfo.sourceModeInfoIdx :
+        path.sourceInfo.modeInfoIdx;
+      if (source_index != DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID &&
+          source_index < display_config.modes.size()) {
+        const auto &mode = display_config.modes[source_index];
+        if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+          std::cout << "path_source_mode[" << index << "]"
+                    << " width=" << mode.sourceMode.width
+                    << " height=" << mode.sourceMode.height
+                    << " pixel_format=" << static_cast<unsigned int>(mode.sourceMode.pixelFormat)
+                    << " position=" << mode.sourceMode.position.x << ',' << mode.sourceMode.position.y
+                    << '\n';
+        }
+      }
+
+      const auto target_index = virtual_mode_aware ?
+        path.targetInfo.targetModeInfoIdx :
+        path.targetInfo.modeInfoIdx;
+      if (target_index != DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID &&
+          target_index < display_config.modes.size()) {
+        const auto &mode = display_config.modes[target_index];
+        if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+          const auto &signal = mode.targetMode.targetVideoSignalInfo;
+          std::cout << "path_target_mode[" << index << "]"
+                    << " active=" << signal.activeSize.cx << 'x' << signal.activeSize.cy
+                    << " total=" << signal.totalSize.cx << 'x' << signal.totalSize.cy
+                    << " vsync=" << signal.vSyncFreq.Numerator << '/' << signal.vSyncFreq.Denominator
+                    << '\n';
+        }
+      }
     }
   }
 
@@ -5355,7 +5389,9 @@ int main(const int argc, char **argv) {
   }
 
   const bool remote_query = command == "--remote-query-permanent" || command == "--remote-query-state";
-  const bool remote_set = command == "--remote-set-permanent" || command == "--remote-set-hdr";
+  const bool remote_set = command == "--remote-set-permanent" ||
+                          command == "--remote-set-hdr" ||
+                          command == "--remote-set-mode";
   std::uint32_t remote_session_id {};
   if ((remote_query || remote_set) &&
       !read_u32_arg(argc, argv, 2, 0, "remote session id", remote_session_id)) {
@@ -5518,6 +5554,28 @@ int main(const int argc, char **argv) {
               << " display_id=" << request.display_id
               << " hdr_enabled=" << request.enabled
               << " sdr_white_level_nits=" << request.sdr_white_level_nits << '\n';
+    return 0;
+  }
+
+  if (command == "--remote-set-mode") {
+    if (!require_command_arg_count(command, argc)) {
+      return 2;
+    }
+    vdd::SetDisplayModeRequest request {};
+    if (!read_u64_arg(argc, argv, 3, 0, "display id", request.display_id) ||
+        !read_u32_arg(argc, argv, 4, 0, "width", request.width) ||
+        !read_u32_arg(argc, argv, 5, 0, "height", request.height) ||
+        !read_u32_arg(argc, argv, 6, 0, "refresh rate (millihertz)", request.refresh_rate_millihz)) {
+      return 2;
+    }
+    const auto result = client.set_display_mode(request);
+    if (!result.ok()) {
+      return fail("set remote display mode failed", result);
+    }
+    std::cout << "remote_session=" << remote_session_id
+              << " display_id=" << request.display_id
+              << " mode=" << request.width << 'x' << request.height << '@'
+              << (request.refresh_rate_millihz / 1000.0) << "Hz\n";
     return 0;
   }
 

@@ -61,6 +61,7 @@ namespace virtual_display::driver {
     virtual BackendError apply_display_manifest(const DisplayManifest &manifest);
     virtual BackendError set_render_adapter(const SetRenderAdapterRequest &request) = 0;
     virtual BackendError set_display_hdr_state(const SetDisplayHdrStateRequest &request);
+    virtual BackendError set_display_mode(const SetDisplayModeRequest &request);
   };
 
   struct ControllerStatus {
@@ -130,6 +131,11 @@ namespace virtual_display::driver {
     ControllerStatus set_display_hdr_state(const SetDisplayHdrStateRequest &request);
     ControllerStatus set_display_hdr_state(
       const SetDisplayHdrStateRequest &request,
+      std::unique_lock<std::timed_mutex> *controller_lock
+    );
+    ControllerStatus set_display_mode(const SetDisplayModeRequest &request);
+    ControllerStatus set_display_mode(
+      const SetDisplayModeRequest &request,
       std::unique_lock<std::timed_mutex> *controller_lock
     );
     const DisplayManifest &query_display_manifest() const;

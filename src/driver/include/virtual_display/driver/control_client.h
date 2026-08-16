@@ -74,6 +74,7 @@ namespace virtual_display::driver {
     ControlResult<DisplayManifest> query_display_manifest();
     ControlOperationResult set_render_adapter(const SetRenderAdapterRequest &request);
     ControlOperationResult set_display_hdr_state(const SetDisplayHdrStateRequest &request);
+    ControlOperationResult set_display_mode(const SetDisplayModeRequest &request);
 
   private:
     template<class T>

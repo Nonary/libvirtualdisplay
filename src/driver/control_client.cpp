@@ -95,6 +95,10 @@ namespace virtual_display::driver {
     return ioctl_no_out(kIoctlSetDisplayHdrState, &request, sizeof(request));
   }
 
+  ControlOperationResult ControlClient::set_display_mode(const SetDisplayModeRequest &request) {
+    return ioctl_no_out(kIoctlSetDisplayMode, &request, sizeof(request));
+  }
+
   ControlOperationResult ControlClient::ioctl_no_out(
     const std::uint32_t ioctl_code,
     const void *input,

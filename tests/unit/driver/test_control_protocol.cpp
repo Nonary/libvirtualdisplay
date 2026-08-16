@@ -91,6 +91,7 @@ TEST(VirtualDisplayDriverControlProtocol, ComputesBufferedUnknownDeviceIoctlCode
   EXPECT_EQ(vdd::kIoctlCreateTemporaryDisplayOwned, 0x0022e430u);
   EXPECT_EQ(vdd::kIoctlReclaimTemporaryDisplay, 0x0022e434u);
   EXPECT_EQ(vdd::kIoctlSetDisplayHdrState, 0x0022e438u);
+  EXPECT_EQ(vdd::kIoctlSetDisplayMode, 0x0022e43cu);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionUsesDedicatedNamespace) {
@@ -106,7 +107,7 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants)
   // Behavioral replacement for the test that scraped README.md for the version prose: it
   // asserts the formatter that is the single source of truth for the dotted version, rather
   // than that a string happens to appear in a checked-in document.
-  EXPECT_EQ(vdd::protocol_version_string(), "3.8.0");
+  EXPECT_EQ(vdd::protocol_version_string(), "3.9.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {
@@ -468,6 +469,31 @@ TEST(VirtualDisplayDriverControlProtocol, ValidatesDisplayHdrState) {
   request.sdr_white_level_nits = vdd::kDefaultSdrWhiteLevelNits;
   request.display_id = 0;
   EXPECT_EQ(vdd::validate_set_display_hdr_state(request), vdd::ValidationError::MissingDisplayId);
+}
+
+TEST(VirtualDisplayDriverControlProtocol, ValidatesDisplayModeChange) {
+  vdd::SetDisplayModeRequest request {};
+  request.display_id = 0x7000000000000001ull;
+  request.width = 2560;
+  request.height = 1440;
+  request.refresh_rate_millihz = 120'000;
+
+  EXPECT_EQ(vdd::validate_set_display_mode(request), vdd::ValidationError::None);
+
+  request.width = 0;
+  EXPECT_EQ(vdd::validate_set_display_mode(request), vdd::ValidationError::InvalidWidth);
+
+  request.width = 2560;
+  request.refresh_rate_millihz = 0;
+  EXPECT_EQ(vdd::validate_set_display_mode(request), vdd::ValidationError::InvalidRefreshRate);
+
+  request.refresh_rate_millihz = 120'000;
+  request.flags = 1;
+  EXPECT_EQ(vdd::validate_set_display_mode(request), vdd::ValidationError::InvalidFlags);
+
+  request.flags = 0;
+  request.display_id = 0;
+  EXPECT_EQ(vdd::validate_set_display_mode(request), vdd::ValidationError::MissingDisplayId);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ValidatesPermanentDisplaySettings) {

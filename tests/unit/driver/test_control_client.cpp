@@ -367,6 +367,27 @@ TEST(VirtualDisplayDriverControlClient, SetDisplayHdrStateUsesHdrIoctl) {
   EXPECT_EQ(sent.sdr_white_level_nits, 203u);
 }
 
+TEST(VirtualDisplayDriverControlClient, SetDisplayModeUsesModeIoctl) {
+  FakeTransport transport;
+  vdd::ControlClient client {transport};
+  vdd::SetDisplayModeRequest request {};
+  request.display_id = 0x7000000000000001ull;
+  request.width = 2560;
+  request.height = 1440;
+  request.refresh_rate_millihz = 120'000;
+
+  const auto result = client.set_display_mode(request);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(transport.calls.size(), 1u);
+  EXPECT_EQ(transport.calls[0].ioctl_code, vdd::kIoctlSetDisplayMode);
+  const auto sent = input_as<vdd::SetDisplayModeRequest>(transport.calls[0]);
+  EXPECT_EQ(sent.display_id, request.display_id);
+  EXPECT_EQ(sent.width, 2560u);
+  EXPECT_EQ(sent.height, 1440u);
+  EXPECT_EQ(sent.refresh_rate_millihz, 120'000u);
+}
+
 TEST(VirtualDisplayDriverControlClient, DetectsShortOutput) {
   FakeTransport transport;
   transport.set_output(vdd::ProtocolVersion {});

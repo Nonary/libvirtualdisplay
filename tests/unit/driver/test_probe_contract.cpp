@@ -95,6 +95,7 @@ TEST(VirtualDisplayProbeContract, PlansProbeCommandArgcBoundsAndExecutionStage) 
     ExpectedPlan {"--remote-query-state", 3, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--remote-set-permanent", 4, 4, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--remote-set-hdr", 5, 6, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
+    ExpectedPlan {"--remote-set-mode", 7, 7, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-permanent", 2, 3, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--self-test-temp", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
     ExpectedPlan {"--probe-displaymanager-acquire-new-temp-target", 2, 5, vdd::ProbeCommandExecutionStage::ControlDeviceWithoutActiveSession},
