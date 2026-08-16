@@ -93,24 +93,11 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME OR BUILD_SUNSHINE_VIRTUAL_DISPLAY_DR
     add_custom_target(gen_driver_package_inf DEPENDS "${SUNSHINE_DRIVER_INF_GENERATED}")
 
     set(SUNSHINE_REMOTE_DRIVER_INF_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/windows_driver/SunshineRemoteDisplayDriver.inf")
-    set(_sunshine_remote_inf_security_args)
-    if(SUNSHINE_REMOTE_DISPLAY_PROOF_WCG_PRIME_HDR)
-        # Proof-only: the transition helper runs under the authentic terminal-session
-        # user, so grant that user class read/write access to the session-scoped
-        # control interface. The normal generated and committed INF retain the
-        # service-SID-only descriptor from device_identity.
-        list(APPEND _sunshine_remote_inf_security_args
-            --control-security-descriptor
-            "D:P(A\;\;GA\;\;\;SY)(A\;\;GA\;\;\;BA)(A\;\;GRGW\;\;\;BU)"
-            --device-security-descriptor
-            "D:P(A\;\;GA\;\;\;SY)(A\;\;GA\;\;\;BA)(A\;\;GRGW\;\;\;BU)")
-    endif()
     add_custom_command(OUTPUT "${SUNSHINE_REMOTE_DRIVER_INF_GENERATED}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/windows_driver"
             COMMAND gen_driver_inf
                 --driverver-date "${LIBVIRTUALDISPLAY_DRIVER_DATE}"
                 --driverver-version "${LIBVIRTUALDISPLAY_DRIVER_VERSION}"
-                ${_sunshine_remote_inf_security_args}
                 "${SUNSHINE_REMOTE_DRIVER_INF_TEMPLATE}"
                 "${SUNSHINE_REMOTE_DRIVER_INF_GENERATED}"
             DEPENDS gen_driver_inf "${SUNSHINE_REMOTE_DRIVER_INF_TEMPLATE}"

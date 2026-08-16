@@ -177,6 +177,14 @@ TEST(VirtualDisplayDriverDeviceIdentity, BuildsProtectedSystemAndBrokerOnlySecur
     sddl,
     "D:P(A;;GA;;;SY)(A;;GA;;;" + vdd::derive_service_sid(vdd::kBrokerServiceName) + ")"
   );
+
+  // The remote-session proof path must never widen the device ACL. User,
+  // interactive-user, and world principals would let a same-account process
+  // bypass the SYSTEM/service broker and issue display-control IOCTLs directly.
+  EXPECT_EQ(sddl.find("BU"), std::string::npos);
+  EXPECT_EQ(sddl.find("WD"), std::string::npos);
+  EXPECT_EQ(sddl.find("AU"), std::string::npos);
+  EXPECT_EQ(sddl.find("BA"), std::string::npos);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, NormalizesLeaseTimeouts) {

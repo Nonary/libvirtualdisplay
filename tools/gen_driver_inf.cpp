@@ -68,7 +68,10 @@ int main(int argc, char **argv) {
   std::string driverver_date = kDefaultDriverVerDate;
   std::string driverver_version = kDefaultDriverVerVersion;
   std::string control_security_descriptor = vdd::control_interface_security_descriptor();
-  std::string device_security_descriptor;
+  // Both the device object and its control interface are privileged broker
+  // boundaries. Keep the remote proof build on this same immutable descriptor;
+  // there is intentionally no command-line override for either ACL.
+  std::string device_security_descriptor = vdd::control_interface_security_descriptor();
   for (auto it = args.begin(); it != args.end();) {
     if (*it == "--check") {
       check = true;
@@ -87,27 +90,13 @@ int main(int argc, char **argv) {
       }
       driverver_version = *std::next(it);
       it = args.erase(it, std::next(it, 2));
-    } else if (*it == "--control-security-descriptor") {
-      if (std::next(it) == args.end()) {
-        std::cerr << "gen_driver_inf: --control-security-descriptor requires a value\n";
-        return 2;
-      }
-      control_security_descriptor = *std::next(it);
-      it = args.erase(it, std::next(it, 2));
-    } else if (*it == "--device-security-descriptor") {
-      if (std::next(it) == args.end()) {
-        std::cerr << "gen_driver_inf: --device-security-descriptor requires a value\n";
-        return 2;
-      }
-      device_security_descriptor = *std::next(it);
-      it = args.erase(it, std::next(it, 2));
     } else {
       ++it;
     }
   }
 
   if (args.size() != 2) {
-    std::cerr << "usage: gen_driver_inf [--check] [--driverver-date MM/DD/YYYY] [--driverver-version A.B.C.D] [--control-security-descriptor SDDL] [--device-security-descriptor SDDL] <template.inf.in> <output.inf>\n";
+    std::cerr << "usage: gen_driver_inf [--check] [--driverver-date MM/DD/YYYY] [--driverver-version A.B.C.D] <template.inf.in> <output.inf>\n";
     return 2;
   }
 

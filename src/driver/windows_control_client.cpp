@@ -421,6 +421,18 @@ namespace virtual_display::driver {
       ),
       devices.end()
     );
+    // A terminal session is allowed exactly one control interface. Opening the
+    // first matching path would let a stale/recreated device win a race and
+    // would make the caller's session identity advisory. The broker/service
+    // must re-enumerate and reject zero or multiple candidates instead.
+    if (devices.size() != 1) {
+      return {
+        ControlStatus::TransportFailed,
+        {},
+        devices.empty() ? ERROR_FILE_NOT_FOUND : ERROR_INVALID_DATA,
+        {}
+      };
+    }
     return open_control_device_paths(devices, last_error);
   }
 }  // namespace virtual_display::driver
