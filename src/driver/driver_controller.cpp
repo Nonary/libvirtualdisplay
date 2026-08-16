@@ -568,7 +568,7 @@ namespace virtual_display::driver {
       return {StoreError::None, ValidationError::None, backend_error};
     }
 
-    return {};
+    return from_store_result(store_.set_display_hdr_state(request));
   }
 
   ControllerStatus DriverController::set_display_mode(const SetDisplayModeRequest &request) {
@@ -766,6 +766,9 @@ namespace virtual_display::driver {
     DisplayStateEntry entry {};
     entry.kind = kDisplayStateKindTemporary;
     entry.flags = kDisplayStateFlagHdrSupported;
+    if (record.initial_remote_hdr_requested) {
+      entry.flags |= kDisplayStateFlagHdrEnabled;
+    }
     if (record.retain_identity) {
       entry.flags |= kDisplayStateFlagRetainIdentity;
     }

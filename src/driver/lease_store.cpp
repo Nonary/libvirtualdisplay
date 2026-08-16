@@ -562,6 +562,19 @@ namespace virtual_display::driver {
     return {StoreError::DisplayNotFound, ValidationError::None};
   }
 
+  StoreResult DisplayStore::set_display_hdr_state(const SetDisplayHdrStateRequest &request) {
+    if (const auto validation = validate_set_display_hdr_state(request);
+        validation != ValidationError::None) {
+      return validation_failure(validation);
+    }
+    if (auto display = displays_by_id_.find(request.display_id);
+        display != displays_by_id_.end() && !display->second.pending_departure) {
+      display->second.initial_remote_hdr_requested = request.enabled != 0;
+      return {};
+    }
+    return {StoreError::DisplayNotFound, ValidationError::None};
+  }
+
   PermanentDisplayCountResult DisplayStore::query_permanent_display_count() const {
     PermanentDisplayCountResult result {};
     result.current_display_count = permanent_display_count_;

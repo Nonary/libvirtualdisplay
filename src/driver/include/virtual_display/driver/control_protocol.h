@@ -85,6 +85,7 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kDisplayStateKindTemporary = 2;
   inline constexpr std::uint32_t kDisplayStateFlagHdrSupported = 0x00000001u;
   inline constexpr std::uint32_t kDisplayStateFlagRetainIdentity = 0x00000002u;
+  inline constexpr std::uint32_t kDisplayStateFlagHdrEnabled = 0x00000004u;
   inline constexpr std::uint32_t kDisplayManifestVersion = 3;
   inline constexpr std::uint32_t kMaxPermanentDisplayProfiles = 8;
   inline constexpr std::uint32_t kMaxAllowedModesPerProfile = 4;

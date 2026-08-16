@@ -116,6 +116,7 @@ namespace virtual_display::driver {
     QueryLeaseResult query_lease(std::uint64_t lease_id, std::chrono::steady_clock::time_point now) const;
     StoreResult set_permanent_display_count(const PermanentDisplayCountRequest &request);
     StoreResult apply_display_manifest(const DisplayManifest &manifest);
+    StoreResult set_display_hdr_state(const SetDisplayHdrStateRequest &request);
     StoreResult set_display_mode(const SetDisplayModeRequest &request);
     PermanentDisplayCountResult query_permanent_display_count() const;
     std::uint32_t reap_expired(std::chrono::steady_clock::time_point now);
