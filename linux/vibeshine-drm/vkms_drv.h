@@ -152,6 +152,7 @@ struct vkms_plane_state {
 	struct vkms_frame_info *frame_info;
 	pixel_read_line_t pixel_read_line;
 	struct conversion_matrix conversion_matrix;
+	bool frame_mapped;
 };
 
 struct vkms_plane {

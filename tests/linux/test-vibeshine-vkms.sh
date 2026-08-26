@@ -56,7 +56,6 @@ configure_paths "$CONFIGFS_TEST_ROOT"
 FAKE_CONFIGFS=1
 
 ensure_display_backend || fail "preferred backend selection failed"
-[[ "$ACTIVE_BACKEND" == "$PREFERRED_BACKEND" ]] || fail "preferred HDR backend was not selected"
 create_pool || fail "initial pool creation failed"
 assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
 
@@ -149,44 +148,15 @@ remove_pool || fail "pool removal failed"
 [[ ! -e "$VKMS_DEVICE_DIR" ]] || fail "managed instance remains after removal"
 remove_pool || fail "idempotent pool removal failed"
 
-# If the HDR module is unavailable, upstream configfs VKMS is selected and
-# remains fully functional as an explicitly logged SDR fallback.
-rmdir -- "$PREFERRED_CONFIGFS_ROOT"
-mkdir -- "$FALLBACK_CONFIGFS_ROOT"
-# ShellCheck cannot see these command mocks being invoked by the sourced helper.
-# shellcheck disable=SC2329
-modprobe() {
-  [[ ${1:-} == "$FALLBACK_MODULE" ]]
-}
-ensure_display_backend || fail "upstream VKMS fallback selection failed"
-[[ "$ACTIVE_BACKEND" == "$FALLBACK_BACKEND" ]] || fail "SDR fallback backend was not selected"
-create_pool || fail "fallback pool creation failed"
-assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
-response=$(printf 'connect Virtual-1\n' | control_connection) || fail "fallback connect request failed"
-[[ "$response" == "OK connected Virtual-1" ]] || fail "unexpected fallback response: ${response}"
-response=$(printf 'disconnect Virtual-1\n' | control_connection) || fail "fallback disconnect request failed"
-[[ "$response" == "OK disconnected Virtual-1" ]] || fail "unexpected fallback disconnect response: ${response}"
-
-# When the HDR backend later appears, its pool takes precedence and the stale
-# managed fallback pool is removed before provisioning continues.
-mkdir -- "$PREFERRED_CONFIGFS_ROOT"
-select_backend "$PREFERRED_BACKEND"
-create_pool || fail "preferred pool creation after fallback failed"
-remove_inactive_backend_pool || fail "stale fallback cleanup failed"
-[[ ! -e "$FALLBACK_CONFIGFS_ROOT/$VKMS_DEVICE_NAME" ]] || fail "stale fallback pool remains"
-[[ -d "$PREFERRED_CONFIGFS_ROOT/$VKMS_DEVICE_NAME" ]] || fail "preferred pool was removed"
-remove_all_backend_pools || fail "all-backend cleanup failed"
-
-# Unsupported systems fail without creating a pool in either subsystem.
-rmdir -- "$PREFERRED_CONFIGFS_ROOT" "$FALLBACK_CONFIGFS_ROOT"
+# Unsupported systems fail without silently creating a CPU-backed stock-VKMS pool.
+rmdir -- "$VKMS_CONFIGFS_ROOT"
 # shellcheck disable=SC2329
 modprobe() {
   return 1
 }
-if ensure_display_backend; then
-  fail "backend detection succeeded without either configfs subsystem"
+if ensure_display_backend >/dev/null 2>&1; then
+  fail "backend detection succeeded without vibeshine_drm"
 fi
-[[ ! -e "$PREFERRED_CONFIGFS_ROOT/$VKMS_DEVICE_NAME" ]] || fail "preferred pool appeared on failure"
-[[ ! -e "$FALLBACK_CONFIGFS_ROOT/$VKMS_DEVICE_NAME" ]] || fail "fallback pool appeared on failure"
+[[ ! -e "$VKMS_DEVICE_DIR" ]] || fail "managed pool appeared on module failure"
 
 printf 'PASS: vibeshine-vkms shell tests\n'

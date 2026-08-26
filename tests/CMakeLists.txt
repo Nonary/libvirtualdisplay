@@ -62,5 +62,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
                     "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-contract.py"
                     "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm")
+        add_test(NAME linux_kwin_gpu_bridge_contract
+                COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-gpu-bridge-contract.py"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}")
     endif()
 endif()

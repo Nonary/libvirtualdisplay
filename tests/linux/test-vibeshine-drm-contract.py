@@ -74,13 +74,17 @@ def validate_edid(edid: bytes) -> None:
 
 def validate_source_contract(driver_root: Path) -> None:
     connector_path = driver_root / "vkms_connector.c"
+    driver_header_path = driver_root / "vkms_drv.h"
     plane_path = driver_root / "vkms_plane.c"
     configfs_path = driver_root / "vkms_configfs.c"
     config_path = driver_root / "vkms_config.c"
+    crtc_path = driver_root / "vkms_crtc.c"
     connector = connector_path.read_text(encoding="utf-8")
+    driver_header = driver_header_path.read_text(encoding="utf-8")
     plane = plane_path.read_text(encoding="utf-8")
     configfs = configfs_path.read_text(encoding="utf-8")
     config = config_path.read_text(encoding="utf-8")
+    crtc = crtc_path.read_text(encoding="utf-8")
 
     for needle in (
         "drm_connector_attach_max_bpc_property(&connector->base, 8, 16)",
@@ -101,6 +105,18 @@ def validate_source_contract(driver_root: Path) -> None:
         "DRM_FORMAT_P016",
     ):
         require_source(plane, pixel_format, plane_path.name)
+
+    for needle in (
+        "DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 5)",
+        "vkms_format_mod_supported",
+        "fb->modifier != DRM_FORMAT_MOD_LINEAR",
+        "vkms_format_modifiers,",
+    ):
+        require_source(plane, needle, plane_path.name)
+    require_source(driver_header, "bool frame_mapped", driver_header_path.name)
+    require(".get_crc_sources" not in crtc, "GPU pass-through CRTC still advertises software CRC")
+    require_source(configfs, "if (writeback)", configfs_path.name)
+    require_source(configfs, "return -EOPNOTSUPP", configfs_path.name)
 
     require(re.search(r'\.ci_name\s*=\s*"vibeshine-drm"', configfs) is not None,
             "configfs root is not named vibeshine-drm")

@@ -54,6 +54,58 @@ static const u32 vkms_formats[] = {
 	DRM_FORMAT_R8,
 };
 
+/*
+ * Keep the virtual scanout buffer on the NVIDIA render GPU. The NVIDIA GBM
+ * backend requires explicit block-linear modifiers; advertising only LINEAR
+ * makes KWin fall back to a CPU dumb-buffer copy for every frame.
+ *
+ * The six block heights below are the uncompressed Turing+ layout advertised
+ * by nvidia-drm. The PRIME importer preserves the producer DMA-BUF, so the
+ * virtual device never needs to understand or touch the tiled pixels.
+ */
+static const u64 vkms_format_modifiers[] = {
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 5),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 4),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 3),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 2),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 1),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 0),
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_INVALID,
+};
+
+static bool vkms_format_mod_supported(struct drm_plane *plane, u32 format,
+				      u64 modifier)
+{
+	if (modifier == DRM_FORMAT_MOD_LINEAR)
+		return true;
+
+	switch (modifier) {
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 5):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 4):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 3):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 2):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 1):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 0):
+		break;
+	default:
+		return false;
+	}
+
+	/* Match the RGB scanout formats shared by KWin and nvidia-drm. */
+	switch (format) {
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR2101010:
+	case DRM_FORMAT_XBGR2101010:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static struct drm_plane_state *
 vkms_plane_duplicate_state(struct drm_plane *plane)
 {
@@ -123,6 +175,7 @@ static const struct drm_plane_funcs vkms_plane_funcs = {
 	.reset			= vkms_plane_reset,
 	.atomic_duplicate_state = vkms_plane_duplicate_state,
 	.atomic_destroy_state	= vkms_plane_destroy_state,
+	.format_mod_supported	= vkms_format_mod_supported,
 };
 
 static void vkms_plane_atomic_update(struct drm_plane *plane,
@@ -185,6 +238,7 @@ static int vkms_plane_atomic_check(struct drm_plane *plane,
 static int vkms_prepare_fb(struct drm_plane *plane,
 			   struct drm_plane_state *state)
 {
+	struct vkms_plane_state *vkms_state = to_vkms_plane_state(state);
 	struct drm_shadow_plane_state *shadow_plane_state;
 	struct drm_framebuffer *fb = state->fb;
 	int ret;
@@ -198,21 +252,37 @@ static int vkms_prepare_fb(struct drm_plane *plane,
 	if (ret)
 		return ret;
 
-	return drm_gem_fb_vmap(fb, shadow_plane_state->map, shadow_plane_state->data);
+	/*
+	 * A non-linear PRIME framebuffer belongs to the render GPU. Mapping it on
+	 * the virtual device would force the very CPU migration this driver exists
+	 * to avoid. Vblank/page-flip emulation does not access pixel memory. The
+	 * product path disables CRC and writeback for these pass-through buffers.
+	 */
+	vkms_state->frame_mapped = false;
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		return 0;
+
+	ret = drm_gem_fb_vmap(fb, shadow_plane_state->map,
+			      shadow_plane_state->data);
+	if (!ret)
+		vkms_state->frame_mapped = true;
+	return ret;
 }
 
 static void vkms_cleanup_fb(struct drm_plane *plane,
 			    struct drm_plane_state *state)
 {
+	struct vkms_plane_state *vkms_state = to_vkms_plane_state(state);
 	struct drm_shadow_plane_state *shadow_plane_state;
 	struct drm_framebuffer *fb = state->fb;
 
-	if (!fb)
+	if (!fb || !vkms_state->frame_mapped)
 		return;
 
 	shadow_plane_state = to_drm_shadow_plane_state(state);
 
 	drm_gem_fb_vunmap(fb, shadow_plane_state->map);
+	vkms_state->frame_mapped = false;
 }
 
 static const struct drm_plane_helper_funcs vkms_plane_helper_funcs = {
@@ -231,7 +301,8 @@ struct vkms_plane *vkms_plane_init(struct vkms_device *vkmsdev,
 	plane = drmm_universal_plane_alloc(dev, struct vkms_plane, base, 0,
 					   &vkms_plane_funcs,
 					   vkms_formats, ARRAY_SIZE(vkms_formats),
-					   NULL, vkms_config_plane_get_type(plane_cfg),
+					   vkms_format_modifiers,
+					   vkms_config_plane_get_type(plane_cfg),
 					   NULL);
 	if (IS_ERR(plane))
 		return plane;

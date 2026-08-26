@@ -1,0 +1,7 @@
+# KDE's wrapper resolves its compositor child through PATH. This launcher runs
+# a verified capability-free shadow so the dynamic loader can attach the
+# virtual KMS device to KWin's NVIDIA renderer. The launcher scopes LD_PRELOAD
+# to KWin and the interposer removes itself from the environment before KWin
+# starts child processes.
+[Service]
+Environment=PATH=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin

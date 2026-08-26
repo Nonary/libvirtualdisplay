@@ -157,6 +157,8 @@ static ssize_t crtc_writeback_store(struct config_item *item, const char *page,
 
 	if (kstrtobool(page, &writeback))
 		return -EINVAL;
+	if (writeback)
+		return -EOPNOTSUPP;
 
 	scoped_guard(mutex, &crtc->dev->lock) {
 		if (crtc->dev->enabled)

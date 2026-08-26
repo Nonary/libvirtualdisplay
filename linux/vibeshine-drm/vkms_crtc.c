@@ -105,9 +105,6 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.atomic_duplicate_state = vkms_atomic_crtc_duplicate_state,
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
 	DRM_CRTC_VBLANK_TIMER_FUNCS,
-	.get_crc_sources	= vkms_get_crc_sources,
-	.set_crc_source		= vkms_set_crc_source,
-	.verify_crc_source	= vkms_verify_crc_source,
 };
 
 static int vkms_crtc_atomic_check(struct drm_crtc *crtc,

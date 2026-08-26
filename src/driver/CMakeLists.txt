@@ -14,6 +14,58 @@ if(WIN32)
     target_link_libraries(${MODULE} PRIVATE setupapi)
 endif()
 
+option(BUILD_VIBESHINE_KWIN_GPU_BRIDGE
+        "Build and install the KWin GPU-association bridge for Vibeshine DRM" OFF)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
+        NOT SUNSHINE_BUILD_APPIMAGE AND NOT SUNSHINE_BUILD_FLATPAK)
+    # Associate the display-only virtual KMS node with KWin's NVIDIA renderer
+    # so GBM allocates scanout on the GPU rather than through kms_swrast.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_DRM REQUIRED IMPORTED_TARGET libdrm)
+
+    add_library(vibeshine_kwin_gpu SHARED
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_gpu_interposer.cpp")
+    set_target_properties(vibeshine_kwin_gpu PROPERTIES
+            OUTPUT_NAME vibeshine-kwin-gpu)
+    target_compile_features(vibeshine_kwin_gpu PRIVATE cxx_std_20)
+    target_link_libraries(vibeshine_kwin_gpu PRIVATE
+            PkgConfig::LIBVIRTUALDISPLAY_KWIN_DRM
+            ${CMAKE_DL_LIBS})
+
+    add_executable(vibeshine_kwin_preload_launcher
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_preload_launcher.cpp")
+    set_target_properties(vibeshine_kwin_preload_launcher PROPERTIES
+            OUTPUT_NAME kwin_wayland)
+    target_compile_features(vibeshine_kwin_preload_launcher PRIVATE cxx_std_20)
+    target_link_libraries(vibeshine_kwin_preload_launcher PRIVATE ${CMAKE_DL_LIBS})
+
+    # These are root-owned integration artifacts. Keep them independent of a
+    # user-selected executable prefix so the systemd user unit cannot point at
+    # a stale or user-writable library after package installation.
+    set(VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR "/usr/lib/vibeshine" CACHE PATH
+            "System directory for the Vibeshine KWin GPU bridge")
+    set(VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR "/usr/lib/systemd/user" CACHE PATH
+            "Systemd user-unit directory for the Vibeshine KWin GPU bridge drop-in")
+    set(VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR "/usr/libexec/vibeshine/kwin-preload" CACHE PATH
+            "Trusted executable directory for the Vibeshine KWin preload launcher")
+    set(VIBESHINE_KWIN_GPU_LIBRARY_PATH
+            "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}/libvibeshine-kwin-gpu.so")
+    target_compile_definitions(vibeshine_kwin_preload_launcher PRIVATE
+            VIBESHINE_KWIN_GPU_LIBRARY_PATH="${VIBESHINE_KWIN_GPU_LIBRARY_PATH}")
+    configure_file(
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-kwin-gpu.conf.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf" @ONLY)
+
+    install(TARGETS vibeshine_kwin_gpu
+            LIBRARY DESTINATION "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}")
+    install(TARGETS vibeshine_kwin_preload_launcher
+            RUNTIME DESTINATION "${VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR}")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf"
+            DESTINATION
+            "${VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR}/plasma-kwin_wayland.service.d")
+endif()
+
 option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     set(_libvirtualdisplay_tool_default ON)

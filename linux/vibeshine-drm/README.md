@@ -23,8 +23,8 @@ generator, not `vibeshine_hdr_edid.h`, and regenerate the header with:
 
 The current source targets the DRM APIs in Linux 7.2. The installer builds it
 for the running kernel (or registers it with DKMS when available). If it cannot
-be built or loaded, Vibeshine's display-pool helper can use upstream VKMS as an
-SDR fallback.
+be built or loaded, managed virtual displays remain unavailable; the helper
+does not substitute CPU-backed upstream VKMS scanout.
 
 With Secure Boot enforcement, the locally built module must be signed by a key
 trusted by the machine before the kernel will load it.
