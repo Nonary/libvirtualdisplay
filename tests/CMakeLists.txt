@@ -38,3 +38,29 @@ add_test(NAME driver_inf_in_sync
         COMMAND gen_driver_inf --check
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf.in"
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_program(LIBVIRTUALDISPLAY_BASH_EXECUTABLE bash)
+    if(LIBVIRTUALDISPLAY_BASH_EXECUTABLE)
+        add_test(NAME linux_vkms_setup
+                COMMAND "${LIBVIRTUALDISPLAY_BASH_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-vkms.sh"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-vkms")
+        add_test(NAME linux_drm_install
+                COMMAND "${LIBVIRTUALDISPLAY_BASH_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-install.sh"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-drm-install.in")
+        add_test(NAME linux_drm_build_module
+                COMMAND "${LIBVIRTUALDISPLAY_BASH_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-build-module.sh"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm/build-module")
+    endif()
+
+    find_program(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE NAMES python3)
+    if(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE)
+        add_test(NAME linux_drm_contract
+                COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-contract.py"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm")
+    endif()
+endif()

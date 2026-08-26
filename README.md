@@ -1,9 +1,10 @@
 # libvirtualdisplay
 
-Clean-room virtual display driver support for Sunshine.
+Cross-platform virtual display driver support for Sunshine.
 
-This repository owns Sunshine's dedicated virtual display control protocol,
-identity model, EDID generation, and Windows UMDF/IddCx driver implementation.
+This repository owns Sunshine's dedicated virtual display control protocols,
+identity model, EDID generation, Windows UMDF/IddCx driver implementation, and
+Linux DRM virtual-display backend.
 It is intentionally separate from Sunshine's existing `libdisplaydevice`
 dependency, which remains only a display enumeration/settings library.
 
@@ -17,10 +18,13 @@ The driver is dedicated to Sunshine virtual-display use cases:
 - keep lease lifetime separate from display identity through `LeaseId`
 - advertise HDR-capable EDID and IddCx target capabilities
 - provide runtime probes that verify the control path and HDR target behavior
+- provision a dormant Linux DRM connector pool and lease connectors through a
+  root-owned Unix-domain control broker
 
-This is a clean-room implementation. Compatibility work happens at the
-API/behavior level rather than by copying driver internals from other virtual
-display driver projects.
+The Windows implementation is clean-room: compatibility work happens at the
+API/behavior level rather than by copying other virtual-display drivers. The
+Linux kernel subtree is deliberately derived from upstream VKMS and retains
+its GPL SPDX licensing and provenance.
 
 ## Build
 
@@ -35,6 +39,13 @@ cmake --build build -j 10
 CMake fetches googletest automatically when no local source directory is
 provided. To use an existing checkout instead, pass
 `-DLIBVIRTUALDISPLAY_GOOGLETEST_SOURCE_DIR=<path-to-googletest>`.
+
+On Linux, the same build also tests the connector broker, module installer,
+kernel-source contract, deterministic HDR EDID, and the public
+`LinuxControlClient`. The `linux/vibeshine-drm` tree contains the GPL-licensed
+out-of-tree DRM module derived from upstream VKMS; its source files retain the
+upstream SPDX identifiers. Service and installer assets live under
+`linux/packaging`.
 
 To build only the Windows driver, CLI, and runtime probe:
 
@@ -236,6 +247,7 @@ The public C++ control surface is in:
 - `virtual_display/driver/control_protocol.h`
 - `virtual_display/driver/control_client.h`
 - `virtual_display/driver/windows_control_client.h`
+- `virtual_display/driver/linux_control_client.h`
 
 On Windows, open the first installed control device, check protocol
 compatibility, and construct a `ControlClient`:

@@ -7,6 +7,8 @@ project(libvirtualdisplay
         LANGUAGES CXX)
 
 set(LIBVIRTUALDISPLAY_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Version used for generated release packages")
+set(LIBVIRTUALDISPLAY_LINUX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/linux" CACHE INTERNAL
+        "Path to libvirtualdisplay Linux driver and service assets")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +54,9 @@ unset(_libvirtualdisplay_license_text)
 ")
     unset(_libvirtualdisplay_license_file)
     install(FILES README.md LICENSE DESTINATION .)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        install(DIRECTORY linux DESTINATION .)
+    endif()
 
     set(CPACK_PACKAGE_NAME "libvirtualdisplay")
     set(CPACK_PACKAGE_VENDOR "LizardByte")
