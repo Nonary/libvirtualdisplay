@@ -3,6 +3,9 @@
 set -euo pipefail
 
 SCRIPT_UNDER_TEST=${1:?usage: test-vibeshine-vkms.sh /path/to/vibeshine-vkms}
+PACKAGING_DIR=$(dirname -- "$SCRIPT_UNDER_TEST")
+SOCKET_UNIT="$PACKAGING_DIR/vibeshine-vkms-control.socket.in"
+CONNECTION_SERVICE="$PACKAGING_DIR/vibeshine-vkms-control@.service.in"
 TEST_ROOT=$(mktemp -d)
 
 cleanup_test_root() {
@@ -17,6 +20,13 @@ fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
+
+[[ -f "$SOCKET_UNIT" ]] || fail "missing socket unit: ${SOCKET_UNIT}"
+[[ -f "$CONNECTION_SERVICE" ]] || fail "missing connection service: ${CONNECTION_SERVICE}"
+grep -Fxq 'Accept=yes' "$SOCKET_UNIT" || fail 'control socket must use one service instance per connection'
+if grep -Eq '^Service=' "$SOCKET_UNIT"; then
+  fail 'Accept=yes control socket must derive its matching @.service template'
+fi
 
 assert_file_value() {
   local path=$1
