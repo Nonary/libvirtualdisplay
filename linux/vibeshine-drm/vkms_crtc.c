@@ -12,6 +12,7 @@
 #include <drm/drm_vblank_helper.h>
 
 #include "vkms_drv.h"
+#include "vibeshine_drm_compat.h"
 
 static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
 {

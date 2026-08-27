@@ -39,6 +39,7 @@
 #include "vibeshine_drm_change.h"
 #include "vibeshine_drm_present.h"
 #include "vibeshine_drm_uapi.h"
+#include "vibeshine_drm_compat.h"
 
 #define DRIVER_NAME	"vibeshine_drm"
 #define DRIVER_DESC	"Vibeshine HDR Virtual Display"

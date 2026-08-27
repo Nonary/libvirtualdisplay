@@ -13,6 +13,7 @@
 
 #include "vkms_drv.h"
 #include "vkms_formats.h"
+#include "vibeshine_drm_compat.h"
 
 static const u32 vkms_formats[] = {
 	DRM_FORMAT_ARGB8888,

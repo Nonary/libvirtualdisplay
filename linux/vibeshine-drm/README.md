@@ -46,22 +46,34 @@ generator, not `vibeshine_hdr_edid.h`, and regenerate the header with:
 ./generate_hdr_edid.py --header vibeshine_hdr_edid.h
 ```
 
-The current source targets the DRM APIs in Linux 7.2. The installer builds it
-for the running kernel (or registers it with DKMS when available). If it cannot
-be built or loaded, managed virtual displays remain unavailable; the helper
-does not substitute CPU-backed upstream VKMS scanout.
+The current source is derived from Linux 7.2 and includes the compatibility
+shim needed for the Linux 7.1 DRM atomic API. The installer builds it for the
+running kernel (or registers it with DKMS when available). If it cannot be
+built or loaded, managed virtual displays remain unavailable; the helper does
+not substitute CPU-backed upstream VKMS scanout.
 
-The installer signs both DKMS and direct builds with the standard local DKMS
-key at `/var/lib/dkms/mok.key`. On Secure Boot systems that boot through shim,
-enroll its public certificate once:
+The installer generates a persistent local DKMS key at
+`/var/lib/dkms/mok.key`, signs every DKMS or direct build, and verifies the
+embedded module signature before accepting the installation. Stock Arch and
+CachyOS kernels need no separate signing command: accept the package manager's
+normal installation confirmation and the module is built, signed, and verified
+automatically, including with Secure Boot through Limine or systemd-boot.
 
-```bash
-sudo /usr/libexec/vibeshine/vibeshine-drm-install enroll-key
-# Reboot, choose "Enroll MOK", and confirm with the temporary password.
-/usr/libexec/vibeshine/vibeshine-drm-install signing-status
-```
+Only a custom kernel that enforces trusted module signatures needs shim and a
+one-time MOK authorization. The Arch package installation detects this and
+launches the authorization prompt automatically. Confirm it, reboot, and
+approve the pending firmware confirmations once. A noninteractive package
+frontend that cannot display the prompt should be retried from a terminal.
 
 DKMS signs rebuilt modules with the same key after future kernel and Vibeshine
-updates. Direct bootloaders that do not pass through shim cannot expose MOK
-keys to the kernel; those systems must add shim to their boot chain or use
-their distribution's equivalent trusted-module signing mechanism.
+updates. The helper requests both certificate enrollment and Linux MOK-list
+trust, because enrollment alone does not put MOK keys in the kernel's trusted
+module keyring.
+
+Stock Arch Linux and CachyOS kernels currently permit a correctly signed but
+untrusted external module and record the normal external-module taint, so a
+direct Limine or systemd-boot installation remains loadable. Kernels that
+enforce trusted module signatures must boot through shim and complete the MOK
+requests, or use a custom kernel that embeds the local certificate. An `sbctl`
+owner key authorizes EFI programs; it is not imported into Linux's trusted
+module keyring and cannot by itself authorize an out-of-tree module.

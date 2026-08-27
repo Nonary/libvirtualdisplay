@@ -43,8 +43,15 @@ TEST_SYS_MODULE="$TEST_ROOT/sys-module"
 TEST_BUILD_TMP="$TEST_ROOT/build-tmp"
 TEST_MOK_KEY="$TEST_ROOT/dkms/mok.key"
 TEST_MOK_CERTIFICATE="$TEST_ROOT/dkms/mok.pub"
+TEST_EFI_FIRMWARE="$TEST_ROOT/efi"
+TEST_EFI_VARS="$TEST_ROOT/efi-vars"
+TEST_MOK_VARIABLES="$TEST_ROOT/mok-variables"
+TEST_LOCKDOWN_FILE="$TEST_ROOT/lockdown"
+TEST_SIG_ENFORCE_FILE="$TEST_ROOT/sig-enforce"
+TEST_DKMS_CONFIG="$TEST_ROOT/dkms-config"
 TEST_KERNEL="6.99.1-vibeshine"
-mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$TEST_KERNEL/build/scripts" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP"
+mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$TEST_KERNEL/build/scripts" "$TEST_SYS_MODULE" \
+  "$TEST_BUILD_TMP" "$TEST_EFI_FIRMWARE" "$TEST_EFI_VARS" "$TEST_DKMS_CONFIG/framework.conf.d"
 printf 'obj-m += vibeshine_drm.o\n' >"$TEST_SOURCE/Makefile"
 printf 'PACKAGE_NAME="vibeshine-drm"\n' >"$TEST_SOURCE/dkms.conf"
 printf '/* test source */\n' >"$TEST_SOURCE/vkms_drv.c"
@@ -58,11 +65,22 @@ configure_install_paths \
   "$TEST_SOURCE" "$TEST_STATE" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
   "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
 KERNEL_RELEASE_OVERRIDE=$TEST_KERNEL
+EFI_FIRMWARE_ROOT=$TEST_EFI_FIRMWARE
+EFI_VARS_ROOT=$TEST_EFI_VARS
+EFI_MOK_VARIABLES_ROOT=$TEST_MOK_VARIABLES
+LOCKDOWN_FILE=$TEST_LOCKDOWN_FILE
+MODULE_SIG_ENFORCE_FILE=$TEST_SIG_ENFORCE_FILE
+DKMS_CONFIG_ROOT=$TEST_DKMS_CONFIG
+printf 'none [none] integrity confidentiality\n' >"$TEST_LOCKDOWN_FILE"
+printf 'N\n' >"$TEST_SIG_ENFORCE_FILE"
+printf 'mok_signing_key="%s"\nmok_certificate="%s"\ntry_sign_modules=true\n' \
+  "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE" >"$TEST_DKMS_CONFIG/framework.conf"
 
 test_dkms_install() (
   DKMS_REGISTERED=0
   DKMS_INSTALLED=0
   DKMS_OLD_REGISTERED=1
+  SIGNATURE_MATCH=1
   DKMS_CALLS="$TEST_ROOT/dkms-calls"
   : >"$DKMS_CALLS"
 
@@ -90,6 +108,7 @@ test_dkms_install() (
         ;;
       install)
         DKMS_INSTALLED=1
+        SIGNATURE_MATCH=1
         ;;
       remove)
         if [[ $* == *'-v 0.9.0'* ]]; then
@@ -104,6 +123,9 @@ test_dkms_install() (
         ;;
     esac
   }
+  installed_module_matches_signing_certificate() {
+    ((SIGNATURE_MATCH == 1))
+  }
 
   mkdir -- "$TEST_ROOT/vibeshine-drm-0.9.0"
   install_module || fail "DKMS installation failed"
@@ -112,12 +134,15 @@ test_dkms_install() (
   install_module || fail "idempotent DKMS installation failed"
   [[ $(grep -c '^install ' "$DKMS_CALLS") -eq 1 ]] || fail "DKMS installed more than once"
 
+  SIGNATURE_MATCH=0
+  install_module || fail "unexpected DKMS signature was not repaired"
+  [[ $(grep -c '^install ' "$DKMS_CALLS") -eq 2 ]] || fail "unexpected DKMS signature was not reinstalled"
+
   MODULE_SOURCE_ID=$(printf 'b%.0s' {1..64})
   install_module || fail "same-version DKMS refresh failed"
-  [[ $(grep -c '^install ' "$DKMS_CALLS") -eq 2 ]] || fail "changed DKMS source was not reinstalled"
-  assert_contains "$DKMS_CALLS" "remove -m $DKMS_NAME -v $MODULE_VERSION -k $TEST_KERNEL"
-  assert_contains "$DKMS_CALLS" "add -m $DKMS_NAME -v $MODULE_VERSION"
-  assert_contains "$DKMS_CALLS" "build -m $DKMS_NAME -v $MODULE_VERSION -k $TEST_KERNEL"
+  [[ $(grep -c '^install ' "$DKMS_CALLS") -eq 3 ]] || fail "changed DKMS source was not reinstalled"
+  assert_contains "$DKMS_CALLS" "build -m $DKMS_NAME -v $MODULE_VERSION -k $TEST_KERNEL --force"
+  assert_contains "$DKMS_CALLS" "install -m $DKMS_NAME -v $MODULE_VERSION -k $TEST_KERNEL --force"
   remove_module || fail "DKMS removal failed"
   assert_contains "$DKMS_CALLS" "remove -m $DKMS_NAME -v $MODULE_VERSION --all"
 )
@@ -141,6 +166,9 @@ test_direct_install() (
   modprobe() {
     printf 'modprobe %s\n' "$*" >>"$DIRECT_CALLS"
   }
+  verify_module_signature_matches_certificate() {
+    grep -F -- "signed:sha256" "$1" >/dev/null
+  }
 
   install_module || fail "direct installation failed"
   destination=$(direct_destination "$TEST_KERNEL")
@@ -152,13 +180,17 @@ test_direct_install() (
   install_module || fail "idempotent direct installation failed"
   [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 1 ]] || fail "direct module built more than once"
 
+  printf 'unexpected signature\n' >"$destination"
+  install_module || fail "unexpected direct signature was not repaired"
+  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 2 ]] || fail "unexpected direct signature was not rebuilt"
+
   rm -f -- "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
   install_module || fail "signing-key rotation direct refresh failed"
-  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 2 ]] || fail "module was not rebuilt after signing-key rotation"
+  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 3 ]] || fail "module was not rebuilt after signing-key rotation"
 
   MODULE_SOURCE_ID=$(printf 'c%.0s' {1..64})
   install_module || fail "same-version direct refresh failed"
-  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 3 ]] || fail "changed direct source was not rebuilt"
+  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 4 ]] || fail "changed direct source was not rebuilt"
   if compgen -G "$BUILD_TMP_ROOT/vibeshine-drm-build.*" >/dev/null; then
     fail "temporary direct-build directory was not cleaned"
   fi
@@ -223,18 +255,102 @@ test_dkms_failure_falls_back() (
   depmod() {
     :
   }
+  verify_module_signature_matches_certificate() {
+    [[ -f "$1" ]] || return 1
+  }
 
   install_module || fail "direct fallback after DKMS failure failed"
   [[ -f "$(direct_destination "$TEST_KERNEL")" ]] || fail "DKMS failure did not install direct module"
 )
 
+test_dkms_signing_mismatch_falls_back() (
+  MISMATCH_STATE="$TEST_ROOT/mismatch-state"
+  MISMATCH_SYS_MODULE="$TEST_ROOT/mismatch-sys-module"
+  MISMATCH_DKMS_CONFIG="$TEST_ROOT/mismatch-dkms-config"
+  MISMATCH_CALLS="$TEST_ROOT/mismatch-calls"
+  MISMATCH_INSTALLED=1
+  FAIL_DIRECT=1
+  mkdir -p -- "$MISMATCH_SYS_MODULE" "$MISMATCH_DKMS_CONFIG/framework.conf.d"
+  : >"$MISMATCH_CALLS"
+  printf '%s\n' \
+    'mok_signing_key="/var/lib/dkms/site.key"' \
+    'mok_certificate="/var/lib/dkms/site.pub"' \
+    'try_sign_modules=true' >"$MISMATCH_DKMS_CONFIG/framework.conf"
+  configure_install_paths \
+    "$TEST_SOURCE" "$MISMATCH_STATE" "$TEST_MODULES" "$MISMATCH_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
+  DKMS_CONFIG_ROOT=$MISMATCH_DKMS_CONFIG
+
+  dkms_available() {
+    return 0
+  }
+  dkms() {
+    printf '%s\n' "$*" >>"$MISMATCH_CALLS"
+    case ${1:-} in
+      status)
+        if ((MISMATCH_INSTALLED)); then
+          printf '%s/%s, %s, x86_64: installed\n' "$DKMS_NAME" "$MODULE_VERSION" "$TEST_KERNEL"
+        else
+          printf '%s/%s: added\n' "$DKMS_NAME" "$MODULE_VERSION"
+        fi
+        ;;
+      remove) MISMATCH_INSTALLED=0 ;;
+      *) return 1 ;;
+    esac
+  }
+  run_build_helper() {
+    local build_workdir=$1
+    printf 'direct-build\n' >>"$MISMATCH_CALLS"
+    ((FAIL_DIRECT == 0)) || return 1
+    printf 'fake module\n' >"$build_workdir/$MODULE_NAME.ko"
+  }
+  depmod() {
+    return 0
+  }
+  verify_module_signature_matches_certificate() {
+    [[ -f "$1" ]]
+  }
+  installed_module_matches_signing_certificate() {
+    return 0
+  }
+
+  if install_module; then
+    fail "a custom-signed current DKMS installation was replaced"
+  fi
+  ((MISMATCH_INSTALLED == 1)) || fail "custom-signed DKMS installation was removed"
+  if grep -q '^remove ' "$MISMATCH_CALLS"; then
+    fail "custom signing mismatch called DKMS remove"
+  fi
+  if grep -q '^direct-build$' "$MISMATCH_CALLS"; then
+    fail "custom-signed current DKMS installation attempted a direct replacement"
+  fi
+
+  MISMATCH_INSTALLED=0
+  if install_module; then
+    fail "a failed direct fallback was accepted"
+  fi
+  if grep -q '^remove ' "$MISMATCH_CALLS"; then
+    fail "failed direct fallback called DKMS remove"
+  fi
+  FAIL_DIRECT=0
+  install_module || fail "DKMS signing mismatch did not use the verified direct fallback"
+  [[ $(grep -c '^direct-build$' "$MISMATCH_CALLS") -eq 2 ]] || fail "direct fallback attempts were not recorded"
+  [[ -f "$(direct_destination "$TEST_KERNEL")" ]] || fail "signing mismatch did not install the direct module"
+)
+
 test_signing_status() (
   MOK_ENROLLED=0
+  EFI_MOK_VARIABLES_ROOT="$TEST_ROOT/signing-status-mok-variables"
+  SIGNING_STATUS_LOG="$TEST_ROOT/signing-status.log"
+  mkdir -p -- "$EFI_MOK_VARIABLES_ROOT"
 
   mokutil() {
     case ${1:-} in
-      --test-key)
-        ((MOK_ENROLLED == 1))
+      --list-enrolled)
+        if ((MOK_ENROLLED == 1)); then
+          printf 'SHA1 Fingerprint: %s\n' \
+            "$(openssl x509 -inform DER -in "$MOK_CERTIFICATE" -noout -sha1 -fingerprint | cut -d= -f2)"
+        fi
         ;;
       --sb-state)
         printf 'SecureBoot enabled\n'
@@ -245,12 +361,157 @@ test_signing_status() (
     esac
   }
 
-  if signing_status; then
+  signing_status >"$SIGNING_STATUS_LOG" || fail "unenforced Arch kernel incorrectly required MOK enrollment"
+  assert_contains "$SIGNING_STATUS_LOG" "does not require MOK enrollment"
+  if grep -q 'enroll-key' "$SIGNING_STATUS_LOG"; then
+    fail "unenforced Arch kernel printed manual enrollment instructions"
+  fi
+  report_enrollment_needed >"$SIGNING_STATUS_LOG" || fail "unenforced signing guidance failed"
+  if grep -q 'enroll-key' "$SIGNING_STATUS_LOG"; then
+    fail "package install printed manual enrollment instructions on an unenforced Arch kernel"
+  fi
+
+  printf 'Y\n' >"$MODULE_SIG_ENFORCE_FILE"
+  if signing_status >"$SIGNING_STATUS_LOG"; then
     fail "unenrolled signing key was reported as enrolled"
   fi
   MOK_ENROLLED=1
+  printf '\x01' >"$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT"
   signing_status || fail "enrolled signing key was not reported as enrolled"
   report_enrollment_needed || fail "enrollment guidance failed"
+  printf 'N\n' >"$MODULE_SIG_ENFORCE_FILE"
+)
+
+test_secure_boot_and_enforcement_detection() (
+  SECURE_BOOT_VAR="$EFI_VARS_ROOT/SecureBoot-test"
+  printf '\x07\x00\x00\x00\x01' >"$SECURE_BOOT_VAR"
+  [[ $(secure_boot_state) == enabled ]] || fail "EFI Secure Boot enabled state was not detected"
+  printf '\x07\x00\x00\x00\x00' >"$SECURE_BOOT_VAR"
+  [[ $(secure_boot_state) == disabled ]] || fail "EFI Secure Boot disabled state was not detected"
+
+  printf 'Y\n' >"$MODULE_SIG_ENFORCE_FILE"
+  module_signature_is_enforced || fail "module.sig_enforce was not detected"
+  printf 'N\n' >"$MODULE_SIG_ENFORCE_FILE"
+  printf 'none [integrity] confidentiality\n' >"$LOCKDOWN_FILE"
+  module_signature_is_enforced || fail "integrity lockdown was not detected"
+  printf 'none [none] integrity confidentiality\n' >"$LOCKDOWN_FILE"
+  if module_signature_is_enforced; then
+    fail "unenforced module signatures were reported as enforced"
+  fi
+
+  EFI_MOK_VARIABLES_ROOT="$TEST_ROOT/trust-mok-variables"
+  mkdir -p -- "$EFI_MOK_VARIABLES_ROOT"
+  printf '\x00' >"$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT"
+  if mok_list_is_trusted; then
+    fail "a disabled MokListTrustedRT flag was accepted"
+  fi
+  printf '\x01' >"$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT"
+  mok_list_is_trusted || fail "the shim MOK trust flag was not detected"
+
+  rm -f -- "$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT"
+  printf '\x07\x00\x00\x00\x01' >"$EFI_VARS_ROOT/MokListTrustedRT-test"
+  mok_list_is_trusted || fail "the EFI-variable MOK trust flag was not detected"
+)
+
+test_partial_signing_key_is_preserved() (
+  PARTIAL_KEY="$TEST_ROOT/partial/mok.key"
+  PARTIAL_CERTIFICATE="$TEST_ROOT/partial/mok.pub"
+  mkdir -p -- "${PARTIAL_KEY%/*}"
+  printf 'do-not-replace\n' >"$PARTIAL_KEY"
+  configure_install_paths \
+    "$TEST_SOURCE" "$TEST_ROOT/partial-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$PARTIAL_KEY" "$PARTIAL_CERTIFICATE"
+
+  if prepare_signing_key; then
+    fail "an incomplete signing-key pair was overwritten"
+  fi
+  assert_contains "$PARTIAL_KEY" "do-not-replace"
+  [[ ! -e "$PARTIAL_CERTIFICATE" ]] || fail "missing certificate was unexpectedly generated"
+)
+
+test_existing_signing_pair_rejects_symlinked_directory() (
+  LINKED_SIGNING_DIR="$TEST_ROOT/linked-signing-dir"
+  ln -s -- "${TEST_MOK_KEY%/*}" "$LINKED_SIGNING_DIR"
+  configure_install_paths \
+    "$TEST_SOURCE" "$TEST_ROOT/linked-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$LINKED_SIGNING_DIR/mok.key" "$LINKED_SIGNING_DIR/mok.pub"
+
+  if prepare_signing_key; then
+    fail "an existing signing pair beneath a symlinked directory was accepted"
+  fi
+)
+
+test_enrollment_requires_current_shim_boot() (
+  ENROLL_CALLS="$TEST_ROOT/enroll-calls"
+  EFI_VARS_ROOT="$TEST_ROOT/enroll-efi-vars"
+  mkdir -p -- "$EFI_VARS_ROOT"
+  : >"$ENROLL_CALLS"
+  printf 'stale\n' >"$EFI_VARS_ROOT/MokListRT-stale"
+
+  require_root() {
+    return 0
+  }
+  sbctl_is_configured() {
+    return 0
+  }
+  mokutil() {
+    case ${1:-} in
+      --list-enrolled | --list-new) return 0 ;;
+      --import) printf 'import %s\n' "$2" >>"$ENROLL_CALLS" ;;
+      --trust-mok) printf 'trust-mok\n' >>"$ENROLL_CALLS" ;;
+      --help) printf '%s\n' '  --trust-mok' ;;
+      *) return 1 ;;
+    esac
+  }
+
+  if enroll_signing_key; then
+    fail "MOK enrollment was scheduled without a current shim MOK table"
+  fi
+  [[ ! -s "$ENROLL_CALLS" ]] || fail "mokutil import ran without a current shim boot"
+
+  mkdir -p -- "$EFI_MOK_VARIABLES_ROOT"
+  enroll_signing_key || fail "MOK enrollment was not scheduled after a shim boot"
+  assert_contains "$ENROLL_CALLS" "import $MOK_CERTIFICATE"
+  assert_contains "$ENROLL_CALLS" "trust-mok"
+)
+
+test_package_install_auto_enrollment() (
+  AUTO_ENROLL=1
+  ENROLLMENT_REQUESTED=0
+
+  module_signing_trust_is_available() {
+    return 1
+  }
+  request_signing_key_enrollment() {
+    ENROLLMENT_REQUESTED=1
+  }
+  report_loaded_module_freshness() {
+    fail "an untrusted strict-kernel module was treated as immediately usable"
+  }
+
+  if finish_module_installation; then
+    fail "package enrollment request was reported as immediately complete"
+  else
+    finish_rc=$?
+  fi
+  [[ $finish_rc -eq $ENROLLMENT_PENDING_EXIT ]] || fail "package enrollment returned the wrong status"
+  ((ENROLLMENT_REQUESTED == 1)) || fail "package install did not launch enrollment automatically"
+)
+
+test_package_enrollment_requires_terminal() (
+  NON_TTY_DEVICE="$TEST_ROOT/not-a-terminal"
+  NON_TTY_LOG="$TEST_ROOT/non-tty-enrollment.log"
+  : >"$NON_TTY_DEVICE"
+  TTY_DEVICE=$NON_TTY_DEVICE
+
+  enroll_signing_key() {
+    fail "enrollment ran without an interactive terminal"
+  }
+
+  if request_signing_key_enrollment </dev/null 2>"$NON_TTY_LOG"; then
+    fail "noninteractive package enrollment was accepted"
+  fi
+  assert_contains "$NON_TTY_LOG" "retry the package installation from a terminal"
 )
 
 test_loaded_module_freshness() (
@@ -262,6 +523,12 @@ test_loaded_module_freshness() (
     return 1
   }
   direct_is_installed_for_kernel() {
+    return 0
+  }
+  verify_module_signature_matches_certificate() {
+    return 0
+  }
+  installed_module_matches_signing_certificate() {
     return 0
   }
   modinfo() {
@@ -309,7 +576,14 @@ configure_install_paths \
   "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
 mkdir -p -- "$SYS_MODULE_ROOT"
 test_dkms_failure_falls_back
+test_dkms_signing_mismatch_falls_back
 test_signing_status
+test_secure_boot_and_enforcement_detection
+test_partial_signing_key_is_preserved
+test_existing_signing_pair_rejects_symlinked_directory
+test_enrollment_requires_current_shim_boot
+test_package_install_auto_enrollment
+test_package_enrollment_requires_terminal
 test_loaded_module_freshness
 
 printf 'PASS: vibeshine-drm installer shell tests\n'

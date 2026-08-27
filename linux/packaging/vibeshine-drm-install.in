@@ -11,6 +11,7 @@ MODULE_NAME="vibeshine_drm"
 MODULE_VERSION="@PROJECT_VERSION_NUMERIC@"
 MODULE_SOURCE_ID="@VIBESHINE_DRM_SOURCE_ID@"
 RELOAD_REQUIRED_EXIT=4
+ENROLLMENT_PENDING_EXIT=5
 
 SOURCE_DIR=""
 STATE_DIR=""
@@ -20,6 +21,14 @@ BUILD_TMP_ROOT=""
 KERNEL_RELEASE_OVERRIDE=""
 MOK_SIGNING_KEY=""
 MOK_CERTIFICATE=""
+EFI_FIRMWARE_ROOT="/sys/firmware/efi"
+EFI_VARS_ROOT="/sys/firmware/efi/efivars"
+EFI_MOK_VARIABLES_ROOT="/sys/firmware/efi/mok-variables"
+LOCKDOWN_FILE="/sys/kernel/security/lockdown"
+MODULE_SIG_ENFORCE_FILE="/sys/module/module/parameters/sig_enforce"
+DKMS_CONFIG_ROOT="/etc/dkms"
+TTY_DEVICE="/dev/tty"
+AUTO_ENROLL=0
 
 log() {
   printf '%s: %s\n' "$PROGRAM_NAME" "$*"
@@ -80,7 +89,16 @@ prepare_signing_key() {
   local signing_dir
 
   validate_signing_paths || return 1
+  signing_dir=${MOK_SIGNING_KEY%/*}
+  if [[ "$signing_dir" != "${MOK_CERTIFICATE%/*}" || -L "$signing_dir" ]]; then
+    error "MOK signing files must share a safe directory"
+    return 1
+  fi
   if [[ -f "$MOK_SIGNING_KEY" && -f "$MOK_CERTIFICATE" ]]; then
+    if [[ ! -d "$signing_dir" ]]; then
+      error "MOK signing directory is unavailable or unsafe: ${signing_dir}"
+      return 1
+    fi
     validate_signing_key_pair || return 1
     chmod 0600 -- "$MOK_SIGNING_KEY" || return 1
     chmod 0644 -- "$MOK_CERTIFICATE" || return 1
@@ -91,12 +109,11 @@ prepare_signing_key() {
     error "MOK signing path exists but is not a regular file"
     return 1
   fi
-
-  signing_dir=${MOK_SIGNING_KEY%/*}
-  if [[ "$signing_dir" != "${MOK_CERTIFICATE%/*}" || -L "$signing_dir" ]]; then
-    error "MOK signing files must share a safe directory"
+  if [[ -e "$MOK_SIGNING_KEY" || -e "$MOK_CERTIFICATE" ]]; then
+    error "refusing to replace an incomplete MOK signing-key pair"
     return 1
   fi
+
   require_command mkdir || return 1
   require_command openssl || return 1
   mkdir -p -- "$signing_dir" || return 1
@@ -168,70 +185,345 @@ sign_module_file() {
   fi
   sign_hash=$(kernel_sign_hash "$kernel_release")
   log "signing ${MODULE_NAME} for ${kernel_release}"
-  "$sign_file" "$sign_hash" "$MOK_SIGNING_KEY" "$MOK_CERTIFICATE" "$module_file"
+  "$sign_file" "$sign_hash" "$MOK_SIGNING_KEY" "$MOK_CERTIFICATE" "$module_file" || return 1
+  verify_module_signature_matches_certificate "$module_file"
+}
+
+certificate_serial() {
+  local certificate=$1 serial
+  local -a certificate_args
+
+  if grep -q '^-----BEGIN CERTIFICATE-----' "$certificate" 2>/dev/null; then
+    certificate_args=(-in "$certificate")
+  else
+    certificate_args=(-inform DER -in "$certificate")
+  fi
+  serial=$(openssl x509 "${certificate_args[@]}" -noout -serial 2>/dev/null) || return 1
+  serial=${serial#serial=}
+  serial=${serial//:/}
+  printf '%s\n' "${serial^^}"
+}
+
+verify_module_signature_matches_certificate() {
+  local module_file=$1 certificate_key module_key
+
+  require_command modinfo || return 1
+  certificate_key=$(certificate_serial "$MOK_CERTIFICATE") || {
+    error "could not read the module-signing certificate serial"
+    return 1
+  }
+  module_key=$(modinfo -F sig_key "$module_file" 2>/dev/null) || {
+    error "could not inspect the signature on ${module_file}"
+    return 1
+  }
+  module_key=${module_key//:/}
+  module_key=${module_key^^}
+  if [[ -z "$module_key" || "$module_key" != "$certificate_key" ]]; then
+    error "${module_file} was not signed with the configured Vibeshine key"
+    return 1
+  fi
+}
+
+installed_module_matches_signing_certificate() {
+  local kernel_release=$1 module_file
+
+  module_file=$(modinfo -k "$kernel_release" -n "$MODULE_NAME" 2>/dev/null) || {
+    error "could not locate the installed ${MODULE_NAME} module for ${kernel_release}"
+    return 1
+  }
+  if [[ ! -f "$module_file" || -L "$module_file" ]]; then
+    error "installed module path is unavailable or unsafe: ${module_file}"
+    return 1
+  fi
+  verify_module_signature_matches_certificate "$module_file"
+}
+
+certificate_sha1_fingerprint() {
+  local certificate=$1 fingerprint
+
+  fingerprint=$(openssl x509 -inform DER -in "$certificate" -noout -sha1 -fingerprint 2>/dev/null) || return 1
+  fingerprint=${fingerprint#*=}
+  fingerprint=${fingerprint//:/}
+  printf '%s\n' "${fingerprint^^}"
+}
+
+mok_certificate_is_in_list() {
+  local list_action=$1 certificate_fingerprint line listed_fingerprint
+  local list_output
+
+  command -v mokutil >/dev/null 2>&1 || return 1
+  certificate_fingerprint=$(certificate_sha1_fingerprint "$MOK_CERTIFICATE") || return 1
+  list_output=$(LC_ALL=C mokutil "$list_action" 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      *"SHA1 Fingerprint:"*)
+        listed_fingerprint=${line#*SHA1 Fingerprint:}
+        listed_fingerprint=${listed_fingerprint//:/}
+        listed_fingerprint=${listed_fingerprint//[[:space:]]/}
+        [[ "${listed_fingerprint^^}" == "$certificate_fingerprint" ]] && return 0
+        ;;
+    esac
+  done <<<"$list_output"
+  return 1
 }
 
 mok_certificate_is_enrolled() {
-  command -v mokutil >/dev/null 2>&1 || return 1
-  mokutil --test-key "$MOK_CERTIFICATE" >/dev/null 2>&1
+  mok_certificate_is_in_list --list-enrolled
+}
+
+mok_certificate_is_enrollment_pending() {
+  mok_certificate_is_in_list --list-new
 }
 
 mok_manager_is_active() {
-  local mok_variable
+  [[ -d "$EFI_MOK_VARIABLES_ROOT" && ! -L "$EFI_MOK_VARIABLES_ROOT" ]]
+}
 
-  for mok_variable in /sys/firmware/efi/efivars/MokListRT-*; do
-    [[ -e "$mok_variable" ]] && return 0
+mok_list_is_trusted() {
+  local trusted_value trusted_variable
+
+  if [[ -f "$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT" &&
+        ! -L "$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT" ]]; then
+    trusted_value=$(od -An -tu1 -N1 "$EFI_MOK_VARIABLES_ROOT/MokListTrustedRT" 2>/dev/null) || return 1
+    trusted_value=${trusted_value//[[:space:]]/}
+    [[ "$trusted_value" == 1 ]]
+    return
+  fi
+  for trusted_variable in "$EFI_VARS_ROOT"/MokListTrustedRT-*; do
+    [[ -f "$trusted_variable" && ! -L "$trusted_variable" ]] || continue
+    trusted_value=$(od -An -tu1 -j4 -N1 "$trusted_variable" 2>/dev/null) || continue
+    trusted_value=${trusted_value//[[:space:]]/}
+    [[ "$trusted_value" == 1 ]] && return 0
   done
   return 1
 }
 
+secure_boot_state() {
+  local secure_boot_var secure_boot_value state_output
+
+  for secure_boot_var in "$EFI_VARS_ROOT"/SecureBoot-*; do
+    [[ -f "$secure_boot_var" && ! -L "$secure_boot_var" ]] || continue
+    secure_boot_value=$(od -An -tu1 -j4 -N1 "$secure_boot_var" 2>/dev/null) || continue
+    secure_boot_value=${secure_boot_value//[[:space:]]/}
+    case "$secure_boot_value" in
+      1) printf 'enabled\n'; return 0 ;;
+      0) printf 'disabled\n'; return 0 ;;
+    esac
+  done
+
+  if command -v mokutil >/dev/null 2>&1; then
+    state_output=$(LC_ALL=C mokutil --sb-state 2>/dev/null || true)
+    case "$state_output" in
+      *"SecureBoot enabled"*) printf 'enabled\n'; return 0 ;;
+      *"SecureBoot disabled"*) printf 'disabled\n'; return 0 ;;
+    esac
+  fi
+  if command -v sbctl >/dev/null 2>&1; then
+    state_output=$(sbctl setup --print-state --json 2>/dev/null || true)
+    if grep -Eq '"secure_boot"[[:space:]]*:[[:space:]]*true' <<<"$state_output"; then
+      printf 'enabled\n'
+      return 0
+    fi
+    if grep -Eq '"secure_boot"[[:space:]]*:[[:space:]]*false' <<<"$state_output"; then
+      printf 'disabled\n'
+      return 0
+    fi
+  fi
+  printf 'unknown\n'
+}
+
 secure_boot_is_enabled() {
-  command -v mokutil >/dev/null 2>&1 || return 1
-  LC_ALL=C mokutil --sb-state 2>/dev/null | grep -q '^SecureBoot enabled'
+  [[ $(secure_boot_state) == enabled ]]
+}
+
+module_signature_is_enforced() {
+  local enforcement lockdown
+
+  if [[ -f "$MODULE_SIG_ENFORCE_FILE" && ! -L "$MODULE_SIG_ENFORCE_FILE" ]]; then
+    IFS= read -r enforcement <"$MODULE_SIG_ENFORCE_FILE" || enforcement=""
+    case "$enforcement" in
+      1 | Y | y | yes | true) return 0 ;;
+    esac
+  fi
+  if [[ -f "$LOCKDOWN_FILE" && ! -L "$LOCKDOWN_FILE" ]]; then
+    IFS= read -r lockdown <"$LOCKDOWN_FILE" || lockdown=""
+    [[ "$lockdown" == *"[integrity]"* || "$lockdown" == *"[confidentiality]"* ]] && return 0
+  fi
+  return 1
+}
+
+sbctl_is_configured() {
+  local state_output
+
+  command -v sbctl >/dev/null 2>&1 || return 1
+  state_output=$(sbctl setup --print-state --json 2>/dev/null || true)
+  grep -Eq '"installed"[[:space:]]*:[[:space:]]*true' <<<"$state_output"
 }
 
 report_enrollment_needed() {
-  secure_boot_is_enabled || return 0
-  mok_certificate_is_enrolled && return 0
+  local boot_state
 
-  log "Secure Boot is enabled, but the DKMS module-signing key is not enrolled."
-  log "Run '@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} enroll-key', reboot, and complete MOK enrollment."
+  boot_state=$(secure_boot_state)
+  if ! module_signature_is_enforced; then
+    case "$boot_state" in
+      enabled)
+        log "the module is signed; this Arch kernel does not require MOK enrollment"
+        ;;
+      unknown)
+        log "could not determine the Secure Boot state; this kernel does not enforce trusted module signatures"
+        ;;
+    esac
+    return 0
+  fi
+  if mok_certificate_is_enrolled && mok_list_is_trusted; then
+    return 0
+  fi
+
+  if [[ "$boot_state" == enabled ]]; then
+    log "Secure Boot is enabled, but the Vibeshine module-signing key is not trusted."
+  else
+    log "The running kernel enforces signatures, but the Vibeshine module-signing key is not trusted."
+  fi
+  if mok_manager_is_active; then
+    log "Run '@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} enroll-key', reboot, and complete the MOK requests."
+  elif sbctl_is_configured; then
+    log "This system uses direct sbctl/UEFI owner keys. Those keys trust EFI programs, not out-of-tree Linux modules."
+    log "For trusted module loading, boot through shim once and enroll the Vibeshine MOK key."
+  else
+    log "Boot through shim once, then run '@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} enroll-key'."
+  fi
+  error "the running kernel enforces trusted module signatures; managed displays remain unavailable until enrollment"
+}
+
+module_signing_trust_is_available() {
+  module_signature_is_enforced || return 0
+  if mok_certificate_is_enrolled && mok_list_is_trusted; then
+    return 0
+  fi
+  return 1
+}
+
+module_signing_trust_is_usable() {
+  module_signing_trust_is_available && return 0
+  error "the running kernel requires a trusted module signature"
+  return 1
+}
+
+request_signing_key_enrollment() {
+  local enrollment_rc tty_fd
+
+  if [[ -t 0 ]]; then
+    enroll_signing_key
+    return
+  fi
+  if { exec {tty_fd}<>"$TTY_DEVICE"; } 2>/dev/null; then
+    if [[ -t "$tty_fd" ]]; then
+      enroll_signing_key <&"$tty_fd"
+      enrollment_rc=$?
+      exec {tty_fd}>&-
+      return "$enrollment_rc"
+    fi
+    exec {tty_fd}>&-
+  fi
+  error "the package frontend cannot display the one-time module-signing confirmation"
+  error "retry the package installation from a terminal"
+  return 1
+}
+
+finish_module_installation() {
+  if module_signing_trust_is_available; then
+    report_enrollment_needed
+    report_loaded_module_freshness
+    return $?
+  fi
+
+  if ((AUTO_ENROLL)); then
+    log "this kernel requires one-time authorization of the Vibeshine module-signing key"
+    if ! request_signing_key_enrollment; then
+      error "could not start the module-signing authorization prompt"
+      return 1
+    fi
+    log "authorization is queued; reboot and approve the pending MOK confirmations once"
+    return "$ENROLLMENT_PENDING_EXIT"
+  fi
+
+  report_enrollment_needed
+  return 1
 }
 
 enroll_signing_key() {
+  local enrollment_requested=0
+
   require_root || return 1
   require_command mokutil || return 1
-  [[ -d /sys/firmware/efi ]] || {
+  [[ -d "$EFI_FIRMWARE_ROOT" && ! -L "$EFI_FIRMWARE_ROOT" ]] || {
     error "MOK enrollment requires a UEFI boot"
     return 1
   }
   mok_manager_is_active || {
-    error "the current boot did not pass through shim, so the Linux kernel cannot receive MOK keys"
+    error "the current boot did not provide shim's MOK table"
+    if sbctl_is_configured; then
+      error "sbctl owner keys authorize EFI programs, not out-of-tree Linux modules"
+    fi
     error "boot through shim once, then retry this command"
     return 1
   }
   prepare_signing_key || return 1
-  if mok_certificate_is_enrolled; then
-    log "the DKMS module-signing key is already enrolled"
-    return 0
+  if ! mok_certificate_is_enrolled && ! mok_certificate_is_enrollment_pending; then
+    log "requesting one-time MOK enrollment for the DKMS signing key"
+    log "Choose a temporary password when prompted. After reboot, use the firmware MOK manager"
+    log "to enroll the key with that password. The normal desktop login password is not changed."
+    mokutil --import "$MOK_CERTIFICATE" || return 1
+    enrollment_requested=1
+  elif ! mok_certificate_is_enrolled; then
+    log "the DKMS module-signing key is already pending enrollment"
+    enrollment_requested=1
   fi
 
-  log "requesting one-time MOK enrollment for the DKMS signing key"
-  log "Choose a temporary password when prompted. After reboot, use the firmware MOK manager"
-  log "to enroll the key with that password. The normal desktop login password is not changed."
-  mokutil --import "$MOK_CERTIFICATE"
+  if ! mok_list_is_trusted; then
+    if ! LC_ALL=C mokutil --help 2>&1 | grep -q -- '--trust-mok'; then
+      error "this mokutil version cannot request MOK-list trust; update mokutil and retry"
+      return 1
+    fi
+    log "requesting that Linux trust the enrolled MOK list for module verification"
+    mokutil --trust-mok || return 1
+    enrollment_requested=1
+  fi
+
+  if ((enrollment_requested)); then
+    log "reboot and complete every pending request in the firmware MOK manager"
+  else
+    log "the DKMS module-signing key is enrolled and trusted by Linux"
+  fi
 }
 
 signing_status() {
+  local boot_state
+
   if [[ ! -f "$MOK_CERTIFICATE" || -L "$MOK_CERTIFICATE" ]]; then
     log "the DKMS module-signing key has not been generated"
     return 3
   fi
-  if mok_certificate_is_enrolled; then
-    log "the DKMS module-signing key is enrolled"
+  boot_state=$(secure_boot_state)
+  if ! module_signature_is_enforced; then
+    if [[ "$boot_state" == enabled ]]; then
+      log "the module is signed; this Arch kernel does not require MOK enrollment"
+    else
+      log "the module is signed and this kernel does not require MOK enrollment"
+    fi
     return 0
   fi
-  log "the DKMS module-signing key is not enrolled"
+  if mok_certificate_is_enrolled && mok_list_is_trusted; then
+    log "the DKMS module-signing key is enrolled and trusted by Linux"
+    return 0
+  fi
+  if mok_certificate_is_enrolled; then
+    log "the DKMS module-signing key is enrolled, but Linux is not configured to trust the MOK list"
+  fi
+  log "the DKMS module-signing key is not trusted by the running kernel"
+  if [[ "$boot_state" == enabled ]] && sbctl_is_configured && ! mok_manager_is_active; then
+    log "sbctl owner keys do not authorize out-of-tree Linux modules; use shim/MOK for trusted loading"
+  fi
   return 3
 }
 
@@ -386,6 +678,48 @@ dkms_available() {
   command -v dkms >/dev/null 2>&1
 }
 
+effective_dkms_signing_configuration() (
+  local kernelver=$1 config_file
+  local mok_signing_key=/var/lib/dkms/mok.key
+  local mok_certificate=/var/lib/dkms/mok.pub
+  local try_sign_modules=not_in_chroot
+
+  # DKMS treats these root-owned files as shell configuration. Read them in a
+  # subshell so they cannot alter the installer's state.
+  set +u
+  if [[ -f "$DKMS_CONFIG_ROOT/framework.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "$DKMS_CONFIG_ROOT/framework.conf" || return 1
+  fi
+  for config_file in "$DKMS_CONFIG_ROOT"/framework.conf.d/*.conf; do
+    [[ -f "$config_file" ]] || continue
+    # shellcheck source=/dev/null
+    source "$config_file" || return 1
+  done
+  printf '%s\n%s\n%s\n' "$mok_signing_key" "$mok_certificate" "$try_sign_modules"
+)
+
+dkms_uses_expected_signing_key() {
+  local kernel_release=$1 signing_output
+  local -a signing_configuration
+
+  signing_output=$(effective_dkms_signing_configuration "$kernel_release") || return 1
+  mapfile -t signing_configuration <<<"$signing_output"
+  if ((${#signing_configuration[@]} != 3)); then
+    error "could not determine DKMS's module-signing configuration"
+    return 1
+  fi
+  if [[ "${signing_configuration[2]}" == false ]]; then
+    error "DKMS module signing is disabled by the system configuration"
+    return 1
+  fi
+  if [[ "${signing_configuration[0]}" != "$MOK_SIGNING_KEY" ||
+        "${signing_configuration[1]}" != "$MOK_CERTIFICATE" ]]; then
+    error "DKMS is configured with a different module-signing key"
+    return 1
+  fi
+}
+
 dkms_is_registered() {
   local status_output line
 
@@ -416,21 +750,22 @@ dkms_is_installed_for_kernel() {
 install_with_dkms() {
   local kernel_release=$1
   local marker
+  local -a refresh_args=()
 
   marker=$(dkms_marker "$kernel_release")
 
   if dkms_is_installed_for_kernel "$kernel_release" &&
      state_marker_matches_source "$marker"; then
-    log "DKMS module ${DKMS_NAME}/${MODULE_VERSION} is already installed for ${kernel_release}"
-    return 0
+    if installed_module_matches_signing_certificate "$kernel_release"; then
+      log "DKMS module ${DKMS_NAME}/${MODULE_VERSION} is already installed for ${kernel_release}"
+      return 0
+    fi
+    log "refreshing DKMS module with an unexpected signature for ${kernel_release}"
   fi
 
   if dkms_is_installed_for_kernel "$kernel_release"; then
     log "refreshing stale DKMS module for ${kernel_release}"
-    if ! dkms remove -m "$DKMS_NAME" -v "$MODULE_VERSION" -k "$kernel_release"; then
-      error "could not remove stale DKMS module for ${kernel_release}"
-      return 1
-    fi
+    refresh_args=(--force)
   fi
 
   if ! dkms_is_registered; then
@@ -442,11 +777,11 @@ install_with_dkms() {
   fi
 
   log "building ${DKMS_NAME}/${MODULE_VERSION} with DKMS for ${kernel_release}"
-  if ! dkms build -m "$DKMS_NAME" -v "$MODULE_VERSION" -k "$kernel_release"; then
+  if ! dkms build -m "$DKMS_NAME" -v "$MODULE_VERSION" -k "$kernel_release" "${refresh_args[@]}"; then
     error "DKMS build failed for ${kernel_release}"
     return 1
   fi
-  if ! dkms install -m "$DKMS_NAME" -v "$MODULE_VERSION" -k "$kernel_release"; then
+  if ! dkms install -m "$DKMS_NAME" -v "$MODULE_VERSION" -k "$kernel_release" "${refresh_args[@]}"; then
     error "DKMS install failed for ${kernel_release}"
     return 1
   fi
@@ -455,12 +790,15 @@ install_with_dkms() {
     error "DKMS did not report an installed module after a successful install"
     return 1
   fi
+  if ! installed_module_matches_signing_certificate "$kernel_release"; then
+    error "DKMS installed ${MODULE_NAME} with an unexpected or missing signature"
+    return 1
+  fi
   write_state_marker "$marker" dkms "$kernel_release" || return 1
   if ! remove_direct_installations; then
     error "current-version direct-build cleanup was incomplete"
   fi
   log "installed HDR DRM module with DKMS for ${kernel_release}"
-  report_enrollment_needed
 }
 
 direct_destination() {
@@ -499,8 +837,11 @@ install_direct() (
   marker=$(direct_marker "$kernel_release")
 
   if direct_is_installed_for_kernel "$kernel_release"; then
-    log "direct-built module is already installed for ${kernel_release}"
-    return 0
+    if verify_module_signature_matches_certificate "$destination"; then
+      log "direct-built module is already installed for ${kernel_release}"
+      return 0
+    fi
+    log "refreshing directly built module with an unexpected signature for ${kernel_release}"
   fi
   if [[ ! -d "$build_dir" || ! -f "$build_dir/Makefile" ]]; then
     error "kernel build files are unavailable at ${build_dir}"
@@ -567,7 +908,6 @@ install_direct() (
   fi
   cleanup_build_directory "$build_workdir" || return 1
   log "installed directly built HDR DRM module for ${kernel_release}"
-  report_enrollment_needed
 )
 
 run_build_helper() {
@@ -604,19 +944,29 @@ install_module() {
   prepare_signing_key || return 1
   cleanup_obsolete_installations || cleanup_rc=1
 
-  if dkms_available; then
+  if dkms_available && dkms_uses_expected_signing_key "$kernel_release"; then
     if install_with_dkms "$kernel_release"; then
       ((cleanup_rc == 0)) || log "obsolete module cleanup was incomplete; current DKMS module is ready"
-      report_loaded_module_freshness
+      finish_module_installation
       return $?
     fi
+    if dkms_is_installed_for_kernel "$kernel_release"; then
+      error "preserving the existing current-kernel DKMS installation after the failed refresh"
+      return 1
+    fi
     log "DKMS installation failed; attempting a current-kernel direct build"
+  elif dkms_available; then
+    if dkms_is_installed_for_kernel "$kernel_release"; then
+      error "preserving the current DKMS installation signed with the system-configured key"
+      return 1
+    fi
+    log "DKMS cannot guarantee the Vibeshine signing key; using a verified direct build"
   else
     log "DKMS is unavailable; attempting a current-kernel direct build"
   fi
   install_direct "$kernel_release" || return 1
   ((cleanup_rc == 0)) || log "obsolete module cleanup was incomplete; current direct-built module is ready"
-  report_loaded_module_freshness
+  finish_module_installation
 }
 
 unload_module() {
@@ -844,11 +1194,17 @@ module_status() {
     log "the current HDR DRM module is not installed for ${kernel_release}"
     return 3
   fi
+  if ! installed_module_matches_signing_certificate "$kernel_release"; then
+    error "the module selected for ${kernel_release} does not have the expected Vibeshine signature"
+    return 3
+  fi
+  report_enrollment_needed
+  module_signing_trust_is_usable || return 3
   report_loaded_module_freshness
 }
 
 usage() {
-  printf 'Usage: %s {install|remove|status|enroll-key|signing-status}\n' "$PROGRAM_NAME" >&2
+  printf 'Usage: %s {install|install-package|remove|status|enroll-key|signing-status}\n' "$PROGRAM_NAME" >&2
 }
 
 main() {
@@ -871,6 +1227,13 @@ main() {
       require_root || return 1
       require_command uname || return 1
       require_command rm || return 1
+      install_module
+      ;;
+    install-package)
+      require_root || return 1
+      require_command uname || return 1
+      require_command rm || return 1
+      AUTO_ENROLL=1
       install_module
       ;;
     remove)
