@@ -16,6 +16,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-tests:
+    name: Linux Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build-linux -G Ninja -DBUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build-linux --target test_libvirtualdisplay --parallel 2
+
+      - name: Run tests
+        run: ctest --test-dir build-linux --output-on-failure -j2
+
   unit-tests:
     name: Unit Tests
     runs-on: windows-latest

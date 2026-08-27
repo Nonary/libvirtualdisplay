@@ -17,6 +17,8 @@ MODULES_ROOT=""
 SYS_MODULE_ROOT=""
 BUILD_TMP_ROOT=""
 KERNEL_RELEASE_OVERRIDE=""
+MOK_SIGNING_KEY=""
+MOK_CERTIFICATE=""
 
 log() {
   printf '%s: %s\n' "$PROGRAM_NAME" "$*"
@@ -32,6 +34,8 @@ configure_install_paths() {
   MODULES_ROOT=$3
   SYS_MODULE_ROOT=$4
   BUILD_TMP_ROOT=$5
+  MOK_SIGNING_KEY=${6:-/var/lib/dkms/mok.key}
+  MOK_CERTIFICATE=${7:-/var/lib/dkms/mok.pub}
 }
 
 require_root() {
@@ -48,6 +52,186 @@ require_command() {
     error "required command not found: ${command_name}"
     return 1
   fi
+}
+
+validate_signing_paths() {
+  case "$MOK_SIGNING_KEY" in
+    /*/mok.key) ;;
+    *)
+      error "unsafe MOK signing-key path: ${MOK_SIGNING_KEY}"
+      return 1
+      ;;
+  esac
+  case "$MOK_CERTIFICATE" in
+    /*/mok.pub | /*/MOK.der) ;;
+    *)
+      error "unsafe MOK certificate path: ${MOK_CERTIFICATE}"
+      return 1
+      ;;
+  esac
+  if [[ -L "$MOK_SIGNING_KEY" || -L "$MOK_CERTIFICATE" ]]; then
+    error "refusing symbolic-link MOK signing files"
+    return 1
+  fi
+}
+
+prepare_signing_key() {
+  local signing_dir
+
+  validate_signing_paths || return 1
+  if [[ -f "$MOK_SIGNING_KEY" && -f "$MOK_CERTIFICATE" ]]; then
+    validate_signing_key_pair || return 1
+    chmod 0600 -- "$MOK_SIGNING_KEY" || return 1
+    chmod 0644 -- "$MOK_CERTIFICATE" || return 1
+    return 0
+  fi
+  if [[ -e "$MOK_SIGNING_KEY" && ! -f "$MOK_SIGNING_KEY" ]] ||
+     [[ -e "$MOK_CERTIFICATE" && ! -f "$MOK_CERTIFICATE" ]]; then
+    error "MOK signing path exists but is not a regular file"
+    return 1
+  fi
+
+  signing_dir=${MOK_SIGNING_KEY%/*}
+  if [[ "$signing_dir" != "${MOK_CERTIFICATE%/*}" || -L "$signing_dir" ]]; then
+    error "MOK signing files must share a safe directory"
+    return 1
+  fi
+  require_command mkdir || return 1
+  require_command openssl || return 1
+  mkdir -p -- "$signing_dir" || return 1
+  if [[ ! -d "$signing_dir" || -L "$signing_dir" ]]; then
+    error "MOK signing directory is unavailable or unsafe: ${signing_dir}"
+    return 1
+  fi
+
+  log "generating the local DKMS module-signing key"
+  if ! (umask 077 && openssl req -new -x509 -nodes -days 36500 \
+      -subj "/CN=Vibeshine DKMS module signing key/" \
+      -newkey rsa:2048 -keyout "$MOK_SIGNING_KEY" \
+      -addext "extendedKeyUsage=codeSigning" \
+      -outform DER -out "$MOK_CERTIFICATE" >/dev/null 2>&1); then
+    error "could not generate the MOK signing key"
+    return 1
+  fi
+  chmod 0600 -- "$MOK_SIGNING_KEY" || return 1
+  chmod 0644 -- "$MOK_CERTIFICATE" || return 1
+  validate_signing_key_pair
+}
+
+validate_signing_key_pair() {
+  local key_fingerprint certificate_fingerprint
+
+  require_command openssl || return 1
+  require_command sha256sum || return 1
+  key_fingerprint=$(openssl pkey -in "$MOK_SIGNING_KEY" -pubout -outform DER 2>/dev/null | sha256sum) || {
+    error "could not read the MOK private key"
+    return 1
+  }
+  certificate_fingerprint=$(openssl x509 -inform DER -in "$MOK_CERTIFICATE" -pubkey -noout 2>/dev/null |
+    openssl pkey -pubin -outform DER 2>/dev/null | sha256sum) || {
+    error "could not read the MOK certificate"
+    return 1
+  }
+  key_fingerprint=${key_fingerprint%% *}
+  certificate_fingerprint=${certificate_fingerprint%% *}
+  if [[ "$key_fingerprint" != "$certificate_fingerprint" ]]; then
+    error "the MOK private key and certificate do not match"
+    return 1
+  fi
+}
+
+kernel_sign_file() {
+  local kernel_release=$1
+  printf '%s/%s/build/scripts/sign-file\n' "$MODULES_ROOT" "$kernel_release"
+}
+
+kernel_sign_hash() {
+  local kernel_release=$1 config_file hash
+
+  config_file="$MODULES_ROOT/$kernel_release/build/.config"
+  hash=""
+  if [[ -f "$config_file" ]]; then
+    hash=$(sed -n 's/^CONFIG_MODULE_SIG_HASH="\([A-Za-z0-9_-]*\)"$/\1/p' "$config_file" | head -n 1)
+  fi
+  printf '%s\n' "${hash:-sha256}"
+}
+
+sign_module_file() {
+  local kernel_release=$1 module_file=$2 sign_file sign_hash
+
+  prepare_signing_key || return 1
+  sign_file=$(kernel_sign_file "$kernel_release")
+  if [[ ! -x "$sign_file" || -L "$sign_file" ]]; then
+    error "kernel module signer is unavailable at ${sign_file}"
+    return 1
+  fi
+  sign_hash=$(kernel_sign_hash "$kernel_release")
+  log "signing ${MODULE_NAME} for ${kernel_release}"
+  "$sign_file" "$sign_hash" "$MOK_SIGNING_KEY" "$MOK_CERTIFICATE" "$module_file"
+}
+
+mok_certificate_is_enrolled() {
+  command -v mokutil >/dev/null 2>&1 || return 1
+  mokutil --test-key "$MOK_CERTIFICATE" >/dev/null 2>&1
+}
+
+mok_manager_is_active() {
+  local mok_variable
+
+  for mok_variable in /sys/firmware/efi/efivars/MokListRT-*; do
+    [[ -e "$mok_variable" ]] && return 0
+  done
+  return 1
+}
+
+secure_boot_is_enabled() {
+  command -v mokutil >/dev/null 2>&1 || return 1
+  LC_ALL=C mokutil --sb-state 2>/dev/null | grep -q '^SecureBoot enabled'
+}
+
+report_enrollment_needed() {
+  secure_boot_is_enabled || return 0
+  mok_certificate_is_enrolled && return 0
+
+  log "Secure Boot is enabled, but the DKMS module-signing key is not enrolled."
+  log "Run '@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} enroll-key', reboot, and complete MOK enrollment."
+}
+
+enroll_signing_key() {
+  require_root || return 1
+  require_command mokutil || return 1
+  [[ -d /sys/firmware/efi ]] || {
+    error "MOK enrollment requires a UEFI boot"
+    return 1
+  }
+  mok_manager_is_active || {
+    error "the current boot did not pass through shim, so the Linux kernel cannot receive MOK keys"
+    error "boot through shim once, then retry this command"
+    return 1
+  }
+  prepare_signing_key || return 1
+  if mok_certificate_is_enrolled; then
+    log "the DKMS module-signing key is already enrolled"
+    return 0
+  fi
+
+  log "requesting one-time MOK enrollment for the DKMS signing key"
+  log "Choose a temporary password when prompted. After reboot, use the firmware MOK manager"
+  log "to enroll the key with that password. The normal desktop login password is not changed."
+  mokutil --import "$MOK_CERTIFICATE"
+}
+
+signing_status() {
+  if [[ ! -f "$MOK_CERTIFICATE" || -L "$MOK_CERTIFICATE" ]]; then
+    log "the DKMS module-signing key has not been generated"
+    return 3
+  fi
+  if mok_certificate_is_enrolled; then
+    log "the DKMS module-signing key is enrolled"
+    return 0
+  fi
+  log "the DKMS module-signing key is not enrolled"
+  return 3
 }
 
 current_kernel_release() {
@@ -115,23 +299,37 @@ ensure_state_dir() {
 
 state_marker_matches_source() {
   local marker=$1
-  local recorded_id
+  local recorded_id expected_id
 
   [[ -f "$marker" && ! -L "$marker" ]] || return 1
   IFS= read -r recorded_id <"$marker" || return 1
-  [[ "$recorded_id" == "$MODULE_SOURCE_ID" ]]
+  expected_id=$(module_install_identity) || return 1
+  [[ "$recorded_id" == "$expected_id" ]]
+}
+
+module_install_identity() {
+  local certificate_hash
+
+  [[ -f "$MOK_CERTIFICATE" && ! -L "$MOK_CERTIFICATE" ]] || return 1
+  require_command sha256sum || return 1
+  certificate_hash=$(sha256sum -- "$MOK_CERTIFICATE") || return 1
+  certificate_hash=${certificate_hash%% *}
+  [[ ${#certificate_hash} -eq 64 ]] || return 1
+  printf '%s:%s\n' "$MODULE_SOURCE_ID" "$certificate_hash"
 }
 
 write_state_marker() {
   local marker=$1
+  local install_identity
   shift
 
   ensure_state_dir || return 1
+  install_identity=$(module_install_identity) || return 1
   if [[ -L "$marker" ]]; then
     error "refusing symbolic-link module state marker: ${marker}"
     return 1
   fi
-  if ! printf '%s\n' "$MODULE_SOURCE_ID" "$@" >"$marker"; then
+  if ! printf '%s\n' "$install_identity" "$@" >"$marker"; then
     error "could not record module state at ${marker}"
     return 1
   fi
@@ -223,6 +421,7 @@ install_with_dkms() {
     error "current-version direct-build cleanup was incomplete"
   fi
   log "installed HDR DRM module with DKMS for ${kernel_release}"
+  report_enrollment_needed
 }
 
 direct_destination() {
@@ -303,6 +502,11 @@ install_direct() (
     cleanup_build_directory "$build_workdir"
     return 1
   fi
+  if ! sign_module_file "$kernel_release" "$build_workdir/${MODULE_NAME}.ko"; then
+    error "could not sign the directly built kernel module"
+    cleanup_build_directory "$build_workdir"
+    return 1
+  fi
 
   ensure_state_dir || return 1
   if ! install -D -m 0644 -- "$build_workdir/${MODULE_NAME}.ko" "$destination"; then
@@ -324,6 +528,7 @@ install_direct() (
   fi
   cleanup_build_directory "$build_workdir" || return 1
   log "installed directly built HDR DRM module for ${kernel_release}"
+  report_enrollment_needed
 )
 
 run_build_helper() {
@@ -357,6 +562,7 @@ install_module() {
   kernel_release=$(current_kernel_release) || return 1
   validate_kernel_release "$kernel_release" || return 1
   validate_source_tree || return 1
+  prepare_signing_key || return 1
   cleanup_obsolete_installations || cleanup_rc=1
 
   if dkms_available; then
@@ -601,7 +807,7 @@ module_status() {
 }
 
 usage() {
-  printf 'Usage: %s {install|remove|status}\n' "$PROGRAM_NAME" >&2
+  printf 'Usage: %s {install|remove|status|enroll-key|signing-status}\n' "$PROGRAM_NAME" >&2
 }
 
 main() {
@@ -614,7 +820,9 @@ main() {
     /var/lib/vibeshine-drm \
     /lib/modules \
     /sys/module \
-    /var/tmp
+    /var/tmp \
+    /var/lib/dkms/mok.key \
+    /var/lib/dkms/mok.pub
   KERNEL_RELEASE_OVERRIDE=""
 
   case "$action" in
@@ -632,6 +840,12 @@ main() {
     status)
       require_command uname || return 1
       module_status
+      ;;
+    enroll-key)
+      enroll_signing_key
+      ;;
+    signing-status)
+      signing_status
       ;;
     *)
       usage

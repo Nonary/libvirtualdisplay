@@ -26,5 +26,17 @@ for the running kernel (or registers it with DKMS when available). If it cannot
 be built or loaded, managed virtual displays remain unavailable; the helper
 does not substitute CPU-backed upstream VKMS scanout.
 
-With Secure Boot enforcement, the locally built module must be signed by a key
-trusted by the machine before the kernel will load it.
+The installer signs both DKMS and direct builds with the standard local DKMS
+key at `/var/lib/dkms/mok.key`. On Secure Boot systems that boot through shim,
+enroll its public certificate once:
+
+```bash
+sudo /usr/libexec/vibeshine/vibeshine-drm-install enroll-key
+# Reboot, choose "Enroll MOK", and confirm with the temporary password.
+/usr/libexec/vibeshine/vibeshine-drm-install signing-status
+```
+
+DKMS signs rebuilt modules with the same key after future kernel and Vibeshine
+updates. Direct bootloaders that do not pass through shim cannot expose MOK
+keys to the kernel; those systems must add shim to their boot chain or use
+their distribution's equivalent trusted-module signing mechanism.

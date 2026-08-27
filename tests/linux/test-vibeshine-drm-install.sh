@@ -41,16 +41,22 @@ TEST_STATE="$TEST_ROOT/state"
 TEST_MODULES="$TEST_ROOT/modules"
 TEST_SYS_MODULE="$TEST_ROOT/sys-module"
 TEST_BUILD_TMP="$TEST_ROOT/build-tmp"
+TEST_MOK_KEY="$TEST_ROOT/dkms/mok.key"
+TEST_MOK_CERTIFICATE="$TEST_ROOT/dkms/mok.pub"
 TEST_KERNEL="6.99.1-vibeshine"
-mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$TEST_KERNEL/build" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP"
+mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$TEST_KERNEL/build/scripts" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP"
 printf 'obj-m += vibeshine_drm.o\n' >"$TEST_SOURCE/Makefile"
 printf 'PACKAGE_NAME="vibeshine-drm"\n' >"$TEST_SOURCE/dkms.conf"
 printf '/* test source */\n' >"$TEST_SOURCE/vkms_drv.c"
 printf 'all:\n' >"$TEST_MODULES/$TEST_KERNEL/build/Makefile"
 cp -- "$TEST_SCRIPT_DIR/../../linux/vibeshine-drm/build-module" "$TEST_SOURCE/build-module"
 chmod 0755 "$TEST_SOURCE/build-module"
+printf '#!/usr/bin/env bash\nprintf "signed:%%s\\n" "$1" >>"$4"\n' >"$TEST_MODULES/$TEST_KERNEL/build/scripts/sign-file"
+chmod 0755 "$TEST_MODULES/$TEST_KERNEL/build/scripts/sign-file"
 
-configure_install_paths "$TEST_SOURCE" "$TEST_STATE" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP"
+configure_install_paths \
+  "$TEST_SOURCE" "$TEST_STATE" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+  "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
 KERNEL_RELEASE_OVERRIDE=$TEST_KERNEL
 
 test_dkms_install() (
@@ -140,14 +146,19 @@ test_direct_install() (
   destination=$(direct_destination "$TEST_KERNEL")
   marker=$(direct_marker "$TEST_KERNEL")
   [[ -f "$destination" ]] || fail "direct module was not installed"
+  assert_contains "$destination" "signed:sha256"
   [[ -f "$marker" ]] || fail "direct-install marker was not created"
   [[ ! -e "$SOURCE_DIR/$MODULE_NAME.ko" ]] || fail "direct build polluted the packaged source tree"
   install_module || fail "idempotent direct installation failed"
   [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 1 ]] || fail "direct module built more than once"
 
+  rm -f -- "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
+  install_module || fail "signing-key rotation direct refresh failed"
+  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 2 ]] || fail "module was not rebuilt after signing-key rotation"
+
   MODULE_SOURCE_ID=$(printf 'c%.0s' {1..64})
   install_module || fail "same-version direct refresh failed"
-  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 2 ]] || fail "changed direct source was not rebuilt"
+  [[ $(grep -c '^build-helper ' "$DIRECT_CALLS") -eq 3 ]] || fail "changed direct source was not rebuilt"
   if compgen -G "$BUILD_TMP_ROOT/vibeshine-drm-build.*" >/dev/null; then
     fail "temporary direct-build directory was not cleaned"
   fi
@@ -217,6 +228,31 @@ test_dkms_failure_falls_back() (
   [[ -f "$(direct_destination "$TEST_KERNEL")" ]] || fail "DKMS failure did not install direct module"
 )
 
+test_signing_status() (
+  MOK_ENROLLED=0
+
+  mokutil() {
+    case ${1:-} in
+      --test-key)
+        ((MOK_ENROLLED == 1))
+        ;;
+      --sb-state)
+        printf 'SecureBoot enabled\n'
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+
+  if signing_status; then
+    fail "unenrolled signing key was reported as enrolled"
+  fi
+  MOK_ENROLLED=1
+  signing_status || fail "enrolled signing key was not reported as enrolled"
+  report_enrollment_needed || fail "enrollment guidance failed"
+)
+
 test_dkms_install
 test_direct_install
 test_obsolete_direct_cleanup
@@ -224,7 +260,9 @@ test_obsolete_direct_cleanup
 # The direct fallback test uses its own state tree so an earlier direct marker
 # cannot turn the fallback path into an idempotent no-op.
 configure_install_paths \
-  "$TEST_SOURCE" "$TEST_ROOT/fallback-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP"
+  "$TEST_SOURCE" "$TEST_ROOT/fallback-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+  "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
 test_dkms_failure_falls_back
+test_signing_status
 
 printf 'PASS: vibeshine-drm installer shell tests\n'
