@@ -11,12 +11,13 @@ monitor contract:
 - a CTA-861 EDID advertising BT.2020, PQ, HLG, and static HDR metadata;
 - atomic `HDR_OUTPUT_METADATA`, `Colorspace`, and 8-16 `max bpc` properties;
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
-- a versioned, read-only presentation-wait ioctl so direct KMS capture can
-  follow completed scanout changes instead of polling at a fixed rate; and
+- versioned, read-only presentation and frame-export ioctls so direct KMS
+  capture can follow completed scanout changes and import the exact presented
+  DMA-BUF instead of polling KMS state at a fixed rate; and
 - an independent `/sys/kernel/config/vibeshine-drm` configfs namespace, so the
   driver can coexist with a distribution's normal `vkms` module.
 
-## Presentation notification ABI
+## Presentation and frame-export ABI
 
 `vibeshine_drm_uapi.h` defines `DRM_VIBESHINE_WAIT_PRESENT`. Each CRTC owns a
 monotonic presentation sequence. The sequence advances after an atomic commit
@@ -28,12 +29,28 @@ latest scanout buffer.
 
 The response also reports when a newer atomic state has been submitted but is
 not presented yet. Capture waits until that pending count reaches zero before
-exporting the current plane framebuffer, so a later software state swap cannot
-be mistaken for the presentation which generated an earlier notification.
+dequeueing a frame.
 
-The ioctl is observational: it cannot modify display state and does not require
-DRM master ownership. ABI additions must preserve the fixed-width version 1
-structure and use its reserved fields for compatible extension. To keep an
+`DRM_VIBESHINE_GET_FRAME` pins and exports the newest completed primary-plane
+framebuffer together with its presentation sequence, monotonic timestamp,
+format, modifier, pitches, offsets, original PRIME DMA-BUF descriptors, and
+optional per-plane sync-file snapshots. The framebuffer reference is exchanged under the
+same lock as the sequence and timestamp, so a later KMS software-state swap
+cannot be mistaken for the presentation which generated an earlier
+notification. Sequence gaps are deliberately coalesced to the newest completed
+frame rather than growing an unbounded kernel queue.
+
+The managed configfs pool provisions exactly one primary plane per CRTC. It
+does not create cursor or overlay planes, forcing KWin to composite the cursor,
+desktop overlays, and application content into the exported framebuffer.
+Non-linear imported PRIME objects are passed through to userspace as the
+renderer GPU's original DMA-BUF; the export ioctl fails rather than silently
+copying a virtual-device shmem buffer.
+
+Both ioctls are observational and cannot modify display state. Presentation
+waiting does not require DRM master ownership; framebuffer export requires
+`CAP_SYS_ADMIN`, matching direct KMS capture. ABI additions must preserve the fixed-width
+version 1 structures and use their reserved fields for compatible extension. To keep an
 untrusted card-node client from amplifying every presentation into unbounded
 wakeup work, each CRTC accepts at most 64 concurrent blocking waits; additional
 blocking requests fail transiently with `EBUSY`, while zero-timeout queries are

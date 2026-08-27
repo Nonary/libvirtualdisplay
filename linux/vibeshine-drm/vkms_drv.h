@@ -237,6 +237,7 @@ struct vkms_output {
 	atomic64_t present_sequence;
 	atomic_t pending_commits;
 	u64 present_timestamp_ns;
+	struct drm_framebuffer *present_fb;
 	unsigned int present_waiters;
 	spinlock_t present_lock;
 	wait_queue_head_t present_waitq;

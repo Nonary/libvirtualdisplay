@@ -199,6 +199,19 @@ static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
 	.handle_vblank_timeout = vkms_crtc_handle_vblank_timeout,
 };
 
+static void vkms_present_fb_cleanup(struct drm_device *dev, void *data)
+{
+	struct vkms_output *output = data;
+	struct drm_framebuffer *fb;
+
+	spin_lock_irq(&output->present_lock);
+	fb = output->present_fb;
+	output->present_fb = NULL;
+	spin_unlock_irq(&output->present_lock);
+	if (fb)
+		drm_framebuffer_put(fb);
+}
+
 struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *primary,
 				   struct drm_plane *cursor)
 {
@@ -233,9 +246,13 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 	atomic64_set(&vkms_out->present_sequence, 0);
 	atomic_set(&vkms_out->pending_commits, 0);
 	vkms_out->present_timestamp_ns = 0;
+	vkms_out->present_fb = NULL;
 	vkms_out->present_waiters = 0;
 	spin_lock_init(&vkms_out->present_lock);
 	init_waitqueue_head(&vkms_out->present_waitq);
+	ret = drmm_add_action_or_reset(dev, vkms_present_fb_cleanup, vkms_out);
+	if (ret)
+		return ERR_PTR(ret);
 
 	vkms_out->composer_workq = drmm_alloc_ordered_workqueue(dev, "vkms_composer", 0);
 	if (IS_ERR(vkms_out->composer_workq))

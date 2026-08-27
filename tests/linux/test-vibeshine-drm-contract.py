@@ -83,6 +83,12 @@ _Static_assert(offsetof(struct vibeshine_drm_wait_present, sequence) == 8, "unex
 _Static_assert(offsetof(struct vibeshine_drm_wait_present, timestamp_ns) == 16, "unexpected timestamp offset");
 _Static_assert(offsetof(struct vibeshine_drm_wait_present, timeout_ms) == 24, "unexpected timeout offset");
 _Static_assert(offsetof(struct vibeshine_drm_wait_present, reserved) == 32, "unexpected reserved offset");
+_Static_assert(sizeof(struct vibeshine_drm_frame) == 152, "unexpected frame ABI size");
+_Static_assert(offsetof(struct vibeshine_drm_frame, sequence) == 8, "unexpected frame sequence offset");
+_Static_assert(offsetof(struct vibeshine_drm_frame, modifier) == 40, "unexpected modifier offset");
+_Static_assert(offsetof(struct vibeshine_drm_frame, dma_buf_fds) == 52, "unexpected fd offset");
+_Static_assert(offsetof(struct vibeshine_drm_frame, sync_file_fds) == 100, "unexpected fence offset");
+_Static_assert(offsetof(struct vibeshine_drm_frame, reserved) == 120, "unexpected frame reserved offset");
 
 int main(void) { return 0; }
 """
@@ -105,12 +111,14 @@ def validate_source_contract(driver_root: Path) -> None:
     configfs_path = driver_root / "vkms_configfs.c"
     config_path = driver_root / "vkms_config.c"
     crtc_path = driver_root / "vkms_crtc.c"
+    drv_path = driver_root / "vkms_drv.c"
     connector = connector_path.read_text(encoding="utf-8")
     driver_header = driver_header_path.read_text(encoding="utf-8")
     plane = plane_path.read_text(encoding="utf-8")
     configfs = configfs_path.read_text(encoding="utf-8")
     config = config_path.read_text(encoding="utf-8")
     crtc = crtc_path.read_text(encoding="utf-8")
+    drv = drv_path.read_text(encoding="utf-8")
 
     for needle in (
         "drm_connector_attach_max_bpc_property(&connector->base, 8, 16)",
@@ -140,6 +148,16 @@ def validate_source_contract(driver_root: Path) -> None:
     ):
         require_source(plane, needle, plane_path.name)
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
+    require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
+    for needle in (
+        "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
+        "obj->import_attach->dmabuf",
+        "dma_buf_fd(dma_buf, O_CLOEXEC)",
+        "drm_framebuffer_get(new_present_fb)",
+        "capable(CAP_SYS_ADMIN)",
+        "static bool enable_cursor;",
+    ):
+        require_source(drv, needle, drv_path.name)
     require(".get_crc_sources" not in crtc, "GPU pass-through CRTC still advertises software CRC")
     require_source(configfs, "if (writeback)", configfs_path.name)
     require_source(configfs, "return -EOPNOTSUPP", configfs_path.name)

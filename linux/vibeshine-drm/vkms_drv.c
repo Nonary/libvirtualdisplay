@@ -10,12 +10,19 @@
  */
 
 #include <linux/module.h>
+#include <linux/capability.h>
 #include <linux/device/faux.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-resv.h>
+#include <linux/fdtable.h>
+#include <linux/file.h>
+#include <linux/fcntl.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
 #include <linux/string.h>
+#include <linux/sync_file.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_gem.h>
@@ -25,6 +32,7 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_file.h>
+#include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
@@ -44,11 +52,11 @@
 #define DRIVER_NAME	"vibeshine_drm"
 #define DRIVER_DESC	"Vibeshine HDR Virtual Display"
 #define DRIVER_MAJOR	1
-#define DRIVER_MINOR	1
+#define DRIVER_MINOR	2
 
 static struct vkms_config *default_config;
 
-static bool enable_cursor = true;
+static bool enable_cursor;
 module_param_named(enable_cursor, enable_cursor, bool, 0444);
 MODULE_PARM_DESC(enable_cursor, "Enable/Disable cursor support");
 
@@ -73,6 +81,9 @@ DEFINE_DRM_GEM_FOPS(vkms_driver_fops);
 #define DRM_IOCTL_VIBESHINE_WAIT_PRESENT \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_WAIT_PRESENT, \
 		 struct vibeshine_drm_wait_present)
+#define DRM_IOCTL_VIBESHINE_GET_FRAME \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_GET_FRAME, \
+		 struct vibeshine_drm_frame)
 
 static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 				   struct drm_file *file_priv)
@@ -139,8 +150,158 @@ static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
+static bool vkms_frame_request_valid(const struct vibeshine_drm_frame *request)
+{
+	struct vibeshine_drm_frame expected = {
+		.abi_version = VIBESHINE_DRM_FRAME_ABI_VERSION,
+		.crtc_id = request->crtc_id,
+	};
+
+	return !memcmp(request, &expected, sizeof(expected));
+}
+
+static void vkms_close_frame_fds(struct vibeshine_drm_frame *frame)
+{
+	unsigned int i;
+
+	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
+		if (frame->dma_buf_fds[i] >= 0) {
+			close_fd(frame->dma_buf_fds[i]);
+			frame->dma_buf_fds[i] = -1;
+		}
+	}
+	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
+		if (frame->sync_file_fds[i] >= 0) {
+			close_fd(frame->sync_file_fds[i]);
+			frame->sync_file_fds[i] = -1;
+		}
+	}
+}
+
+static int vkms_export_read_fence(struct dma_buf *dma_buf)
+{
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fd;
+	int ret;
+
+	ret = dma_resv_get_singleton(dma_buf->resv, DMA_RESV_USAGE_WRITE,
+				     &fence);
+	if (ret)
+		return ret;
+	if (!fence)
+		return -1;
+
+	sync_file = sync_file_create(fence);
+	dma_fence_put(fence);
+	if (!sync_file)
+		return -ENOMEM;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		fput(sync_file->file);
+		return fd;
+	}
+	fd_install(fd, sync_file->file);
+	return fd;
+}
+
+static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
+				struct drm_file *file_priv)
+{
+	struct vibeshine_drm_frame *request = data;
+	struct drm_framebuffer *fb = NULL;
+	struct vkms_output *output;
+	struct drm_crtc *crtc;
+	unsigned int plane_count;
+	unsigned int i;
+	int ret = 0;
+
+	if (!vkms_frame_request_valid(request))
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EACCES;
+
+	crtc = drm_crtc_find(dev, file_priv, request->crtc_id);
+	if (!crtc)
+		return -ENOENT;
+
+	output = drm_crtc_to_vkms_output(crtc);
+	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
+		request->dma_buf_fds[i] = -1;
+		request->sync_file_fds[i] = -1;
+	}
+
+	spin_lock_irq(&output->present_lock);
+	request->sequence = atomic64_read(&output->present_sequence);
+	request->timestamp_ns = output->present_timestamp_ns;
+	if (output->present_fb) {
+		fb = output->present_fb;
+		drm_framebuffer_get(fb);
+	}
+	spin_unlock_irq(&output->present_lock);
+
+	if (!fb) {
+		request->flags = VIBESHINE_DRM_FRAME_EMPTY;
+		return 0;
+	}
+
+	request->flags = VIBESHINE_DRM_FRAME_READY;
+	request->width = fb->width;
+	request->height = fb->height;
+	request->fourcc = fb->format->format;
+	request->modifier = fb->modifier;
+	plane_count = fb->format->num_planes;
+	if (!plane_count || plane_count > VIBESHINE_DRM_FRAME_MAX_PLANES) {
+		ret = -EINVAL;
+		goto out;
+	}
+	request->plane_count = plane_count;
+
+	for (i = 0; i < plane_count; ++i) {
+		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, i);
+		struct dma_buf *dma_buf;
+
+		if (!obj || !obj->import_attach || !obj->import_attach->dmabuf) {
+			ret = -EXDEV;
+			goto out;
+		}
+
+		dma_buf = obj->import_attach->dmabuf;
+		get_dma_buf(dma_buf);
+		request->dma_buf_fds[i] = dma_buf_fd(dma_buf, O_CLOEXEC);
+		if (request->dma_buf_fds[i] < 0) {
+			dma_buf_put(dma_buf);
+			ret = request->dma_buf_fds[i];
+			goto out;
+		}
+		request->pitches[i] = fb->pitches[i];
+		request->offsets[i] = fb->offsets[i];
+
+		/*
+		 * Atomic helpers have already waited for producer fences before the
+		 * presentation is published. Return a per-plane snapshot of any
+		 * remaining implicit write fence for explicit-sync importers; -1 means
+		 * no wait is required.
+		 */
+		request->sync_file_fds[i] = vkms_export_read_fence(dma_buf);
+		if (request->sync_file_fds[i] < -1) {
+			ret = request->sync_file_fds[i];
+			request->sync_file_fds[i] = -1;
+			goto out;
+		}
+	}
+
+out:
+	drm_framebuffer_put(fb);
+	if (ret)
+		vkms_close_frame_fds(request);
+	return ret;
+}
+
 static const struct drm_ioctl_desc vkms_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VIBESHINE_WAIT_PRESENT, vkms_wait_present_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0),
 };
 
 static bool vkms_commit_touches_crtc(struct drm_atomic_commit *state,
@@ -322,6 +483,10 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 
 	drm_for_each_crtc(crtc, state->dev) {
 		struct vkms_output *output;
+		struct drm_framebuffer *new_present_fb = NULL;
+		struct drm_framebuffer *old_present_fb = NULL;
+		struct drm_plane_state *primary_state;
+		struct drm_crtc_state *crtc_state;
 		bool scanout_changed;
 
 		if (!vkms_commit_touches_crtc(state, crtc))
@@ -329,8 +494,19 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 
 		scanout_changed = vkms_commit_changes_crtc(state, crtc);
 		output = drm_crtc_to_vkms_output(crtc);
+		primary_state = drm_atomic_get_new_plane_state(state, crtc->primary);
+		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+		if (primary_state && primary_state->fb && primary_state->visible) {
+			new_present_fb = primary_state->fb;
+			drm_framebuffer_get(new_present_fb);
+		}
 		spin_lock_irq(&output->present_lock);
 		if (scanout_changed) {
+			if (primary_state || (crtc_state && !crtc_state->active)) {
+				old_present_fb = output->present_fb;
+				output->present_fb = new_present_fb;
+				new_present_fb = NULL;
+			}
 			output->present_timestamp_ns = ktime_get_ns();
 			atomic64_inc(&output->present_sequence);
 		}
@@ -339,6 +515,10 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		else
 			atomic_dec(&output->pending_commits);
 		spin_unlock_irq(&output->present_lock);
+		if (old_present_fb)
+			drm_framebuffer_put(old_present_fb);
+		if (new_present_fb)
+			drm_framebuffer_put(new_present_fb);
 		wake_up_interruptible(&output->present_waitq);
 	}
 }
@@ -654,5 +834,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.1.0");
+MODULE_VERSION("1.2.0");
+MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

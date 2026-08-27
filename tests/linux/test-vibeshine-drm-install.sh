@@ -516,7 +516,7 @@ test_package_enrollment_requires_terminal() (
 
 test_loaded_module_freshness() (
   mkdir -p -- "$SYS_MODULE_ROOT/$MODULE_NAME"
-  printf '1.1.0\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/version"
+  printf '1.2.0\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/version"
   printf 'CURRENT-SOURCE\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/srcversion"
 
   dkms_available() {
@@ -534,7 +534,7 @@ test_loaded_module_freshness() (
   modinfo() {
     [[ ${1:-} == -F && ${3:-} == "$MODULE_NAME" ]] || return 1
     case ${2:-} in
-      version) printf '1.1.0\n' ;;
+      version) printf '1.2.0\n' ;;
       srcversion) printf 'CURRENT-SOURCE\n' ;;
       *) return 1 ;;
     esac
