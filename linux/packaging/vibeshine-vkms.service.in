@@ -1,7 +1,8 @@
 [Unit]
 Description=Vibeshine virtual display pool
 Documentation=https://docs.kernel.org/gpu/vkms.html
-Wants=vibeshine-drm-setup.service vibeshine-vkms-control.socket
+Requires=vibeshine-drm-setup.service
+Wants=vibeshine-vkms-control.socket
 After=systemd-modules-load.service vibeshine-drm-setup.service
 Before=display-manager.service
 

@@ -21,6 +21,10 @@ file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/unit/*.h")
 
 add_executable(test_libvirtualdisplay ${TEST_SOURCES})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_include_directories(test_libvirtualdisplay PRIVATE
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm")
+endif()
 target_link_libraries(test_libvirtualdisplay
         PRIVATE
         gmock_main

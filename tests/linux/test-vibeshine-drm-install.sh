@@ -253,6 +253,51 @@ test_signing_status() (
   report_enrollment_needed || fail "enrollment guidance failed"
 )
 
+test_loaded_module_freshness() (
+  mkdir -p -- "$SYS_MODULE_ROOT/$MODULE_NAME"
+  printf '1.1.0\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/version"
+  printf 'CURRENT-SOURCE\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/srcversion"
+
+  dkms_available() {
+    return 1
+  }
+  direct_is_installed_for_kernel() {
+    return 0
+  }
+  modinfo() {
+    [[ ${1:-} == -F && ${3:-} == "$MODULE_NAME" ]] || return 1
+    case ${2:-} in
+      version) printf '1.1.0\n' ;;
+      srcversion) printf 'CURRENT-SOURCE\n' ;;
+      *) return 1 ;;
+    esac
+  }
+
+  module_status || fail "matching loaded module was rejected"
+
+  printf 'STALE-SOURCE\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/srcversion"
+  if module_status; then
+    fail "same-version stale loaded module was accepted"
+  else
+    [[ $? -eq $RELOAD_REQUIRED_EXIT ]] || fail "stale source returned the wrong status"
+  fi
+
+  printf 'CURRENT-SOURCE\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/srcversion"
+  printf '1.0.0\n' >"$SYS_MODULE_ROOT/$MODULE_NAME/version"
+  if module_status; then
+    fail "stale loaded module version was accepted"
+  else
+    [[ $? -eq $RELOAD_REQUIRED_EXIT ]] || fail "stale version returned the wrong status"
+  fi
+
+  rm -f -- "$SYS_MODULE_ROOT/$MODULE_NAME/srcversion"
+  if module_status; then
+    fail "unverifiable loaded module was accepted"
+  else
+    [[ $? -eq $RELOAD_REQUIRED_EXIT ]] || fail "unverifiable module returned the wrong status"
+  fi
+)
+
 test_dkms_install
 test_direct_install
 test_obsolete_direct_cleanup
@@ -260,9 +305,11 @@ test_obsolete_direct_cleanup
 # The direct fallback test uses its own state tree so an earlier direct marker
 # cannot turn the fallback path into an idempotent no-op.
 configure_install_paths \
-  "$TEST_SOURCE" "$TEST_ROOT/fallback-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+  "$TEST_SOURCE" "$TEST_ROOT/fallback-state" "$TEST_MODULES" "$TEST_ROOT/fallback-sys-module" "$TEST_BUILD_TMP" \
   "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
+mkdir -p -- "$SYS_MODULE_ROOT"
 test_dkms_failure_falls_back
 test_signing_status
+test_loaded_module_freshness
 
 printf 'PASS: vibeshine-drm installer shell tests\n'

@@ -10,6 +10,7 @@ DKMS_NAME="vibeshine-drm"
 MODULE_NAME="vibeshine_drm"
 MODULE_VERSION="@PROJECT_VERSION_NUMERIC@"
 MODULE_SOURCE_ID="@VIBESHINE_DRM_SOURCE_ID@"
+RELOAD_REQUIRED_EXIT=4
 
 SOURCE_DIR=""
 STATE_DIR=""
@@ -318,6 +319,44 @@ module_install_identity() {
   printf '%s:%s\n' "$MODULE_SOURCE_ID" "$certificate_hash"
 }
 
+loaded_module_matches_installed() {
+  local field installed_value loaded_path loaded_value
+
+  [[ -d "$SYS_MODULE_ROOT/$MODULE_NAME" ]] || return 0
+  require_command modinfo || return 2
+
+  for field in version srcversion; do
+    loaded_path="$SYS_MODULE_ROOT/$MODULE_NAME/$field"
+    if [[ ! -f "$loaded_path" || -L "$loaded_path" ]]; then
+      return 2
+    fi
+    IFS= read -r loaded_value <"$loaded_path" || return 2
+    installed_value=$(modinfo -F "$field" "$MODULE_NAME" 2>/dev/null) || return 2
+    if [[ -z "$loaded_value" || -z "$installed_value" ]]; then
+      return 2
+    fi
+    if [[ "$loaded_value" != "$installed_value" ]]; then
+      return 1
+    fi
+  done
+}
+
+report_loaded_module_freshness() {
+  local result
+
+  if loaded_module_matches_installed; then
+    return 0
+  else
+    result=$?
+  fi
+  if ((result == 1)); then
+    error "the loaded ${MODULE_NAME} differs from the installed module; reboot or safely reload it before using managed displays"
+  else
+    error "could not verify the loaded ${MODULE_NAME} against the installed module; reboot or safely reload it before using managed displays"
+  fi
+  return "$RELOAD_REQUIRED_EXIT"
+}
+
 write_state_marker() {
   local marker=$1
   local install_identity
@@ -568,7 +607,8 @@ install_module() {
   if dkms_available; then
     if install_with_dkms "$kernel_release"; then
       ((cleanup_rc == 0)) || log "obsolete module cleanup was incomplete; current DKMS module is ready"
-      return 0
+      report_loaded_module_freshness
+      return $?
     fi
     log "DKMS installation failed; attempting a current-kernel direct build"
   else
@@ -576,6 +616,7 @@ install_module() {
   fi
   install_direct "$kernel_release" || return 1
   ((cleanup_rc == 0)) || log "obsolete module cleanup was incomplete; current direct-built module is ready"
+  report_loaded_module_freshness
 }
 
 unload_module() {
@@ -790,7 +831,6 @@ module_status() {
   validate_kernel_release "$kernel_release" || return 1
   if [[ -d "$SYS_MODULE_ROOT/$MODULE_NAME" ]]; then
     log "${MODULE_NAME} is loaded"
-    installed=1
   fi
   if dkms_available && dkms_is_installed_for_kernel "$kernel_release"; then
     log "DKMS module is installed for ${kernel_release}"
@@ -801,9 +841,10 @@ module_status() {
     installed=1
   fi
   if ((installed == 0)); then
-    log "HDR DRM module is not installed for ${kernel_release}"
+    log "the current HDR DRM module is not installed for ${kernel_release}"
     return 3
   fi
+  report_loaded_module_freshness
 }
 
 usage() {

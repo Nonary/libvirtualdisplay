@@ -148,6 +148,8 @@ struct conversion_matrix {
  * @pixel_read_line: function to read a pixel line in this plane. The creator of a
  *		     struct vkms_plane_state must ensure that this pointer is valid
  * @conversion_matrix: matrix used for yuv formats to convert to rgb
+ * @presentation_content_update: true when this commit supplied a content fence
+ *				 that the atomic helper consumes before commit_tail
  */
 struct vkms_plane_state {
 	struct drm_shadow_plane_state base;
@@ -155,6 +157,7 @@ struct vkms_plane_state {
 	pixel_read_line_t pixel_read_line;
 	struct conversion_matrix conversion_matrix;
 	bool frame_mapped;
+	bool presentation_content_update;
 };
 
 struct vkms_plane {
