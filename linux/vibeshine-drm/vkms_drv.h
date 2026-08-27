@@ -4,6 +4,8 @@
 #define _VKMS_DRV_H_
 
 #include <linux/hrtimer.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
 
 #include <drm/drm.h>
 #include <drm/drm_framebuffer.h>
@@ -227,6 +229,14 @@ struct vkms_output {
 	struct vkms_crtc_state *composer_state;
 
 	spinlock_t composer_lock;
+
+	/* Read-only presentation notification consumed by direct KMS capture. */
+	atomic64_t present_sequence;
+	atomic_t pending_commits;
+	u64 present_timestamp_ns;
+	unsigned int present_waiters;
+	spinlock_t present_lock;
+	wait_queue_head_t present_waitq;
 };
 
 struct vkms_config;
@@ -244,6 +254,9 @@ struct vkms_device {
 	struct drm_device drm;
 	struct faux_device *faux_dev;
 	const struct vkms_config *config;
+	struct mutex commit_lock;
+	bool accepting_commits;
+	struct task_struct *shutdown_owner;
 };
 
 /*

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -70,6 +71,31 @@ def validate_edid(edid: bytes) -> None:
     require(hdr_metadata and len(hdr_metadata[0]) >= 3, "CTA HDR static metadata block is missing")
     require(hdr_metadata[0][1] & 0x04, "CTA HDR metadata does not advertise SMPTE ST 2084 PQ")
     require(hdr_metadata[0][2] & 0x01, "CTA HDR metadata does not advertise static metadata type 1")
+
+
+def validate_uapi_layout(driver_root: Path) -> None:
+    source = r"""
+#include <stddef.h>
+#include "vibeshine_drm_uapi.h"
+
+_Static_assert(sizeof(struct vibeshine_drm_wait_present) == 48, "unexpected ABI size");
+_Static_assert(offsetof(struct vibeshine_drm_wait_present, sequence) == 8, "unexpected sequence offset");
+_Static_assert(offsetof(struct vibeshine_drm_wait_present, timestamp_ns) == 16, "unexpected timestamp offset");
+_Static_assert(offsetof(struct vibeshine_drm_wait_present, timeout_ms) == 24, "unexpected timeout offset");
+_Static_assert(offsetof(struct vibeshine_drm_wait_present, reserved) == 32, "unexpected reserved offset");
+
+int main(void) { return 0; }
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-uapi-") as temporary_dir:
+        source_path = Path(temporary_dir) / "uapi-layout.c"
+        binary_path = Path(temporary_dir) / "uapi-layout"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Werror", "-I", str(driver_root),
+             str(source_path), "-o", str(binary_path)],
+            check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
 
 
 def validate_source_contract(driver_root: Path) -> None:
@@ -151,6 +177,7 @@ def main() -> int:
         validate_edid(binary.read_bytes())
 
     validate_source_contract(driver_root)
+    validate_uapi_layout(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
 

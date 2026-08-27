@@ -229,6 +229,12 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);
+	atomic64_set(&vkms_out->present_sequence, 0);
+	atomic_set(&vkms_out->pending_commits, 0);
+	vkms_out->present_timestamp_ns = 0;
+	vkms_out->present_waiters = 0;
+	spin_lock_init(&vkms_out->present_lock);
+	init_waitqueue_head(&vkms_out->present_waitq);
 
 	vkms_out->composer_workq = drmm_alloc_ordered_workqueue(dev, "vkms_composer", 0);
 	if (IS_ERR(vkms_out->composer_workq))

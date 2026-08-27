@@ -12,9 +12,11 @@
  * struct vkms_connector - VKMS custom type wrapping around the DRM connector
  *
  * @drm: Base DRM connector
+ * @status: Runtime connector state copied from configfs at device creation.
  */
 struct vkms_connector {
 	struct drm_connector base;
+	enum drm_connector_status status;
 };
 
 /**
@@ -24,7 +26,16 @@ struct vkms_connector {
  * Returns:
  * The connector or an error on failure.
  */
-struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev);
+struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev,
+					   enum drm_connector_status status);
+
+/**
+ * vkms_connector_set_status() - Update an instantiated connector's status
+ * @connector: Runtime connector to update
+ * @status: New connector status
+ */
+void vkms_connector_set_status(struct vkms_connector *connector,
+			       enum drm_connector_status status);
 
 /**
  * vkms_trigger_connector_hotplug() - Update the device's connectors status

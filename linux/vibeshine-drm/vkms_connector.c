@@ -12,27 +12,10 @@
 static enum drm_connector_status vkms_connector_detect(struct drm_connector *connector,
 						       bool force)
 {
-	struct drm_device *dev = connector->dev;
-	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
 	struct vkms_connector *vkms_connector;
-	enum drm_connector_status status;
-	struct vkms_config_connector *connector_cfg;
 
 	vkms_connector = drm_connector_to_vkms_connector(connector);
-
-	/*
-	 * The connector configuration might not exist if its configfs directory
-	 * was deleted. Therefore, use the configuration if present or keep the
-	 * current status if we can not access it anymore.
-	 */
-	status = connector->status;
-
-	vkms_config_for_each_connector(vkmsdev->config, connector_cfg) {
-		if (connector_cfg->connector == vkms_connector)
-			status = vkms_config_connector_get_status(connector_cfg);
-	}
-
-	return status;
+	return READ_ONCE(vkms_connector->status);
 }
 
 static const struct drm_connector_funcs vkms_connector_funcs = {
@@ -80,7 +63,8 @@ static const struct drm_connector_helper_funcs vkms_conn_helper_funcs = {
 	.best_encoder = vkms_conn_best_encoder,
 };
 
-struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev)
+struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev,
+					   enum drm_connector_status status)
 {
 	struct drm_device *dev = &vkmsdev->drm;
 	struct vkms_connector *connector;
@@ -96,6 +80,7 @@ struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev)
 		return ERR_PTR(ret);
 
 	drm_connector_helper_add(&connector->base, &vkms_conn_helper_funcs);
+	WRITE_ONCE(connector->status, status);
 	drm_connector_attach_edid_property(&connector->base);
 
 	/* The max-bpc helper initializes standardized atomic connector state. */
@@ -115,6 +100,12 @@ struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev)
 		return ERR_PTR(ret);
 
 	return connector;
+}
+
+void vkms_connector_set_status(struct vkms_connector *connector,
+			       enum drm_connector_status status)
+{
+	WRITE_ONCE(connector->status, status);
 }
 
 void vkms_trigger_connector_hotplug(struct vkms_device *vkmsdev)

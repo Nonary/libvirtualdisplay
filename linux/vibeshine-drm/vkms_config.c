@@ -3,7 +3,6 @@
 #include <linux/slab.h>
 
 #include <drm/drm_print.h>
-#include <drm/drm_debugfs.h>
 #include <kunit/visibility.h>
 
 #include "vkms_config.h"
@@ -26,6 +25,7 @@ struct vkms_config *vkms_config_create(const char *dev_name)
 	INIT_LIST_HEAD(&config->crtcs);
 	INIT_LIST_HEAD(&config->encoders);
 	INIT_LIST_HEAD(&config->connectors);
+	refcount_set(&config->refcount, 1);
 
 	return config;
 }
@@ -108,12 +108,20 @@ err_alloc:
 	return ERR_PTR(-ENOMEM);
 }
 
+void vkms_config_get(struct vkms_config *config)
+{
+	refcount_inc(&config->refcount);
+}
+
 void vkms_config_destroy(struct vkms_config *config)
 {
 	struct vkms_config_plane *plane_cfg, *plane_tmp;
 	struct vkms_config_crtc *crtc_cfg, *crtc_tmp;
 	struct vkms_config_encoder *encoder_cfg, *encoder_tmp;
 	struct vkms_config_connector *connector_cfg, *connector_tmp;
+
+	if (!refcount_dec_and_test(&config->refcount))
+		return;
 
 	list_for_each_entry_safe(plane_cfg, plane_tmp, &config->planes, link)
 		vkms_config_destroy_plane(plane_cfg);
@@ -330,54 +338,6 @@ bool vkms_config_is_valid(const struct vkms_config *config)
 		return false;
 
 	return true;
-}
-
-static int vkms_config_show(struct seq_file *m, void *data)
-{
-	struct drm_debugfs_entry *entry = m->private;
-	struct drm_device *dev = entry->dev;
-	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
-	const char *dev_name;
-	struct vkms_config_plane *plane_cfg;
-	struct vkms_config_crtc *crtc_cfg;
-	struct vkms_config_encoder *encoder_cfg;
-	struct vkms_config_connector *connector_cfg;
-
-	dev_name = vkms_config_get_device_name((struct vkms_config *)vkmsdev->config);
-	seq_printf(m, "dev_name=%s\n", dev_name);
-
-	vkms_config_for_each_plane(vkmsdev->config, plane_cfg) {
-		seq_puts(m, "plane:\n");
-		seq_printf(m, "\ttype=%d\n",
-			   vkms_config_plane_get_type(plane_cfg));
-	}
-
-	vkms_config_for_each_crtc(vkmsdev->config, crtc_cfg) {
-		seq_puts(m, "crtc:\n");
-		seq_printf(m, "\twriteback=%d\n",
-			   vkms_config_crtc_get_writeback(crtc_cfg));
-	}
-
-	vkms_config_for_each_encoder(vkmsdev->config, encoder_cfg)
-		seq_puts(m, "encoder\n");
-
-	vkms_config_for_each_connector(vkmsdev->config, connector_cfg) {
-		seq_puts(m, "connector:\n");
-		seq_printf(m, "\tstatus=%d\n",
-			   vkms_config_connector_get_status(connector_cfg));
-	}
-
-	return 0;
-}
-
-static const struct drm_debugfs_info vkms_config_debugfs_list[] = {
-	{ "vkms_config", vkms_config_show, 0 },
-};
-
-void vkms_config_register_debugfs(struct vkms_device *vkms_device)
-{
-	drm_debugfs_add_files(&vkms_device->drm, vkms_config_debugfs_list,
-			      ARRAY_SIZE(vkms_config_debugfs_list));
 }
 
 struct vkms_config_plane *vkms_config_create_plane(struct vkms_config *config)

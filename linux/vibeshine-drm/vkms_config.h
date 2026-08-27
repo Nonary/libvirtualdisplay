@@ -4,6 +4,7 @@
 #define _VKMS_CONFIG_H_
 
 #include <linux/list.h>
+#include <linux/refcount.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
 
@@ -20,6 +21,7 @@
  * @encoders: List of encoders configured for the device
  * @connectors: List of connectors configured for the device
  * @dev: Used to store the current VKMS device. Only set when the device is instantiated.
+ * @refcount: Keeps the configuration alive while unplugged DRM fds still exist.
  */
 struct vkms_config {
 	const char *dev_name;
@@ -28,6 +30,7 @@ struct vkms_config {
 	struct list_head encoders;
 	struct list_head connectors;
 	struct vkms_device *dev;
+	refcount_t refcount;
 };
 
 /**
@@ -205,11 +208,17 @@ struct vkms_config *vkms_config_create(const char *dev_name);
 struct vkms_config *vkms_config_default_create(bool enable_cursor,
 					       bool enable_writeback,
 					       bool enable_overlay,
-					       bool enable_plane_pipeline);
+						bool enable_plane_pipeline);
 
 /**
- * vkms_config_destroy() - Free a VKMS configuration
- * @config: vkms_config to free
+ * vkms_config_get() - Hold a VKMS configuration reference
+ * @config: Configuration to retain
+ */
+void vkms_config_get(struct vkms_config *config);
+
+/**
+ * vkms_config_destroy() - Drop a VKMS configuration reference
+ * @config: Configuration reference to release
  */
 void vkms_config_destroy(struct vkms_config *config);
 
@@ -250,8 +259,6 @@ bool vkms_config_is_valid(const struct vkms_config *config);
  * configuration
  * @vkms_device: Device to register
  */
-void vkms_config_register_debugfs(struct vkms_device *vkms_device);
-
 /**
  * vkms_config_create_plane() - Add a new plane configuration
  * @config: Configuration to add the plane to
