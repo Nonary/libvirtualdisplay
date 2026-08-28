@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 
 #include <linux/dma-fence.h>
+#include <linux/timekeeping.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -99,6 +100,32 @@ static void vkms_atomic_crtc_reset(struct drm_crtc *crtc)
 		INIT_WORK(&vkms_state->composer_work, vkms_composer_worker);
 }
 
+static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
+					   int *max_error,
+					   ktime_t *vblank_time,
+					   bool in_vblank_irq)
+{
+	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+	u64 timestamp_ns;
+
+	if (!READ_ONCE(crtc->state->vrr_enabled))
+		return drm_crtc_vblank_helper_get_vblank_timestamp_from_timer(
+			crtc, max_error, vblank_time, in_vblank_irq);
+
+	/*
+	 * The DRM timer helper derives its timestamp from the timer expiry and
+	 * interval. VRR deliberately cancels that timer, clearing its interval,
+	 * so retain the actual synthetic-vblank time instead.
+	 */
+	timestamp_ns = atomic64_read(&output->vrr_vblank_timestamp_ns);
+	if (!timestamp_ns)
+		timestamp_ns = ktime_get_ns();
+	*max_error = 0;
+	*vblank_time = ns_to_ktime(timestamp_ns);
+
+	return true;
+}
+
 static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.set_config             = drm_atomic_helper_set_config,
 	.page_flip              = drm_atomic_helper_page_flip,
@@ -107,7 +134,7 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
 	.enable_vblank          = drm_crtc_vblank_helper_enable_vblank_timer,
 	.disable_vblank         = drm_crtc_vblank_helper_disable_vblank_timer,
-	.get_vblank_timestamp   = drm_crtc_vblank_helper_get_vblank_timestamp_from_timer,
+	.get_vblank_timestamp   = vkms_crtc_get_vblank_timestamp,
 };
 
 static int vkms_crtc_atomic_check(struct drm_crtc *crtc,
@@ -208,10 +235,14 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	 */
 	if (crtc->state->vrr_enabled)
 		drm_crtc_vblank_cancel_timer(crtc);
-	if (vrr_flip)
+	if (vrr_flip) {
+		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns,
+			     ktime_get_ns());
 		vkms_crtc_handle_vblank_timeout(crtc);
-	else if (vrr_disabled)
+	} else if (vrr_disabled) {
+		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns, 0);
 		drm_crtc_vblank_start_timer(crtc);
+	}
 }
 
 static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
@@ -267,6 +298,7 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);
+	atomic64_set(&vkms_out->vrr_vblank_timestamp_ns, 0);
 	atomic64_set(&vkms_out->present_sequence, 0);
 	atomic_set(&vkms_out->pending_commits, 0);
 	vkms_out->present_timestamp_ns = 0;

@@ -233,6 +233,9 @@ struct vkms_output {
 
 	spinlock_t composer_lock;
 
+	/* Last synthetic VRR vblank, used after the fixed timer is cancelled. */
+	atomic64_t vrr_vblank_timestamp_ns;
+
 	/* Read-only presentation notification consumed by direct KMS capture. */
 	atomic64_t present_sequence;
 	atomic_t pending_commits;

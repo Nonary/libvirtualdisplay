@@ -52,7 +52,7 @@
 #define DRIVER_NAME	"vibeshine_drm"
 #define DRIVER_DESC	"Vibeshine HDR Virtual Display"
 #define DRIVER_MAJOR	1
-#define DRIVER_MINOR	3
+#define DRIVER_MINOR	4
 
 static struct vkms_config *default_config;
 
@@ -834,6 +834,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.3.0");
+MODULE_VERSION("1.4.0");
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

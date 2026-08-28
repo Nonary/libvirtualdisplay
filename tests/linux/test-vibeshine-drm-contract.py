@@ -154,6 +154,9 @@ def validate_source_contract(driver_root: Path) -> None:
     for needle in (
         "if (crtc->state->vrr_enabled)",
         "drm_crtc_vblank_cancel_timer(crtc)",
+        "vkms_crtc_get_vblank_timestamp",
+        "atomic64_set(&vkms_output->vrr_vblank_timestamp_ns",
+        "*vblank_time = ns_to_ktime(timestamp_ns)",
         "vkms_crtc_handle_vblank_timeout(crtc)",
         "drm_crtc_vblank_start_timer(crtc)",
     ):

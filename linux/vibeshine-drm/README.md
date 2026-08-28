@@ -10,7 +10,8 @@ monitor contract:
 
 - a CTA-861 EDID advertising BT.2020, PQ, HLG, and static HDR metadata;
 - atomic `HDR_OUTPUT_METADATA`, `Colorspace`, and 8-16 `max bpc` properties;
-- adaptive-sync capability with frame-driven virtual vblank completion;
+- adaptive-sync capability with frame-driven virtual vblank completion and
+  commit-time timestamps independent of the disabled fixed-rate timer;
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
 - versioned, read-only presentation and frame-export ioctls so direct KMS
   capture can follow completed scanout changes and import the exact presented
