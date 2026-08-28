@@ -834,6 +834,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.5.0");
+MODULE_VERSION("1.4.1");
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");
