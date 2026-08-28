@@ -113,10 +113,15 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 			crtc, max_error, vblank_time, in_vblank_irq);
 
 	/*
-	 * The DRM timer helper derives its timestamp from the timer expiry and
-	 * interval. VRR deliberately cancels that timer, clearing its interval,
-	 * so retain the actual synthetic-vblank time instead.
+	 * A synthetic VRR interrupt represents exactly one submitted frame.
+	 * Returning no high-precision timestamp here makes the DRM no-hardware-
+	 * counter path advance by one instead of inferring zero or several
+	 * vblanks from the nominal mode period.
 	 */
+	if (in_vblank_irq)
+		return false;
+
+	/* The fixed timer is stopped in VRR mode, so retain the last flip time. */
 	timestamp_ns = atomic64_read(&output->vrr_vblank_timestamp_ns);
 	if (!timestamp_ns)
 		timestamp_ns = ktime_get_ns();
@@ -210,13 +215,14 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 			       !crtc->state->vrr_enabled;
 
 	if (crtc->state->event) {
-		vrr_flip = crtc->state->vrr_enabled;
 		spin_lock(&crtc->dev->event_lock);
 
 		if (drm_crtc_vblank_get(crtc) != 0)
 			drm_crtc_send_vblank_event(crtc, crtc->state->event);
-		else
+		else {
 			drm_crtc_arm_vblank_event(crtc, crtc->state->event);
+			vrr_flip = crtc->state->vrr_enabled;
+		}
 
 		spin_unlock(&crtc->dev->event_lock);
 
@@ -233,7 +239,8 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	 * presentation timing follow compositor submissions instead of the mode's
 	 * nominal refresh clock. Restore the normal timer when VRR is disabled.
 	 */
-	if (crtc->state->vrr_enabled)
+	if (crtc->state->vrr_enabled && old_crtc_state &&
+	    old_crtc_state->active)
 		drm_crtc_vblank_cancel_timer(crtc);
 	if (vrr_flip) {
 		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns,
@@ -245,11 +252,21 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 }
 
+static void vkms_crtc_atomic_enable(struct drm_crtc *crtc,
+				    struct drm_atomic_commit *state)
+{
+	drm_crtc_vblank_atomic_enable(crtc, state);
+
+	/* drm_crtc_vblank_on() starts the timer after the initial atomic flush. */
+	if (crtc->state->vrr_enabled)
+		drm_crtc_vblank_cancel_timer(crtc);
+}
+
 static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
 	.atomic_check	= vkms_crtc_atomic_check,
 	.atomic_begin	= vkms_crtc_atomic_begin,
 	.atomic_flush	= vkms_crtc_atomic_flush,
-	.atomic_enable	= drm_crtc_vblank_atomic_enable,
+	.atomic_enable	= vkms_crtc_atomic_enable,
 	.atomic_disable	= drm_crtc_vblank_atomic_disable,
 	.handle_vblank_timeout = vkms_crtc_handle_vblank_timeout,
 };
