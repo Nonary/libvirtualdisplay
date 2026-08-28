@@ -121,6 +121,8 @@ def validate_source_contract(driver_root: Path) -> None:
     drv = drv_path.read_text(encoding="utf-8")
 
     for needle in (
+        "drm_connector_attach_vrr_capable_property(&connector->base)",
+        "drm_connector_set_vrr_capable_property(&connector->base, true)",
         "drm_connector_attach_max_bpc_property(&connector->base, 8, 16)",
         "drm_connector_attach_hdr_output_metadata_property(&connector->base)",
         "DRM_MODE_COLORIMETRY_BT2020_RGB",
@@ -149,6 +151,13 @@ def validate_source_contract(driver_root: Path) -> None:
         require_source(plane, needle, plane_path.name)
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
     require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
+    for needle in (
+        "if (crtc->state->vrr_enabled)",
+        "drm_crtc_vblank_cancel_timer(crtc)",
+        "vkms_crtc_handle_vblank_timeout(crtc)",
+        "drm_crtc_vblank_start_timer(crtc)",
+    ):
+        require_source(crtc, needle, crtc_path.name)
     for needle in (
         "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
         "obj->import_attach->dmabuf",

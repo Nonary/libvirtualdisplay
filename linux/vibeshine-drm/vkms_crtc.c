@@ -105,7 +105,9 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.reset                  = vkms_atomic_crtc_reset,
 	.atomic_duplicate_state = vkms_atomic_crtc_duplicate_state,
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
-	DRM_CRTC_VBLANK_TIMER_FUNCS,
+	.enable_vblank          = drm_crtc_vblank_helper_enable_vblank_timer,
+	.disable_vblank         = drm_crtc_vblank_helper_disable_vblank_timer,
+	.get_vblank_timestamp   = drm_crtc_vblank_helper_get_vblank_timestamp_from_timer,
 };
 
 static int vkms_crtc_atomic_check(struct drm_crtc *crtc,
@@ -171,8 +173,17 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	__releases(&vkms_output->lock)
 {
 	struct vkms_output *vkms_output = drm_crtc_to_vkms_output(crtc);
+	struct drm_crtc_state *old_crtc_state;
+	bool vrr_flip = false;
+	bool vrr_disabled = false;
+
+	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
+	if (old_crtc_state)
+		vrr_disabled = old_crtc_state->vrr_enabled &&
+			       !crtc->state->vrr_enabled;
 
 	if (crtc->state->event) {
+		vrr_flip = crtc->state->vrr_enabled;
 		spin_lock(&crtc->dev->event_lock);
 
 		if (drm_crtc_vblank_get(crtc) != 0)
@@ -188,6 +199,19 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	vkms_output->composer_state = to_vkms_crtc_state(crtc->state);
 
 	spin_unlock_irq(&vkms_output->lock);
+
+	/*
+	 * A virtual adaptive-sync CRTC has no panel scanout constraint. Complete
+	 * each queued flip as its vblank and stop the fixed-rate timer, making
+	 * presentation timing follow compositor submissions instead of the mode's
+	 * nominal refresh clock. Restore the normal timer when VRR is disabled.
+	 */
+	if (crtc->state->vrr_enabled)
+		drm_crtc_vblank_cancel_timer(crtc);
+	if (vrr_flip)
+		vkms_crtc_handle_vblank_timeout(crtc);
+	else if (vrr_disabled)
+		drm_crtc_vblank_start_timer(crtc);
 }
 
 static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {

@@ -82,6 +82,10 @@ struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev,
 	drm_connector_helper_add(&connector->base, &vkms_conn_helper_funcs);
 	WRITE_ONCE(connector->status, status);
 	drm_connector_attach_edid_property(&connector->base);
+	ret = drm_connector_attach_vrr_capable_property(&connector->base);
+	if (ret)
+		return ERR_PTR(ret);
+	drm_connector_set_vrr_capable_property(&connector->base, true);
 
 	/* The max-bpc helper initializes standardized atomic connector state. */
 	connector->base.funcs->reset(&connector->base);
