@@ -144,8 +144,22 @@ assert_file_value "$TEST_ROOT/outside/sentinel" keep
 unlink -- "$VKMS_DEVICE_DIR/connectors/Virtual-1"
 mv -- "$TEST_ROOT/Virtual-1.saved" "$VKMS_DEVICE_DIR/connectors/Virtual-1"
 
-remove_pool || fail "pool removal failed"
-[[ ! -e "$VKMS_DEVICE_DIR" ]] || fail "managed instance remains after removal"
+# A global shutdown must leave the DRM object graph alive until KWin and other
+# clients have closed their file descriptors. Manual service stops retain the
+# normal full cleanup behavior used by hot reload and package removal.
+system_is_stopping() {
+  return 0
+}
+stop_pool || fail "shutdown-aware stop failed"
+assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
+[[ -d "$VKMS_DEVICE_DIR/connectors/Virtual-1" ]] || fail "global shutdown removed the live DRM pool"
+
+system_is_stopping() {
+  return 1
+}
+stop_pool || fail "manual stop pool removal failed"
+[[ ! -e "$VKMS_DEVICE_DIR" ]] || fail "manual stop left the managed instance behind"
+
 remove_pool || fail "idempotent pool removal failed"
 
 # Unsupported systems fail without silently creating a CPU-backed stock-VKMS pool.

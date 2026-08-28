@@ -393,6 +393,27 @@ remove_pool() {
   log "removed private display pool from ${DRM_BACKEND}"
 }
 
+system_is_stopping() {
+  local state
+
+  state=$(systemctl is-system-running 2>/dev/null || true)
+  [[ "$state" == stopping ]]
+}
+
+stop_pool() {
+  # The system service and the graphical user session stop concurrently during
+  # a global shutdown. Tearing down configfs here can unplug the DRM device
+  # while KWin still owns it; KWin then closes an already-destroyed modeset
+  # device later in shutdown. Keep the device alive for the remaining fraction
+  # of the reboot instead. Manual stops and hot reloads still remove the pool.
+  if system_is_stopping; then
+    log "system shutdown is in progress; preserving the display pool until kernel restart"
+    return 0
+  fi
+
+  remove_pool
+}
+
 validate_link() {
   local path=$1
   local expected_target=$2
@@ -661,13 +682,14 @@ main() {
       ;;
     stop)
       require_root || return 1
+      require_command systemctl || return 1
       require_command unlink || return 1
       require_command rmdir || return 1
       if ! configfs_is_mounted; then
         log "configfs is not mounted; virtual-display pools are already stopped"
         return 0
       fi
-      remove_pool
+      stop_pool
       ;;
     restart)
       require_root || return 1
