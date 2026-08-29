@@ -20,6 +20,7 @@
 #include <linux/fcntl.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/reboot.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
@@ -687,6 +688,60 @@ static int vkms_modeset_init(struct vkms_device *vkmsdev)
 	return vkms_output_init(vkmsdev);
 }
 
+static void vkms_release_presented_frames(struct vkms_device *vkmsdev)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, &vkmsdev->drm)
+		vkms_crtc_release_presented_frame(
+			drm_crtc_to_vkms_output(crtc));
+}
+
+static void vkms_quiesce(struct vkms_device *vkmsdev)
+{
+	mutex_lock(&vkmsdev->shutdown_lock);
+
+	mutex_lock(&vkmsdev->commit_lock);
+	if (!vkmsdev->accepting_commits) {
+		mutex_unlock(&vkmsdev->commit_lock);
+		mutex_unlock(&vkmsdev->shutdown_lock);
+		return;
+	}
+	vkmsdev->accepting_commits = false;
+	vkmsdev->shutdown_owner = current;
+	mutex_unlock(&vkmsdev->commit_lock);
+
+	/*
+	 * First drain and disable KMS while all producer devices are still alive,
+	 * then drop the extra framebuffer references held for direct capture. The
+	 * latter may own imported NVIDIA DMA-BUFs and must not survive into the
+	 * physical GPU driver's device-shutdown phase.
+	 */
+	drm_atomic_helper_shutdown(&vkmsdev->drm);
+	vkms_release_presented_frames(vkmsdev);
+
+	mutex_lock(&vkmsdev->commit_lock);
+	vkmsdev->shutdown_owner = NULL;
+	mutex_unlock(&vkmsdev->commit_lock);
+
+	mutex_unlock(&vkmsdev->shutdown_lock);
+}
+
+static int vkms_reboot_notifier(struct notifier_block *notifier,
+				unsigned long action, void *data)
+{
+	struct vkms_device *vkmsdev = container_of(notifier,
+						    struct vkms_device,
+						    reboot_notifier);
+
+	(void)action;
+	(void)data;
+	DRM_INFO("quiescing virtual scanout before system shutdown\n");
+	vkms_quiesce(vkmsdev);
+
+	return NOTIFY_DONE;
+}
+
 int vkms_create(struct vkms_config *config)
 {
 	int ret;
@@ -713,8 +768,10 @@ int vkms_create(struct vkms_config *config)
 	vkms_device->faux_dev = fdev;
 	vkms_device->config = config;
 	mutex_init(&vkms_device->commit_lock);
+	mutex_init(&vkms_device->shutdown_lock);
 	vkms_device->accepting_commits = true;
 	vkms_device->shutdown_owner = NULL;
+	vkms_device->reboot_notifier.notifier_call = vkms_reboot_notifier;
 	vkms_config_get(config);
 	ret = drmm_add_action_or_reset(&vkms_device->drm,
 				       vkms_config_put_action, config);
@@ -744,6 +801,13 @@ int vkms_create(struct vkms_config *config)
 	ret = drm_dev_register(&vkms_device->drm, 0);
 	if (ret)
 		goto out_devres;
+
+	ret = devm_register_reboot_notifier(&fdev->dev,
+					    &vkms_device->reboot_notifier);
+	if (ret) {
+		drm_dev_unregister(&vkms_device->drm);
+		goto out_devres;
+	}
 
 	drm_client_setup(&vkms_device->drm, NULL);
 
@@ -798,16 +862,7 @@ void vkms_destroy(struct vkms_config *config)
 	vkmsdev = config->dev;
 	fdev = vkmsdev->faux_dev;
 
-	mutex_lock(&vkmsdev->commit_lock);
-	vkmsdev->accepting_commits = false;
-	vkmsdev->shutdown_owner = current;
-	mutex_unlock(&vkmsdev->commit_lock);
-
-	drm_atomic_helper_shutdown(&vkmsdev->drm);
-
-	mutex_lock(&vkmsdev->commit_lock);
-	vkmsdev->shutdown_owner = NULL;
-	mutex_unlock(&vkmsdev->commit_lock);
+	vkms_quiesce(vkmsdev);
 	drm_dev_unplug(&vkmsdev->drm);
 	config->dev = NULL;
 	devres_release_group(&fdev->dev, NULL);
@@ -832,6 +887,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.4.2");
+MODULE_VERSION("1.4.3");
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

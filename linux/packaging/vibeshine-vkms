@@ -413,7 +413,8 @@ stop_pool() {
   # a global shutdown. Tearing down configfs here can unplug the DRM device
   # while KWin still owns it; KWin then closes an already-destroyed modeset
   # device later in shutdown. Keep the device alive for the remaining fraction
-  # of the reboot instead. Manual stops and hot reloads still remove the pool.
+  # of userspace shutdown instead. The driver's reboot notifier quiesces it
+  # before physical GPU device shutdown. Manual stops still remove the pool.
   if system_is_stopping; then
     log "system shutdown is in progress; preserving the display pool until kernel restart"
     return 0

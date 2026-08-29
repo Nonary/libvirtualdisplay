@@ -151,6 +151,8 @@ def validate_source_contract(driver_root: Path) -> None:
         require_source(plane, needle, plane_path.name)
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
     require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
+    require_source(driver_header, "struct mutex shutdown_lock", driver_header_path.name)
+    require_source(driver_header, "struct notifier_block reboot_notifier", driver_header_path.name)
     for needle in (
         "if (crtc->state->vrr_enabled)",
         "drm_crtc_vblank_cancel_timer(crtc)",
@@ -171,8 +173,22 @@ def validate_source_contract(driver_root: Path) -> None:
         "drm_framebuffer_get(new_present_fb)",
         "capable(CAP_SYS_ADMIN)",
         "static bool enable_cursor;",
+        "devm_register_reboot_notifier",
+        "vkms_reboot_notifier",
+        "vkms_crtc_release_presented_frame",
     ):
         require_source(drv, needle, drv_path.name)
+    require(
+        re.search(
+            r"static void vkms_quiesce\(.*?"
+            r"drm_atomic_helper_shutdown\(&vkmsdev->drm\);.*?"
+            r"vkms_release_presented_frames\(vkmsdev\);",
+            drv,
+            flags=re.DOTALL,
+        )
+        is not None,
+        "reboot quiescing does not release presented frames after atomic shutdown",
+    )
     require(".get_crc_sources" not in crtc, "GPU pass-through CRTC still advertises software CRC")
     require_source(configfs, "if (writeback)", configfs_path.name)
     require_source(configfs, "return -EOPNOTSUPP", configfs_path.name)

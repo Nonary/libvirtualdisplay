@@ -15,7 +15,9 @@ monitor contract:
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
 - versioned, read-only presentation and frame-export ioctls so direct KMS
   capture can follow completed scanout changes and import the exact presented
-  DMA-BUF instead of polling KMS state at a fixed rate; and
+  DMA-BUF instead of polling KMS state at a fixed rate;
+- late reboot quiescing which drains virtual scanout and releases imported
+  renderer-GPU framebuffers before physical GPU device shutdown; and
 - an independent `/sys/kernel/config/vibeshine-drm` configfs namespace, so the
   driver can coexist with a distribution's normal `vkms` module.
 
@@ -41,6 +43,13 @@ same lock as the sequence and timestamp, so a later KMS software-state swap
 cannot be mistaken for the presentation which generated an earlier
 notification. Sequence gaps are deliberately coalesced to the newest completed
 frame rather than growing an unbounded kernel queue.
+
+An explicit configfs teardown disables scanout before unplugging the DRM
+device. During a global shutdown the service instead preserves the device while
+KWin closes its descriptors; a kernel reboot notifier then performs the same
+atomic quiesce after userspace has exited but before physical GPU devices shut
+down. This two-phase ordering prevents both a live-compositor unplug and stale
+imported DMA-BUF references crossing into NVIDIA teardown.
 
 The managed configfs pool provisions exactly one primary plane per CRTC. It
 does not create cursor or overlay planes, forcing KWin to composite the cursor,

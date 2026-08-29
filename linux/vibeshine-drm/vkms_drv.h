@@ -5,6 +5,7 @@
 
 #include <linux/hrtimer.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/wait.h>
 
 #include <drm/drm.h>
@@ -256,14 +257,18 @@ struct vkms_config_plane;
  * @faux_dev - Associated faux device
  * @output - Configuration and sub-components of the VKMS device
  * @config: Configuration used in this VKMS device
+ * @shutdown_lock: Serializes explicit destruction with late reboot quiescing
+ * @reboot_notifier: Quiesces scanout before physical GPU device shutdown
  */
 struct vkms_device {
 	struct drm_device drm;
 	struct faux_device *faux_dev;
 	const struct vkms_config *config;
 	struct mutex commit_lock;
+	struct mutex shutdown_lock;
 	bool accepting_commits;
 	struct task_struct *shutdown_owner;
+	struct notifier_block reboot_notifier;
 };
 
 /*
@@ -312,6 +317,7 @@ void vkms_destroy(struct vkms_config *config);
 struct vkms_output *vkms_crtc_init(struct drm_device *dev,
 				   struct drm_plane *primary,
 				   struct drm_plane *cursor);
+void vkms_crtc_release_presented_frame(struct vkms_output *output);
 
 /**
  * vkms_output_init() - Initialize all sub-components needed for a VKMS device.

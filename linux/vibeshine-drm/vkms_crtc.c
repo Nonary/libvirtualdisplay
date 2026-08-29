@@ -271,9 +271,8 @@ static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
 	.handle_vblank_timeout = vkms_crtc_handle_vblank_timeout,
 };
 
-static void vkms_present_fb_cleanup(struct drm_device *dev, void *data)
+void vkms_crtc_release_presented_frame(struct vkms_output *output)
 {
-	struct vkms_output *output = data;
 	struct drm_framebuffer *fb;
 
 	spin_lock_irq(&output->present_lock);
@@ -282,6 +281,12 @@ static void vkms_present_fb_cleanup(struct drm_device *dev, void *data)
 	spin_unlock_irq(&output->present_lock);
 	if (fb)
 		drm_framebuffer_put(fb);
+}
+
+static void vkms_present_fb_cleanup(struct drm_device *dev, void *data)
+{
+	(void)dev;
+	vkms_crtc_release_presented_frame(data);
 }
 
 struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *primary,
