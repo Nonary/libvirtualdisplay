@@ -28,11 +28,15 @@ vibeshine_drm_present_request_valid(const struct vibeshine_drm_wait_present *req
 static inline enum vibeshine_drm_present_wait_decision_e
 vibeshine_drm_present_decide_wait(const struct vibeshine_drm_wait_present *request,
 				  __u64 current_sequence,
-				  bool presentation_pending,
 				  unsigned int waiter_count)
 {
-	if (!request->timeout_ms ||
-	    (current_sequence != request->sequence && !presentation_pending))
+	/*
+	 * A completed sequence is immediately consumable even when a newer atomic
+	 * commit is pending. The exported framebuffer is pinned at completion, so
+	 * waiting for the entire producer queue to drain only turns closely spaced
+	 * presentations into avoidable frame gaps.
+	 */
+	if (!request->timeout_ms || current_sequence != request->sequence)
 		return VIBESHINE_DRM_PRESENT_RETURN_CURRENT;
 	if (waiter_count >= VIBESHINE_DRM_PRESENT_MAX_WAITERS)
 		return VIBESHINE_DRM_PRESENT_REJECT_BUSY;

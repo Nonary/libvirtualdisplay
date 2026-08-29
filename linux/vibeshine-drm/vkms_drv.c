@@ -110,7 +110,6 @@ static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 	spin_lock_irq(&output->present_lock);
 	switch (vibeshine_drm_present_decide_wait(
 		request, atomic64_read(&output->present_sequence),
-		atomic_read(&output->pending_commits) != 0,
 		output->present_waiters)) {
 	case VIBESHINE_DRM_PRESENT_REJECT_BUSY:
 			spin_unlock_irq(&output->present_lock);
@@ -127,8 +126,7 @@ static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 	if (waiter_registered) {
 		wait_result = wait_event_interruptible_timeout(
 			output->present_waitq,
-			atomic64_read(&output->present_sequence) != requested_sequence &&
-			atomic_read(&output->pending_commits) == 0,
+			atomic64_read(&output->present_sequence) != requested_sequence,
 			msecs_to_jiffies(request->timeout_ms));
 
 		spin_lock_irq(&output->present_lock);
@@ -834,6 +832,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.4.1");
+MODULE_VERSION("1.4.2");
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

@@ -30,12 +30,14 @@
  * @timestamp_ns: out: CLOCK_MONOTONIC timestamp for @sequence
  * @timeout_ms: maximum interruptible wait; zero performs a query
  * @flags: out: VIBESHINE_DRM_PRESENT_* result flags; PENDING means a newer
- *         submitted state has not completed presentation yet
+ *         submitted state has not completed presentation yet; it does not
+ *         invalidate the completed sequence or framebuffer being returned
  * @reserved: must be zero
  *
  * A sequence advances once per completed atomic commit which can change the
- * selected CRTC's scanout. Multiple consumers may wait independently and can
- * coalesce missed sequences by always importing the newest framebuffer.
+ * selected CRTC's scanout. A wait returns as soon as a newer sequence completes,
+ * even if another commit is pending. Multiple consumers may wait independently
+ * and can coalesce missed sequences by always importing the newest framebuffer.
  */
 struct vibeshine_drm_wait_present {
 	__u32 abi_version;
