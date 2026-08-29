@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-BUILD_HELPER_UNDER_TEST=${1:?usage: test-vibeshine-drm-build-module.sh /path/to/build-module}
+BUILD_HELPER_UNDER_TEST=${1:?usage: test-vibeshine-drm-build-module.sh /path/to/build-module /path/to/dkms.conf.in}
+DKMS_CONFIG_UNDER_TEST=${2:?usage: test-vibeshine-drm-build-module.sh /path/to/build-module /path/to/dkms.conf.in}
 TEST_ROOT=$(mktemp -d)
 
 cleanup_test_root() {
@@ -38,15 +39,25 @@ make() {
 configure_build_paths "$TEST_MODULES"
 build_module "$CLANG_KERNEL" "$TEST_SOURCE" || fail "Clang kernel build dispatch failed"
 build_module "$GCC_KERNEL" "$TEST_SOURCE" || fail "GCC kernel build dispatch failed"
+build_module "$GCC_KERNEL" "$TEST_SOURCE" LLVM=1 || fail "forwarded Kbuild arguments failed"
 
 clang_call=$(sed -n '1p' "$MAKE_CALLS")
 gcc_call=$(sed -n '2p' "$MAKE_CALLS")
+forwarded_call=$(sed -n '3p' "$MAKE_CALLS")
 [[ "$clang_call" == *"M=$TEST_SOURCE"* ]] || fail "Clang build omitted the module source path"
 [[ "$clang_call" == *"LLVM=1"* ]] || fail "Clang build omitted LLVM=1"
 [[ "$clang_call" == *"modules" ]] || fail "Clang build omitted the modules target"
 [[ "$gcc_call" == *"M=$TEST_SOURCE"* ]] || fail "GCC build omitted the module source path"
 [[ "$gcc_call" != *"LLVM=1"* ]] || fail "GCC build incorrectly enabled LLVM mode"
 [[ "$gcc_call" == *"modules" ]] || fail "GCC build omitted the modules target"
+[[ "$forwarded_call" == *"M=$TEST_SOURCE"* ]] || fail "forwarded build omitted the module source path"
+[[ "$forwarded_call" == *"LLVM=1"* ]] || fail "forwarded build omitted the DKMS Kbuild argument"
+[[ "$forwarded_call" == *"modules" ]] || fail "forwarded build omitted the modules target"
+
+grep -Fq 'BUILD_EXCLUSIVE_KERNEL_MIN="7.1"' "$DKMS_CONFIG_UNDER_TEST" ||
+  fail "DKMS configuration omitted the supported kernel floor"
+grep -Fq 'build-module ${kernelver} ${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build' \
+  "$DKMS_CONFIG_UNDER_TEST" || fail "DKMS build command omitted the explicit module source path"
 
 if build_module '../unsafe' "$TEST_SOURCE"; then
   fail "unsafe kernel release was accepted"

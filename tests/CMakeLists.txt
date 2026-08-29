@@ -57,7 +57,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME linux_drm_build_module
                 COMMAND "${LIBVIRTUALDISPLAY_BASH_EXECUTABLE}"
                     "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-build-module.sh"
-                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm/build-module")
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm/build-module"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm/dkms.conf.in")
     endif()
 
     find_program(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE NAMES python3)

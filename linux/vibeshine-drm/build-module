@@ -33,8 +33,11 @@ validate_kernel_release() {
 build_module() {
   local kernel_release=$1
   local source_dir=$2
-  local build_dir config_file
-  local -a make_args
+  local build_dir config_file make_arg llvm_mode_set=0
+  local -a make_args forwarded_make_args
+
+  shift 2
+  forwarded_make_args=("$@")
 
   validate_kernel_release "$kernel_release" || return 1
   if [[ ! -d "$source_dir" || -L "$source_dir" || ! -f "$source_dir/Makefile" ]]; then
@@ -54,10 +57,14 @@ build_module() {
   fi
 
   make_args=(-C "$build_dir" "M=$source_dir")
+  for make_arg in "${forwarded_make_args[@]}"; do
+    [[ "$make_arg" == LLVM=* ]] && llvm_mode_set=1
+  done
   if [[ -f "$config_file" ]] && grep -q '^CONFIG_CC_IS_CLANG=y$' "$config_file"; then
     log "kernel ${kernel_release} was built with Clang; enabling LLVM Kbuild mode"
-    make_args+=(LLVM=1)
+    ((llvm_mode_set)) || make_args+=(LLVM=1)
   fi
+  make_args+=("${forwarded_make_args[@]}")
   make_args+=(modules)
   make "${make_args[@]}"
 }
@@ -65,19 +72,23 @@ build_module() {
 main() {
   local kernel_release=${1:-}
   local source_dir script_dir
+  local -a forwarded_make_args
 
-  if [[ $# -gt 2 ]]; then
-    printf 'Usage: %s [kernel-release] [source-directory]\n' "$PROGRAM_NAME" >&2
-    return 2
-  fi
   if [[ -z "$kernel_release" ]]; then
     kernel_release=$(uname -r) || return 1
+  else
+    shift
   fi
   script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || return 1
-  source_dir=${2:-$script_dir}
+  source_dir=$script_dir
+  if [[ $# -gt 0 && "$1" != *=* && "$1" != -* ]]; then
+    source_dir=$1
+    shift
+  fi
+  forwarded_make_args=("$@")
 
   configure_build_paths /lib/modules
-  build_module "$kernel_release" "$source_dir"
+  build_module "$kernel_release" "$source_dir" "${forwarded_make_args[@]}"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
