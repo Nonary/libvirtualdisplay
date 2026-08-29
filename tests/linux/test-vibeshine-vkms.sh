@@ -6,6 +6,7 @@ SCRIPT_UNDER_TEST=${1:?usage: test-vibeshine-vkms.sh /path/to/vibeshine-vkms}
 PACKAGING_DIR=$(dirname -- "$SCRIPT_UNDER_TEST")
 SOCKET_UNIT="$PACKAGING_DIR/vibeshine-vkms-control.socket.in"
 CONNECTION_SERVICE="$PACKAGING_DIR/vibeshine-vkms-control@.service.in"
+SYSUSERS_FILE="$PACKAGING_DIR/vibeshine-vkms.sysusers"
 TEST_ROOT=$(mktemp -d)
 
 cleanup_test_root() {
@@ -23,9 +24,19 @@ fail() {
 
 [[ -f "$SOCKET_UNIT" ]] || fail "missing socket unit: ${SOCKET_UNIT}"
 [[ -f "$CONNECTION_SERVICE" ]] || fail "missing connection service: ${CONNECTION_SERVICE}"
+[[ -f "$SYSUSERS_FILE" ]] || fail "missing sysusers file: ${SYSUSERS_FILE}"
+grep -Fxq 'g vibeshine-vkms - -' "$SYSUSERS_FILE" || fail 'sysusers file must provision the dedicated socket group'
 grep -Fxq 'Accept=yes' "$SOCKET_UNIT" || fail 'control socket must use one service instance per connection'
+grep -Fxq 'SocketGroup=vibeshine-vkms' "$SOCKET_UNIT" || fail 'control socket must use its dedicated access group'
+if grep -Fxq 'SocketGroup=video' "$SOCKET_UNIT"; then
+  fail 'control socket must not grant every video-group member mutation access'
+fi
 if grep -Eq '^Service=' "$SOCKET_UNIT"; then
   fail 'Accept=yes control socket must derive its matching @.service template'
+fi
+grep -Fq '/vibeshine-vkms-peercred ' "$CONNECTION_SERVICE" || fail 'control service must obtain peer credentials before invoking the broker'
+if grep -Fxq 'ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms control' "$CONNECTION_SERVICE"; then
+  fail 'control service must not invoke the root broker without peer credentials'
 fi
 
 assert_file_value() {
@@ -51,6 +62,7 @@ assert_link_target() {
 CONFIGFS_TEST_ROOT="$TEST_ROOT/configfs"
 mkdir -p -- "$CONFIGFS_TEST_ROOT/vibeshine-drm"
 configure_paths "$CONFIGFS_TEST_ROOT"
+configure_lease_paths "$TEST_ROOT/vkms-leases"
 # The sourced helper functions consume this test-only switch.
 # shellcheck disable=SC2034
 FAKE_CONFIGFS=1
@@ -78,11 +90,27 @@ done
 configfs_is_mounted() {
   return 0
 }
-response=$(printf 'connect Virtual-2\n' | control_connection) || fail "connect request failed"
+OWNER_UID=11001
+OTHER_UID=11002
+LEASE_PATH="$LEASE_ROOT/Virtual-2.owner"
+response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID") || fail "connect request failed"
 [[ "$response" == "OK connected Virtual-2" ]] || fail "unexpected connect response: ${response}"
 assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_CONNECTED"
-response=$(printf 'status Virtual-2\n' | control_connection) || fail "status request failed"
+assert_file_value "$LEASE_PATH" "$OWNER_UID"
+response=$(printf 'status Virtual-2\n' | control_connection "$OTHER_UID") || fail "status request failed"
 [[ "$response" == "STATUS connected Virtual-2" ]] || fail "unexpected status response: ${response}"
+assert_file_value "$LEASE_PATH" "$OWNER_UID"
+
+if response=$(printf 'connect Virtual-2\n' | control_connection "$OTHER_UID"); then
+  fail "cross-uid connect request succeeded"
+fi
+[[ "$response" == "ERROR connector owned by another uid" ]] || fail "unexpected cross-uid connect response: ${response}"
+if response=$(printf 'disconnect Virtual-2\n' | control_connection "$OTHER_UID"); then
+  fail "cross-uid disconnect request succeeded"
+fi
+[[ "$response" == "ERROR connector owned by another uid" ]] || fail "unexpected cross-uid disconnect response: ${response}"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_CONNECTED"
+assert_file_value "$LEASE_PATH" "$OWNER_UID"
 validate_topology || fail "live connected topology was rejected"
 
 # A second start must retain the exact four-pipeline object graph and must not
@@ -98,14 +126,39 @@ for group in planes crtcs encoders connectors; do
   [[ $count -eq $VKMS_OUTPUT_COUNT ]] || fail "${group}: expected 4 items after restart, found ${count}"
 done
 
-response=$(printf 'disconnect Virtual-2\n' | control_connection) || fail "disconnect request failed"
-[[ "$response" == "OK disconnected Virtual-2" ]] || fail "unexpected disconnect response: ${response}"
+response=$(printf 'disconnect Virtual-2\n' | control_connection 0) || fail "root handoff disconnect failed"
+[[ "$response" == "OK disconnected Virtual-2" ]] || fail "unexpected root handoff response: ${response}"
 assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_DISCONNECTED"
-response=$(printf 'status Virtual-2\n' | control_connection) || fail "disconnected status request failed"
+[[ ! -e "$LEASE_PATH" ]] || fail "root handoff left the prior ownership lease behind"
+
+response=$(printf 'connect Virtual-2\n' | control_connection "$OTHER_UID") || fail "new owner connect failed"
+assert_file_value "$LEASE_PATH" "$OTHER_UID"
+response=$(printf 'disconnect Virtual-2\n' | control_connection "$OTHER_UID") || fail "owner release failed"
+[[ "$response" == "OK disconnected Virtual-2" ]] || fail "unexpected owner release response: ${response}"
+[[ ! -e "$LEASE_PATH" ]] || fail "owner release left its lease behind"
+
+# Model an interrupted disconnect: configfs reached disconnected, but the
+# owner file was not removed. The next connect may safely reclaim it because a
+# disconnected output cannot still be controlled by the old session.
+response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID") || fail "stale lease setup failed"
+printf '%s\n' "$CONNECTOR_STATUS_DISCONNECTED" >"$VKMS_DEVICE_DIR/connectors/Virtual-2/status"
+assert_file_value "$LEASE_PATH" "$OWNER_UID"
+response=$(printf 'connect Virtual-2\n' | control_connection "$OTHER_UID") || fail "stale lease reclamation failed"
+[[ "$response" == "OK connected Virtual-2" ]] || fail "unexpected stale lease response: ${response}"
+assert_file_value "$LEASE_PATH" "$OTHER_UID"
+response=$(printf 'disconnect Virtual-2\n' | control_connection "$OTHER_UID") || fail "stale lease test cleanup failed"
+[[ ! -e "$LEASE_PATH" ]] || fail "stale lease test cleanup left an owner file"
+
+response=$(printf 'status Virtual-2\n' | control_connection "$OWNER_UID") || fail "disconnected status request failed"
 [[ "$response" == "STATUS disconnected Virtual-2" ]] || fail "unexpected disconnected status: ${response}"
 
+if response=$(printf 'status Virtual-2\n' | control_connection); then
+  fail "request without trusted peer credentials succeeded"
+fi
+[[ "$response" == "ERROR peer credentials unavailable" ]] || fail "unexpected missing-peer response: ${response}"
+
 for invalid_request in 'connect Virtual-0' 'connect Virtual-5' 'connect Virtual-1 extra' 'CONNECT Virtual-1'; do
-  if response=$(printf '%s\n' "$invalid_request" | control_connection); then
+  if response=$(printf '%s\n' "$invalid_request" | control_connection "$OWNER_UID"); then
     fail "invalid control request succeeded: ${invalid_request}"
   fi
   [[ "$response" == "ERROR malformed request" ]] || fail "unexpected protocol error: ${response}"
@@ -115,7 +168,7 @@ done
 mv -- "$VKMS_DEVICE_DIR/connectors/Virtual-3/status" "$TEST_ROOT/Virtual-3.status"
 printf 'outside' >"$TEST_ROOT/outside-status"
 ln -s -- "$TEST_ROOT/outside-status" "$VKMS_DEVICE_DIR/connectors/Virtual-3/status"
-if response=$(printf 'connect Virtual-3\n' | control_connection); then
+if response=$(printf 'connect Virtual-3\n' | control_connection "$OWNER_UID"); then
   fail "control followed a symbolic-link status attribute"
 fi
 [[ "$response" == "ERROR unsafe connector path" ]] || fail "unexpected unsafe-path response: ${response}"
@@ -147,18 +200,22 @@ mv -- "$TEST_ROOT/Virtual-1.saved" "$VKMS_DEVICE_DIR/connectors/Virtual-1"
 # A global shutdown must leave the DRM object graph alive until KWin and other
 # clients have closed their file descriptors. Manual service stops retain the
 # normal full cleanup behavior used by hot reload and package removal.
+response=$(printf 'connect Virtual-4\n' | control_connection "$OWNER_UID") || fail "pool cleanup lease setup failed"
+assert_file_value "$LEASE_ROOT/Virtual-4.owner" "$OWNER_UID"
 system_is_stopping() {
   return 0
 }
 stop_pool || fail "shutdown-aware stop failed"
 assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
 [[ -d "$VKMS_DEVICE_DIR/connectors/Virtual-1" ]] || fail "global shutdown removed the live DRM pool"
+assert_file_value "$LEASE_ROOT/Virtual-4.owner" "$OWNER_UID"
 
 system_is_stopping() {
   return 1
 }
 stop_pool || fail "manual stop pool removal failed"
 [[ ! -e "$VKMS_DEVICE_DIR" ]] || fail "manual stop left the managed instance behind"
+[[ ! -e "$LEASE_ROOT/Virtual-4.owner" ]] || fail "manual stop left a connector ownership lease behind"
 
 remove_pool || fail "idempotent pool removal failed"
 

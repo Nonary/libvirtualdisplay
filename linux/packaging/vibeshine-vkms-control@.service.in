@@ -6,10 +6,11 @@ After=vibeshine-vkms.service
 [Service]
 Type=exec
 User=root
-ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms control
+ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms-peercred @VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms control
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
+UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes

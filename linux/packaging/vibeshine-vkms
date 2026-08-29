@@ -18,6 +18,7 @@ CONNECTOR_STATUS_DISCONNECTED=2
 CONFIGFS_MOUNTPOINT=""
 VKMS_CONFIGFS_ROOT=""
 VKMS_DEVICE_DIR=""
+LEASE_ROOT=""
 FAKE_CONFIGFS=0
 
 log() {
@@ -34,6 +35,10 @@ configure_paths() {
   CONFIGFS_MOUNTPOINT=$configfs_mountpoint
   VKMS_CONFIGFS_ROOT="${CONFIGFS_MOUNTPOINT}/${DRM_BACKEND}"
   VKMS_DEVICE_DIR="${VKMS_CONFIGFS_ROOT}/${VKMS_DEVICE_NAME}"
+}
+
+configure_lease_paths() {
+  LEASE_ROOT=$1
 }
 
 require_root() {
@@ -351,6 +356,7 @@ remove_pool() {
   local index rc=0
 
   if [[ ! -d "$VKMS_DEVICE_DIR" ]]; then
+    clear_connector_leases || return 1
     log "${DRM_BACKEND} display pool is already stopped"
     return 0
   fi
@@ -389,6 +395,8 @@ remove_pool() {
     error "could not remove VKMS instance: ${VKMS_DEVICE_DIR}"
     return 1
   fi
+
+  clear_connector_leases || return 1
 
   log "removed private display pool from ${DRM_BACKEND}"
 }
@@ -531,6 +539,7 @@ create_pool() {
     remove_pool || return 1
   fi
 
+  clear_connector_leases || return 1
   if ! build_new_pool; then
     error "failed to create the private VKMS display pool; rolling back"
     remove_pool || error "rollback was incomplete; inspect ${VKMS_DEVICE_DIR}"
@@ -553,9 +562,214 @@ select_control_backend() {
   return 1
 }
 
+ensure_lease_root() {
+  local owner_uid
+
+  if [[ -L "$LEASE_ROOT" ]]; then
+    error "refusing symbolic-link connector lease directory: ${LEASE_ROOT}"
+    return 1
+  fi
+  if [[ ! -e "$LEASE_ROOT" ]]; then
+    if ! mkdir -m 0700 -- "$LEASE_ROOT" && [[ ! -d "$LEASE_ROOT" || -L "$LEASE_ROOT" ]]; then
+      error "could not create connector lease directory: ${LEASE_ROOT}"
+      return 1
+    fi
+  fi
+  if [[ ! -d "$LEASE_ROOT" || -L "$LEASE_ROOT" ]]; then
+    error "connector lease path is not a safe directory: ${LEASE_ROOT}"
+    return 1
+  fi
+  if ((FAKE_CONFIGFS == 0)); then
+    owner_uid=$(stat -c %u -- "$LEASE_ROOT") || return 1
+    if [[ "$owner_uid" != 0 ]]; then
+      error "connector lease directory is not owned by root: ${LEASE_ROOT}"
+      return 1
+    fi
+  fi
+  if ! chmod 0700 -- "$LEASE_ROOT"; then
+    error "could not secure connector lease directory: ${LEASE_ROOT}"
+    return 1
+  fi
+}
+
+read_connector_lease() {
+  local connector_name=$1
+  local output_variable=$2
+  local lease_path="$LEASE_ROOT/${connector_name}.owner"
+  local stored_uid=""
+
+  printf -v "$output_variable" '%s' ""
+  [[ -e "$lease_path" || -L "$lease_path" ]] || return 0
+  if [[ ! -f "$lease_path" || -L "$lease_path" ]]; then
+    error "connector lease is not a safe regular file: ${lease_path}"
+    return 1
+  fi
+  stored_uid=$(<"$lease_path")
+  if [[ ! "$stored_uid" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    error "connector lease contains an invalid uid: ${lease_path}"
+    return 1
+  fi
+  printf -v "$output_variable" '%s' "$stored_uid"
+}
+
+write_connector_lease() {
+  local connector_name=$1
+  local owner_uid=$2
+  local lease_path="$LEASE_ROOT/${connector_name}.owner"
+  local temporary_path="$LEASE_ROOT/.${connector_name}.owner.${BASHPID}"
+
+  if [[ -L "$lease_path" || (-e "$lease_path" && ! -f "$lease_path") ]]; then
+    error "refusing unsafe connector lease path: ${lease_path}"
+    return 1
+  fi
+  if ! printf '%s\n' "$owner_uid" >"$temporary_path" ||
+     ! chmod 0600 -- "$temporary_path" ||
+     ! mv -fT -- "$temporary_path" "$lease_path"; then
+    rm -f -- "$temporary_path"
+    error "could not persist connector lease: ${lease_path}"
+    return 1
+  fi
+}
+
+release_connector_lease() {
+  local connector_name=$1
+  local lease_path="$LEASE_ROOT/${connector_name}.owner"
+
+  [[ -e "$lease_path" || -L "$lease_path" ]] || return 0
+  if [[ ! -f "$lease_path" || -L "$lease_path" ]]; then
+    error "refusing unsafe connector lease path: ${lease_path}"
+    return 1
+  fi
+  if ! rm -f -- "$lease_path"; then
+    error "could not release connector lease: ${lease_path}"
+    return 1
+  fi
+}
+
+clear_connector_leases() {
+  local index connector_name
+
+  [[ -n "$LEASE_ROOT" && (-e "$LEASE_ROOT" || -L "$LEASE_ROOT") ]] || return 0
+  if [[ ! -d "$LEASE_ROOT" || -L "$LEASE_ROOT" ]]; then
+    error "refusing unsafe connector lease directory: ${LEASE_ROOT}"
+    return 1
+  fi
+  for ((index = 1; index <= VKMS_OUTPUT_COUNT; ++index)); do
+    connector_name="Virtual-${index}"
+    release_connector_lease "$connector_name" || return 1
+  done
+}
+
+mutate_connector() (
+  local action=$1
+  local connector_name=$2
+  local caller_uid=$3
+  local status_path=$4
+  local lock_path owner_uid="" current_status lock_fd
+
+  umask 077
+  if ! ensure_lease_root; then
+    printf 'ERROR connector lease unavailable\n'
+    return 1
+  fi
+
+  lock_path="$LEASE_ROOT/${connector_name}.lock"
+  if [[ -L "$lock_path" || (-e "$lock_path" && ! -f "$lock_path") ]]; then
+    error "refusing unsafe connector lock path: ${lock_path}"
+    printf 'ERROR connector lease unavailable\n'
+    return 1
+  fi
+  if ! exec {lock_fd}>>"$lock_path" || ! flock -x "$lock_fd"; then
+    error "could not lock connector lease: ${lock_path}"
+    printf 'ERROR connector lease unavailable\n'
+    return 1
+  fi
+
+  current_status=$(<"$status_path")
+  case "$current_status" in
+    "$CONNECTOR_STATUS_CONNECTED" | "$CONNECTOR_STATUS_DISCONNECTED")
+      ;;
+    *)
+      printf 'ERROR invalid connector state\n'
+      return 1
+      ;;
+  esac
+
+  if ! read_connector_lease "$connector_name" owner_uid; then
+    if [[ "$caller_uid" != 0 ]] || ! release_connector_lease "$connector_name"; then
+      printf 'ERROR connector lease unavailable\n'
+      return 1
+    fi
+    owner_uid=""
+  fi
+
+  case "$action" in
+    connect)
+      if [[ "$current_status" == "$CONNECTOR_STATUS_CONNECTED" ]]; then
+        if [[ -z "$owner_uid" ]]; then
+          if [[ "$caller_uid" != 0 ]] || ! write_connector_lease "$connector_name" 0; then
+            printf 'ERROR connector ownership unavailable\n'
+            return 1
+          fi
+        elif [[ "$caller_uid" != 0 && "$caller_uid" != "$owner_uid" ]]; then
+          printf 'ERROR connector owned by another uid\n'
+          return 1
+        fi
+        printf 'OK connected %s\n' "$connector_name"
+        return 0
+      fi
+
+      # A disconnected connector cannot still be in use. Discard bookkeeping
+      # left behind by an interrupted disconnect before assigning a new owner.
+      release_connector_lease "$connector_name" || {
+        printf 'ERROR connector lease unavailable\n'
+        return 1
+      }
+      if ! write_connector_lease "$connector_name" "$caller_uid"; then
+        printf 'ERROR connector lease unavailable\n'
+        return 1
+      fi
+      if ! printf '%s\n' "$CONNECTOR_STATUS_CONNECTED" >"$status_path" ||
+         [[ $(<"$status_path") != "$CONNECTOR_STATUS_CONNECTED" ]]; then
+        release_connector_lease "$connector_name" || true
+        printf 'ERROR connector update failed\n'
+        return 1
+      fi
+      printf 'OK connected %s\n' "$connector_name"
+      ;;
+    disconnect)
+      if [[ -n "$owner_uid" && "$caller_uid" != 0 && "$caller_uid" != "$owner_uid" ]]; then
+        printf 'ERROR connector owned by another uid\n'
+        return 1
+      fi
+      if [[ -z "$owner_uid" && "$current_status" == "$CONNECTOR_STATUS_CONNECTED" &&
+            "$caller_uid" != 0 ]]; then
+        printf 'ERROR connector ownership unavailable\n'
+        return 1
+      fi
+      if [[ "$current_status" == "$CONNECTOR_STATUS_CONNECTED" ]] &&
+         { ! printf '%s\n' "$CONNECTOR_STATUS_DISCONNECTED" >"$status_path" ||
+           [[ $(<"$status_path") != "$CONNECTOR_STATUS_DISCONNECTED" ]]; }; then
+        printf 'ERROR connector update failed\n'
+        return 1
+      fi
+      if ! release_connector_lease "$connector_name"; then
+        printf 'ERROR connector lease cleanup failed\n'
+        return 1
+      fi
+      printf 'OK disconnected %s\n' "$connector_name"
+      ;;
+    *)
+      printf 'ERROR invalid action\n'
+      return 1
+      ;;
+  esac
+)
+
 control_connector() {
   local action=$1
   local connector_name=$2
+  local caller_uid=$3
   local connector_dir status_path status_value state
 
   case "$connector_name" in
@@ -588,12 +802,12 @@ control_connector() {
 
   case "$action" in
     connect)
-      status_value=$CONNECTOR_STATUS_CONNECTED
-      state=connected
+      mutate_connector connect "$connector_name" "$caller_uid" "$status_path"
+      return
       ;;
     disconnect)
-      status_value=$CONNECTOR_STATUS_DISCONNECTED
-      state=disconnected
+      mutate_connector disconnect "$connector_name" "$caller_uid" "$status_path"
+      return
       ;;
     status)
       status_value=$(<"$status_path")
@@ -614,16 +828,16 @@ control_connector() {
       ;;
   esac
 
-  if ! printf '%s\n' "$status_value" >"$status_path" ||
-     [[ $(<"$status_path") != "$status_value" ]]; then
-    printf 'ERROR connector update failed\n'
-    return 1
-  fi
-  printf 'OK %s %s\n' "$state" "$connector_name"
 }
 
 control_connection() {
+  local caller_uid=${1:-}
   local request
+
+  if [[ ! "$caller_uid" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    printf 'ERROR peer credentials unavailable\n'
+    return 1
+  fi
 
   if ! IFS= read -r request; then
     printf 'ERROR malformed request\n'
@@ -634,7 +848,7 @@ control_connection() {
     "connect Virtual-1" | "connect Virtual-2" | "connect Virtual-3" | "connect Virtual-4" | \
     "disconnect Virtual-1" | "disconnect Virtual-2" | "disconnect Virtual-3" | "disconnect Virtual-4" | \
     "status Virtual-1" | "status Virtual-2" | "status Virtual-3" | "status Virtual-4")
-      control_connector "${request%% *}" "${request#* }"
+      control_connector "${request%% *}" "${request#* }" "$caller_uid"
       ;;
     *)
       printf 'ERROR malformed request\n'
@@ -663,6 +877,7 @@ main() {
   # Do not accept an environment override for this privileged path. Cleanup is
   # deliberately restricted to one exact configfs instance.
   configure_paths /sys/kernel/config
+  configure_lease_paths /run/vibeshine/vkms-leases
   FAKE_CONFIGFS=0
 
   require_command awk || return 1
@@ -674,6 +889,7 @@ main() {
       require_command mkdir || return 1
       require_command ln || return 1
       require_command readlink || return 1
+      require_command rm || return 1
       require_command unlink || return 1
       require_command rmdir || return 1
       ensure_configfs || return 1
@@ -685,7 +901,9 @@ main() {
       require_command systemctl || return 1
       require_command unlink || return 1
       require_command rmdir || return 1
+      require_command rm || return 1
       if ! configfs_is_mounted; then
+        clear_connector_leases || return 1
         log "configfs is not mounted; virtual-display pools are already stopped"
         return 0
       fi
@@ -698,6 +916,7 @@ main() {
       require_command mkdir || return 1
       require_command ln || return 1
       require_command readlink || return 1
+      require_command rm || return 1
       require_command unlink || return 1
       require_command rmdir || return 1
       if configfs_is_mounted; then
@@ -717,7 +936,13 @@ main() {
     control)
       require_root || return 1
       require_command awk || return 1
-      control_connection
+      require_command chmod || return 1
+      require_command flock || return 1
+      require_command mkdir || return 1
+      require_command mv || return 1
+      require_command rm || return 1
+      require_command stat || return 1
+      control_connection "${2:-}"
       ;;
     *)
       usage

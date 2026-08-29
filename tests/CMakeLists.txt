@@ -63,6 +63,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     find_program(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE NAMES python3)
     if(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE)
+        add_test(NAME linux_vkms_peercred
+                COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-vkms-peercred.py"
+                    "$<TARGET_FILE:vibeshine_vkms_peercred>")
         add_test(NAME linux_drm_contract
                 COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
                     "${PROJECT_SOURCE_DIR}/tests/linux/test-vibeshine-drm-contract.py"

@@ -14,6 +14,14 @@ if(WIN32)
     target_link_libraries(${MODULE} PRIVATE setupapi)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(vibeshine_vkms_peercred
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vkms_peercred.cpp")
+    set_target_properties(vibeshine_vkms_peercred PROPERTIES
+            OUTPUT_NAME vibeshine-vkms-peercred)
+    target_compile_features(vibeshine_vkms_peercred PRIVATE cxx_std_20)
+endif()
+
 option(BUILD_VIBESHINE_KWIN_GPU_BRIDGE
         "Build and install the KWin GPU-association bridge for Vibeshine DRM" OFF)
 
