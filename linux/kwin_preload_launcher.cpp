@@ -19,7 +19,7 @@ namespace {
   constexpr char kInterposerMarker[] = "vibeshine_kwin_gpu_interposer_abi";
   constexpr char kPreloadActiveEnvironment[] = "VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE";
   constexpr char kParentPreloadEnvironment[] = "VIBESHINE_KWIN_PARENT_LD_PRELOAD";
-  constexpr unsigned int kInterposerAbi = 2;
+  constexpr unsigned int kInterposerAbi = 3;
   constexpr off_t kMaximumKwinSize = 256 * 1024 * 1024;
 
   using interposer_abi_fn = unsigned int (*)();

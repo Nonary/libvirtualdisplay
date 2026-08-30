@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -39,16 +40,29 @@ def main() -> int:
 
     require_all(interposer, (
         'extern "C" int drmGetDevices2',
+        'extern "C" int drmGetDevice2',
+        'extern "C" int drmGetDeviceFromDevId',
         "DRM_BUS_FAUX",
         'std::strcmp(device->businfo.faux->name, "vibeshine")',
         "deviceinfo.pci->vendor_id == 0x10de",
         "matches > 1",
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
-        "return 2",
+        "return 3",
         "stop_preload_inheritance",
         'unsetenv("LD_PRELOAD")',
     ), interposer_path.name)
+    for function_name in ("drmGetDevice2", "drmGetDeviceFromDevId"):
+        require(
+            re.search(
+                rf'extern "C" int {function_name}\(.*?'
+                r"attach_vibeshine_display_to_nvidia\(\*device\);",
+                interposer,
+                flags=re.DOTALL,
+            )
+            is not None,
+            f"{function_name} does not normalize the per-device Vibeshine identity",
+        )
     require("drmIoctl" not in interposer, "physical-connector DRM ioctl suppression returned")
     require("HEADLESS_HDR" not in interposer, "physical headless-HDR policy returned")
 
@@ -57,7 +71,7 @@ def main() -> int:
         "VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE",
         "VIBESHINE_KWIN_PARENT_LD_PRELOAD",
         'setenv("LD_PRELOAD"',
-        "kInterposerAbi = 2",
+        "kInterposerAbi = 3",
     ), launcher_path.name)
     require("Environment=LD_PRELOAD" not in dropin, "systemd drop-in leaks preload to KWin children")
     require("VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR" in dropin,
