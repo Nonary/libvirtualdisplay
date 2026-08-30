@@ -7,6 +7,8 @@ PACKAGING_DIR=$(dirname -- "$SCRIPT_UNDER_TEST")
 SOCKET_UNIT="$PACKAGING_DIR/vibeshine-vkms-control.socket.in"
 CONNECTION_SERVICE="$PACKAGING_DIR/vibeshine-vkms-control@.service.in"
 SYSUSERS_FILE="$PACKAGING_DIR/vibeshine-vkms.sysusers"
+QUIESCE_HELPER="$PACKAGING_DIR/vibeshine-vkms-quiesce"
+SERVICE_UNIT="$PACKAGING_DIR/vibeshine-vkms.service.in"
 TEST_ROOT=$(mktemp -d)
 
 cleanup_test_root() {
@@ -25,6 +27,10 @@ fail() {
 [[ -f "$SOCKET_UNIT" ]] || fail "missing socket unit: ${SOCKET_UNIT}"
 [[ -f "$CONNECTION_SERVICE" ]] || fail "missing connection service: ${CONNECTION_SERVICE}"
 [[ -f "$SYSUSERS_FILE" ]] || fail "missing sysusers file: ${SYSUSERS_FILE}"
+[[ -x "$QUIESCE_HELPER" ]] || fail "missing quiesce helper: ${QUIESCE_HELPER}"
+grep -Fq '/vibeshine-vkms-quiesce' "$SERVICE_UNIT" || fail 'pool service must quiesce the driver after its shutdown-aware stop'
+grep -Fq 'Before=systemd-user-sessions.service display-manager.service' "$SERVICE_UNIT" || \
+  fail 'pool service must remain active until all graphical user sessions have stopped'
 grep -Fxq 'g vibeshine-vkms - -' "$SYSUSERS_FILE" || fail 'sysusers file must provision the dedicated socket group'
 grep -Fxq 'Accept=yes' "$SOCKET_UNIT" || fail 'control socket must use one service instance per connection'
 grep -Fxq 'SocketGroup=vibeshine-vkms' "$SOCKET_UNIT" || fail 'control socket must use its dedicated access group'
@@ -209,6 +215,16 @@ stop_pool || fail "shutdown-aware stop failed"
 assert_file_value "$VKMS_DEVICE_DIR/enabled" 1
 [[ -d "$VKMS_DEVICE_DIR/connectors/Virtual-1" ]] || fail "global shutdown removed the live DRM pool"
 assert_file_value "$LEASE_ROOT/Virtual-4.owner" "$OWNER_UID"
+
+QUIESCE_TEST_PATH="$TEST_ROOT/sysfs/vibeshine/quiesce"
+mkdir -p -- "$(dirname -- "$QUIESCE_TEST_PATH")"
+printf '0\n' >"$QUIESCE_TEST_PATH"
+VIBESHINE_SYSTEM_STATE=running VIBESHINE_VKMS_QUIESCE_PATH="$QUIESCE_TEST_PATH" \
+  "$QUIESCE_HELPER" || fail "non-shutdown quiesce helper failed"
+assert_file_value "$QUIESCE_TEST_PATH" 0
+VIBESHINE_SYSTEM_STATE=stopping VIBESHINE_VKMS_QUIESCE_PATH="$QUIESCE_TEST_PATH" \
+  "$QUIESCE_HELPER" || fail "shutdown quiesce helper failed"
+assert_file_value "$QUIESCE_TEST_PATH" 1
 
 system_is_stopping() {
   return 1

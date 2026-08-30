@@ -552,9 +552,9 @@ static void vkms_mark_presentation_content_updates(struct drm_atomic_commit *sta
 	int i;
 
 	/*
-	 * drm_atomic_helper_wait_for_fences() consumes new_plane_state->fence
-	 * before commit_tail runs. Preserve its presence in the per-commit plane
-	 * state so same-framebuffer explicit-fence updates still emit an event.
+	 * Record explicit fences before prepare_fb. The GEM helper can attach an
+	 * implicit fence later; vkms_prepare_fb() preserves that independently.
+	 * Both are consumed before commit_tail decides whether scanout changed.
 	 */
 	for_each_new_plane_in_state(state, plane, new_plane_state, i)
 		to_vkms_plane_state(new_plane_state)->presentation_content_update =
@@ -727,6 +727,81 @@ static void vkms_quiesce(struct vkms_device *vkmsdev)
 	mutex_unlock(&vkmsdev->shutdown_lock);
 }
 
+/*
+ * Quiescing only stops scanout; it leaves the device registered and leaves the
+ * imported producer DMA-BUFs attached. Those imports may be owned by the
+ * physical GPU driver, so they have to be gone before device_shutdown() walks
+ * it -- otherwise the restart wedges with the buffers still attached.
+ *
+ * Unplugging cannot happen from the userspace stop path, because the pool is
+ * torn down concurrently with the graphical session and a compositor may still
+ * own the modeset device. The reboot notifier has no such problem: it runs from
+ * kernel_restart_prepare(), after every userspace process is gone and before
+ * device_shutdown(), which makes it the one safe point to do the real release.
+ */
+static void vkms_shutdown_release(struct vkms_device *vkmsdev)
+{
+	vkms_quiesce(vkmsdev);
+
+	mutex_lock(&vkmsdev->shutdown_lock);
+	if (vkmsdev->unplugged) {
+		mutex_unlock(&vkmsdev->shutdown_lock);
+		return;
+	}
+	vkmsdev->unplugged = true;
+
+	/*
+	 * Drop the direct-capture framebuffer references again. A commit cannot
+	 * republish one behind us -- vkms_quiesce() has already cleared
+	 * accepting_commits -- but this keeps the release self-contained rather
+	 * than relying on the earlier quiesce having been the one that ran.
+	 */
+	vkms_release_presented_frames(vkmsdev);
+
+	/*
+	 * drm_dev_unplug() sleeps in synchronize_srcu(). That is safe here: the
+	 * reboot notifier chain is a blocking chain called from process context,
+	 * and no drm_dev_enter() reader can still be in flight once userspace is
+	 * gone. Unregistering also tears down the internal client, releasing the
+	 * framebuffers it holds.
+	 */
+	drm_dev_unplug(&vkmsdev->drm);
+	mutex_unlock(&vkmsdev->shutdown_lock);
+}
+
+static ssize_t quiesce_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct vkms_device *vkmsdev = dev_get_drvdata(dev);
+	bool requested;
+	int ret;
+
+	(void)attr;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	ret = kstrtobool(buf, &requested);
+	if (ret)
+		return ret;
+	if (!requested || !vkmsdev)
+		return -EINVAL;
+
+	DRM_INFO("quiescing virtual scanout at userspace request\n");
+	vkms_quiesce(vkmsdev);
+	return count;
+}
+
+static DEVICE_ATTR_WO(quiesce);
+
+static struct attribute *vkms_device_attrs[] = {
+	&dev_attr_quiesce.attr,
+	NULL,
+};
+
+static const struct attribute_group vkms_device_attr_group = {
+	.attrs = vkms_device_attrs,
+};
+
 static int vkms_reboot_notifier(struct notifier_block *notifier,
 				unsigned long action, void *data)
 {
@@ -736,8 +811,8 @@ static int vkms_reboot_notifier(struct notifier_block *notifier,
 
 	(void)action;
 	(void)data;
-	DRM_INFO("quiescing virtual scanout before system shutdown\n");
-	vkms_quiesce(vkmsdev);
+	DRM_INFO("releasing virtual scanout before system shutdown\n");
+	vkms_shutdown_release(vkmsdev);
 
 	return NOTIFY_DONE;
 }
@@ -770,8 +845,10 @@ int vkms_create(struct vkms_config *config)
 	mutex_init(&vkms_device->commit_lock);
 	mutex_init(&vkms_device->shutdown_lock);
 	vkms_device->accepting_commits = true;
+	vkms_device->unplugged = false;
 	vkms_device->shutdown_owner = NULL;
 	vkms_device->reboot_notifier.notifier_call = vkms_reboot_notifier;
+	dev_set_drvdata(&fdev->dev, vkms_device);
 	vkms_config_get(config);
 	ret = drmm_add_action_or_reset(&vkms_device->drm,
 				       vkms_config_put_action, config);
@@ -795,6 +872,10 @@ int vkms_create(struct vkms_config *config)
 	}
 
 	ret = vkms_modeset_init(vkms_device);
+	if (ret)
+		goto out_devres;
+
+	ret = devm_device_add_group(&fdev->dev, &vkms_device_attr_group);
 	if (ret)
 		goto out_devres;
 
@@ -862,8 +943,7 @@ void vkms_destroy(struct vkms_config *config)
 	vkmsdev = config->dev;
 	fdev = vkmsdev->faux_dev;
 
-	vkms_quiesce(vkmsdev);
-	drm_dev_unplug(&vkmsdev->drm);
+	vkms_shutdown_release(vkmsdev);
 	config->dev = NULL;
 	devres_release_group(&fdev->dev, NULL);
 	faux_device_destroy(fdev);
@@ -887,6 +967,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.4.3");
+MODULE_VERSION("1.4.4");
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

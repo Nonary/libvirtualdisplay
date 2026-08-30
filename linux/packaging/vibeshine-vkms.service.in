@@ -3,7 +3,7 @@ Description=Vibeshine virtual display pool
 Documentation=https://docs.kernel.org/gpu/vkms.html
 Wants=vibeshine-drm-setup.service vibeshine-vkms-control.socket
 After=systemd-modules-load.service vibeshine-drm-setup.service
-Before=display-manager.service
+Before=systemd-user-sessions.service display-manager.service
 
 [Service]
 Type=oneshot
@@ -11,6 +11,7 @@ RemainAfterExit=yes
 ExecStartPre=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-drm-install status
 ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms start
 ExecStop=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms stop
+ExecStopPost=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms-quiesce
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0022

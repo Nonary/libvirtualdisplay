@@ -254,6 +254,13 @@ static int vkms_prepare_fb(struct drm_plane *plane,
 		return ret;
 
 	/*
+	 * The GEM helper attaches an unsignaled implicit write fence here. Atomic
+	 * helpers consume state->fence before commit_tail, so retain its presence
+	 * for same-framebuffer presentation change detection.
+	 */
+	vkms_state->presentation_content_update |= state->fence != NULL;
+
+	/*
 	 * A non-linear PRIME framebuffer belongs to the render GPU. Mapping it on
 	 * the virtual device would force the very CPU migration this driver exists
 	 * to avoid. Vblank/page-flip emulation does not access pixel memory. The

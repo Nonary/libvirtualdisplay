@@ -149,6 +149,17 @@ def validate_source_contract(driver_root: Path) -> None:
         "vkms_format_modifiers,",
     ):
         require_source(plane, needle, plane_path.name)
+    require(
+        re.search(
+            r"static int vkms_prepare_fb\(.*?"
+            r"drm_gem_plane_helper_prepare_fb\(plane, state\);.*?"
+            r"vkms_state->presentation_content_update \|= state->fence != NULL;",
+            plane,
+            flags=re.DOTALL,
+        )
+        is not None,
+        "vkms_prepare_fb does not preserve implicit fences after GEM preparation",
+    )
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
     require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
     require_source(driver_header, "struct mutex shutdown_lock", driver_header_path.name)
@@ -174,7 +185,9 @@ def validate_source_contract(driver_root: Path) -> None:
         "capable(CAP_SYS_ADMIN)",
         "static bool enable_cursor;",
         "devm_register_reboot_notifier",
+        "devm_device_add_group",
         "vkms_reboot_notifier",
+        "quiesce_store",
         "vkms_crtc_release_presented_frame",
     ):
         require_source(drv, needle, drv_path.name)

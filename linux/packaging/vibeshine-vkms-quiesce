@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Quiesce the managed DRM device early during a global shutdown without
+# unplugging it while compositors still hold file descriptors.
+
+set -uo pipefail
+
+PROGRAM_NAME="vibeshine-vkms-quiesce"
+QUIESCE_PATH="${VIBESHINE_VKMS_QUIESCE_PATH:-/sys/bus/faux/devices/vibeshine/quiesce}"
+
+error() {
+  printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+system_is_stopping() {
+  local state
+
+  if [[ -n ${VIBESHINE_SYSTEM_STATE:-} ]]; then
+    state=$VIBESHINE_SYSTEM_STATE
+  else
+    state=$(systemctl is-system-running 2>/dev/null || true)
+  fi
+  [[ "$state" == stopping ]]
+}
+
+if ! system_is_stopping; then
+  exit 0
+fi
+
+if [[ ! -f "$QUIESCE_PATH" || -L "$QUIESCE_PATH" ]]; then
+  error "virtual-display quiesce control is unavailable: ${QUIESCE_PATH}"
+  exit 1
+fi
+
+if ! printf '1\n' >"$QUIESCE_PATH"; then
+  error "could not quiesce virtual scanout through ${QUIESCE_PATH}"
+  exit 1
+fi
+
+printf '%s: quiesced virtual scanout before late kernel shutdown\n' "$PROGRAM_NAME"

@@ -149,8 +149,9 @@ struct conversion_matrix {
  * @pixel_read_line: function to read a pixel line in this plane. The creator of a
  *		     struct vkms_plane_state must ensure that this pointer is valid
  * @conversion_matrix: matrix used for yuv formats to convert to rgb
- * @presentation_content_update: true when this commit supplied a content fence
- *				 that the atomic helper consumes before commit_tail
+ * @presentation_content_update: true when this commit supplied an explicit or
+ *				 implicit content fence that the atomic helper consumes
+ *				 before commit_tail
  */
 struct vkms_plane_state {
 	struct drm_shadow_plane_state base;
@@ -258,7 +259,9 @@ struct vkms_config_plane;
  * @output - Configuration and sub-components of the VKMS device
  * @config: Configuration used in this VKMS device
  * @shutdown_lock: Serializes explicit destruction with late reboot quiescing
- * @reboot_notifier: Quiesces scanout before physical GPU device shutdown
+ * @unplugged: Set once the DRM device has been unplugged, so that the reboot
+ *             notifier and an explicit destroy cannot unplug it twice
+ * @reboot_notifier: Releases the device before physical GPU device shutdown
  */
 struct vkms_device {
 	struct drm_device drm;
@@ -267,6 +270,7 @@ struct vkms_device {
 	struct mutex commit_lock;
 	struct mutex shutdown_lock;
 	bool accepting_commits;
+	bool unplugged;
 	struct task_struct *shutdown_owner;
 	struct notifier_block reboot_notifier;
 };
