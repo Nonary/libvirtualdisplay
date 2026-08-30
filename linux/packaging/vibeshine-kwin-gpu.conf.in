@@ -4,4 +4,5 @@
 # to KWin and the interposer removes itself from the environment before KWin
 # starts child processes.
 [Service]
+UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD LD_PROFILE LD_SHOW_AUXV
 Environment=PATH=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin

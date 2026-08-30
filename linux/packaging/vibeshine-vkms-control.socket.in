@@ -9,3 +9,7 @@ SocketGroup=vibeshine-vkms
 DirectoryMode=0755
 Accept=yes
 RemoveOnStop=yes
+MaxConnections=16
+MaxConnectionsPerSource=4
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=32

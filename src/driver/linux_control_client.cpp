@@ -197,10 +197,8 @@ namespace virtual_display::driver {
     const std::string_view output_name,
     const bool connected
   ) const {
-    const auto current = query_connector(output_name);
-    if (current.ok() && current.connected == connected) {
-      return current;
-    }
+    // Mutations must always reach the broker. A status-only idempotence
+    // shortcut cannot prove that this UID owns an already-connected output.
     const auto result = request(connected ? "connect" : "disconnect", output_name);
     if (!result.ok() || result.connected != connected) {
       return result.ok()

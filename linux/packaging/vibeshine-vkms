@@ -834,14 +834,19 @@ control_connector() {
 control_connection() {
   local caller_uid=${1:-}
   local request
+  local max_request_bytes=128
 
   if [[ ! "$caller_uid" =~ ^(0|[1-9][0-9]*)$ ]]; then
     printf 'ERROR peer credentials unavailable\n'
     return 1
   fi
 
-  if ! IFS= read -r request; then
+  if ! IFS= read -r -t 2 -n "$max_request_bytes" request; then
     printf 'ERROR malformed request\n'
+    return 1
+  fi
+  if (( ${#request} >= max_request_bytes )); then
+    printf 'ERROR request too large\n'
     return 1
   fi
 

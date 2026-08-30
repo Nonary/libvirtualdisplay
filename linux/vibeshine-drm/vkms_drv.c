@@ -48,6 +48,7 @@
 #include "vibeshine_drm_present.h"
 #include "vibeshine_drm_uapi.h"
 #include "vibeshine_drm_compat.h"
+#include "vibeshine_drm_version.h"
 
 #define DRIVER_NAME	"vibeshine_drm"
 #define DRIVER_DESC	"Vibeshine HDR Virtual Display"
@@ -97,6 +98,8 @@ static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 
 	if (!vibeshine_drm_present_request_valid(request))
 		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EACCES;
 
 	crtc = drm_crtc_find(dev, file_priv, request->crtc_id);
 	if (!crtc)
@@ -972,6 +975,6 @@ MODULE_AUTHOR("Haneen Mohammed <hamohammed.sa@gmail.com>");
 MODULE_AUTHOR("Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>");
 MODULE_AUTHOR("Vibeshine contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION("1.4.4");
+MODULE_VERSION(VIBESHINE_DRM_VERSION);
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_LICENSE("GPL");

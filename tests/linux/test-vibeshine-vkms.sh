@@ -34,6 +34,10 @@ grep -Fq 'Before=systemd-user-sessions.service display-manager.service' "$SERVIC
 grep -Fxq 'g vibeshine-vkms - -' "$SYSUSERS_FILE" || fail 'sysusers file must provision the dedicated socket group'
 grep -Fxq 'Accept=yes' "$SOCKET_UNIT" || fail 'control socket must use one service instance per connection'
 grep -Fxq 'SocketGroup=vibeshine-vkms' "$SOCKET_UNIT" || fail 'control socket must use its dedicated access group'
+grep -Fxq 'MaxConnections=16' "$SOCKET_UNIT" || fail 'control socket must cap concurrent root helpers'
+grep -Fxq 'MaxConnectionsPerSource=4' "$SOCKET_UNIT" || fail 'control socket must cap each peer source'
+grep -Fxq 'RuntimeMaxSec=5s' "$CONNECTION_SERVICE" || fail 'control helper must have a runtime deadline'
+grep -Fxq 'MemoryMax=32M' "$CONNECTION_SERVICE" || fail 'control helper must have a memory ceiling'
 if grep -Fxq 'SocketGroup=video' "$SOCKET_UNIT"; then
   fail 'control socket must not grant every video-group member mutation access'
 fi
@@ -169,6 +173,12 @@ for invalid_request in 'connect Virtual-0' 'connect Virtual-5' 'connect Virtual-
   fi
   [[ "$response" == "ERROR malformed request" ]] || fail "unexpected protocol error: ${response}"
 done
+
+oversized_request=$(printf '%0130d' 0)
+if response=$(printf '%s\n' "$oversized_request" | control_connection "$OWNER_UID"); then
+  fail 'oversized control request succeeded'
+fi
+[[ "$response" == "ERROR request too large" ]] || fail "unexpected oversized-request response: ${response}"
 
 # Control must never follow a connector attribute symlink in the test model.
 mv -- "$VKMS_DEVICE_DIR/connectors/Virtual-3/status" "$TEST_ROOT/Virtual-3.status"

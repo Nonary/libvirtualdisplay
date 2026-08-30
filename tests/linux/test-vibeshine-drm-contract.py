@@ -122,6 +122,11 @@ def validate_source_contract(driver_root: Path) -> None:
     crtc = crtc_path.read_text(encoding="utf-8")
     drv = drv_path.read_text(encoding="utf-8")
 
+    require_source(drv, '#include "vibeshine_drm_version.h"', drv_path.name)
+    require_source(drv, "MODULE_VERSION(VIBESHINE_DRM_VERSION)", drv_path.name)
+    require("MODULE_VERSION(\"" not in drv,
+            "kernel module version must come from the package build")
+
     for needle in (
         "VIBESHINE_DRM_MIN_KERNEL_VERSION KERNEL_VERSION(6, 16, 0)",
         "VIBESHINE_DRM_HAS_COLOR_PIPELINE",
@@ -227,6 +232,16 @@ def validate_source_contract(driver_root: Path) -> None:
         "vkms_crtc_release_presented_frame",
     ):
         require_source(drv, needle, drv_path.name)
+    require(
+        re.search(
+            r"static int vkms_wait_present_ioctl\(.*?"
+            r"if \(!capable\(CAP_SYS_ADMIN\)\)\s*return -EACCES;",
+            drv,
+            flags=re.DOTALL,
+        )
+        is not None,
+        "presentation waits are not restricted to the privileged capture host",
+    )
     require(
         re.search(
             r"static void vkms_quiesce\(.*?"

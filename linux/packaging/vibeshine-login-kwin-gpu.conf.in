@@ -3,5 +3,7 @@
 # login-compositor arguments while launching the same verified KWin shadow and
 # GPU-association bridge used by the normal desktop session.
 [Service]
+UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD LD_PROFILE LD_SHOW_AUXV
+ExecCondition=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@/kwin_wayland --verify-plasma-login-unit
 ExecStart=
 ExecStart=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@/kwin_wayland --no-lockscreen --no-global-shortcuts --no-kactivities --inputmethod plasma-keyboard --locale1

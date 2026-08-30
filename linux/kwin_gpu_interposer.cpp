@@ -21,7 +21,6 @@ namespace {
 
   constexpr std::string_view kRenderPciEnvironment = "VIBESHINE_KWIN_RENDER_PCI";
   constexpr std::string_view kPreloadActiveEnvironment = "VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE";
-  constexpr std::string_view kParentPreloadEnvironment = "VIBESHINE_KWIN_PARENT_LD_PRELOAD";
 
   std::atomic<drm_get_devices2_fn> real_drm_get_devices2 {nullptr};
   std::atomic<drm_get_device2_fn> real_drm_get_device2 {nullptr};
@@ -239,12 +238,7 @@ namespace {
       return;
     }
 
-    if (const auto *parent_preload = std::getenv(kParentPreloadEnvironment.data()); parent_preload) {
-      (void)setenv("LD_PRELOAD", parent_preload, 1);
-    } else {
-      (void)unsetenv("LD_PRELOAD");
-    }
-    (void)unsetenv(kParentPreloadEnvironment.data());
+    (void)unsetenv("LD_PRELOAD");
     (void)unsetenv(kPreloadActiveEnvironment.data());
   }
 }
