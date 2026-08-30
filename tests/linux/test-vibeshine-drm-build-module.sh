@@ -21,8 +21,9 @@ fail() {
 
 TEST_MODULES="$TEST_ROOT/modules"
 TEST_SOURCE="$TEST_ROOT/source"
-CLANG_KERNEL="6.99.1-clang"
-GCC_KERNEL="6.99.1-gcc"
+CLANG_KERNEL="6.16.0-clang"
+GCC_KERNEL="7.2.0-gcc"
+UNSUPPORTED_KERNEL="6.15.99-vibeshine"
 MAKE_CALLS="$TEST_ROOT/make-calls"
 mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$CLANG_KERNEL/build" "$TEST_MODULES/$GCC_KERNEL/build"
 printf 'obj-m += vibeshine_drm.o\n' >"$TEST_SOURCE/Makefile"
@@ -54,7 +55,7 @@ forwarded_call=$(sed -n '3p' "$MAKE_CALLS")
 [[ "$forwarded_call" == *"LLVM=1"* ]] || fail "forwarded build omitted the DKMS Kbuild argument"
 [[ "$forwarded_call" == *"modules" ]] || fail "forwarded build omitted the modules target"
 
-grep -Fq 'BUILD_EXCLUSIVE_KERNEL_MIN="7.1"' "$DKMS_CONFIG_UNDER_TEST" ||
+grep -Fq 'BUILD_EXCLUSIVE_KERNEL_MIN="6.16"' "$DKMS_CONFIG_UNDER_TEST" ||
   fail "DKMS configuration omitted the supported kernel floor"
 grep -Fq 'build-module ${kernelver} ${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build' \
   "$DKMS_CONFIG_UNDER_TEST" || fail "DKMS build command omitted the explicit module source path"
@@ -62,5 +63,9 @@ grep -Fq 'build-module ${kernelver} ${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSI
 if build_module '../unsafe' "$TEST_SOURCE"; then
   fail "unsafe kernel release was accepted"
 fi
+if build_module "$UNSUPPORTED_KERNEL" "$TEST_SOURCE"; then
+  fail "unsupported kernel was accepted"
+fi
+[[ $(wc -l <"$MAKE_CALLS") -eq 3 ]] || fail "unsupported kernel invoked make"
 
 printf 'PASS: vibeshine-drm build-module shell tests\n'

@@ -2,6 +2,7 @@
 
 #include <linux/dma-fence.h>
 #include <linux/timekeeping.h>
+#include <linux/version.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -10,12 +11,14 @@
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 #include <drm/drm_vblank_helper.h>
+#endif
 
 #include "vkms_drv.h"
 #include "vibeshine_drm_compat.h"
 
-static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
+static void vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 {
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
 	struct vkms_crtc_state *state;
@@ -54,8 +57,52 @@ static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
 
 	dma_fence_end_signalling(fence_cookie);
 
+}
+
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
+static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
+{
+	vkms_crtc_handle_vblank(crtc);
 	return true;
 }
+#else
+static enum hrtimer_restart vkms_vblank_simulate(struct hrtimer *timer)
+{
+	struct vkms_output *output = container_of(timer, struct vkms_output,
+						  vblank_hrtimer);
+	u64 ret_overrun;
+
+	ret_overrun = hrtimer_forward_now(&output->vblank_hrtimer,
+					  output->period_ns);
+	if (ret_overrun != 1)
+		pr_warn("%s: vblank timer overrun\n", __func__);
+
+	vkms_crtc_handle_vblank(&output->crtc);
+
+	return HRTIMER_RESTART;
+}
+
+static int vkms_enable_vblank(struct drm_crtc *crtc)
+{
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+
+	drm_calc_timestamping_constants(crtc, &crtc->mode);
+	hrtimer_setup(&output->vblank_hrtimer, &vkms_vblank_simulate,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	output->period_ns = ktime_set(0, vblank->framedur_ns);
+	hrtimer_start(&output->vblank_hrtimer, output->period_ns, HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+static void vkms_disable_vblank(struct drm_crtc *crtc)
+{
+	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+
+	hrtimer_cancel(&output->vblank_hrtimer);
+}
+#endif
 
 static struct drm_crtc_state *
 vkms_atomic_crtc_duplicate_state(struct drm_crtc *crtc)
@@ -92,12 +139,14 @@ static void vkms_atomic_crtc_reset(struct drm_crtc *crtc)
 {
 	struct vkms_crtc_state *vkms_state = kzalloc_obj(*vkms_state);
 
+	if (!vkms_state)
+		return;
+
 	if (crtc->state)
 		vkms_atomic_crtc_destroy_state(crtc, crtc->state);
 
 	__drm_atomic_helper_crtc_reset(crtc, &vkms_state->base);
-	if (vkms_state)
-		INIT_WORK(&vkms_state->composer_work, vkms_composer_worker);
+	INIT_WORK(&vkms_state->composer_work, vkms_composer_worker);
 }
 
 static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
@@ -105,6 +154,7 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 					   ktime_t *vblank_time,
 					   bool in_vblank_irq)
 {
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
 	u64 timestamp_ns;
 
@@ -129,6 +179,27 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 	*vblank_time = ns_to_ktime(timestamp_ns);
 
 	return true;
+#else
+	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+
+	(void)max_error;
+	(void)in_vblank_irq;
+
+	if (!READ_ONCE(vblank->enabled)) {
+		*vblank_time = ktime_get();
+		return true;
+	}
+
+	*vblank_time = READ_ONCE(output->vblank_hrtimer.node.expires);
+	if (WARN_ON(*vblank_time == vblank->time))
+		return true;
+
+	/* The timer is advanced before drm_crtc_handle_vblank() runs. */
+	*vblank_time -= output->period_ns;
+
+	return true;
+#endif
 }
 
 static const struct drm_crtc_funcs vkms_crtc_funcs = {
@@ -137,8 +208,13 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.reset                  = vkms_atomic_crtc_reset,
 	.atomic_duplicate_state = vkms_atomic_crtc_duplicate_state,
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	.enable_vblank          = drm_crtc_vblank_helper_enable_vblank_timer,
 	.disable_vblank         = drm_crtc_vblank_helper_disable_vblank_timer,
+#else
+	.enable_vblank          = vkms_enable_vblank,
+	.disable_vblank         = vkms_disable_vblank,
+#endif
 	.get_vblank_timestamp   = vkms_crtc_get_vblank_timestamp,
 };
 
@@ -205,6 +281,7 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	__releases(&vkms_output->lock)
 {
 	struct vkms_output *vkms_output = drm_crtc_to_vkms_output(crtc);
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct drm_crtc_state *old_crtc_state;
 	bool vrr_flip = false;
 	bool vrr_disabled = false;
@@ -213,6 +290,7 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	if (old_crtc_state)
 		vrr_disabled = old_crtc_state->vrr_enabled &&
 			       !crtc->state->vrr_enabled;
+#endif
 
 	if (crtc->state->event) {
 		spin_lock(&crtc->dev->event_lock);
@@ -221,7 +299,9 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 			drm_crtc_send_vblank_event(crtc, crtc->state->event);
 		else {
 			drm_crtc_arm_vblank_event(crtc, crtc->state->event);
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 			vrr_flip = crtc->state->vrr_enabled;
+#endif
 		}
 
 		spin_unlock(&crtc->dev->event_lock);
@@ -233,6 +313,7 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 
 	spin_unlock_irq(&vkms_output->lock);
 
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	/*
 	 * A virtual adaptive-sync CRTC has no panel scanout constraint. Complete
 	 * each queued flip as its vblank and stop the fixed-rate timer, making
@@ -250,16 +331,33 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns, 0);
 		drm_crtc_vblank_start_timer(crtc);
 	}
+#endif
 }
 
 static void vkms_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	drm_crtc_vblank_atomic_enable(crtc, state);
 
 	/* drm_crtc_vblank_on() starts the timer after the initial atomic flush. */
 	if (crtc->state->vrr_enabled)
 		drm_crtc_vblank_cancel_timer(crtc);
+#else
+	(void)state;
+	drm_crtc_vblank_on(crtc);
+#endif
+}
+
+static void vkms_crtc_atomic_disable(struct drm_crtc *crtc,
+				     struct drm_atomic_commit *state)
+{
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
+	drm_crtc_vblank_atomic_disable(crtc, state);
+#else
+	(void)state;
+	drm_crtc_vblank_off(crtc);
+#endif
 }
 
 static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
@@ -267,8 +365,10 @@ static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
 	.atomic_begin	= vkms_crtc_atomic_begin,
 	.atomic_flush	= vkms_crtc_atomic_flush,
 	.atomic_enable	= vkms_crtc_atomic_enable,
-	.atomic_disable	= drm_crtc_vblank_atomic_disable,
+	.atomic_disable	= vkms_crtc_atomic_disable,
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	.handle_vblank_timeout = vkms_crtc_handle_vblank_timeout,
+#endif
 };
 
 void vkms_crtc_release_presented_frame(struct vkms_output *output)
@@ -316,7 +416,9 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 
 	drm_crtc_enable_color_mgmt(crtc, 0, false, VKMS_LUT_SIZE);
 
+#if VIBESHINE_DRM_HAS_BACKGROUND_COLOR
 	drm_crtc_attach_background_color_property(crtc);
+#endif
 
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);

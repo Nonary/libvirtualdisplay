@@ -105,6 +105,7 @@ int main(void) { return 0; }
 
 
 def validate_source_contract(driver_root: Path) -> None:
+    compat_path = driver_root / "vibeshine_drm_compat.h"
     connector_path = driver_root / "vkms_connector.c"
     driver_header_path = driver_root / "vkms_drv.h"
     plane_path = driver_root / "vkms_plane.c"
@@ -112,6 +113,7 @@ def validate_source_contract(driver_root: Path) -> None:
     config_path = driver_root / "vkms_config.c"
     crtc_path = driver_root / "vkms_crtc.c"
     drv_path = driver_root / "vkms_drv.c"
+    compat = compat_path.read_text(encoding="utf-8")
     connector = connector_path.read_text(encoding="utf-8")
     driver_header = driver_header_path.read_text(encoding="utf-8")
     plane = plane_path.read_text(encoding="utf-8")
@@ -121,6 +123,28 @@ def validate_source_contract(driver_root: Path) -> None:
     drv = drv_path.read_text(encoding="utf-8")
 
     for needle in (
+        "VIBESHINE_DRM_MIN_KERNEL_VERSION KERNEL_VERSION(6, 16, 0)",
+        "VIBESHINE_DRM_HAS_COLOR_PIPELINE",
+        "VIBESHINE_DRM_HAS_BACKGROUND_COLOR",
+        "VIBESHINE_DRM_HAS_VBLANK_HELPER",
+        "VIBESHINE_DRM_HAS_SHARPNESS_STRENGTH",
+        "#define kzalloc_obj(P, ...) kzalloc(sizeof(P), GFP_KERNEL)",
+        "#define kzalloc_objs(P, COUNT, ...) kcalloc((COUNT), sizeof(P), GFP_KERNEL)",
+    ):
+        require_source(compat, needle, compat_path.name)
+
+    for needle in (
+        "#if VIBESHINE_DRM_HAS_VBLANK_HELPER",
+        "static enum hrtimer_restart vkms_vblank_simulate",
+        "drm_calc_timestamping_constants(crtc, &crtc->mode)",
+        "drm_crtc_vblank_on(crtc)",
+        "drm_crtc_vblank_off(crtc)",
+        "#if VIBESHINE_DRM_HAS_BACKGROUND_COLOR",
+    ):
+        require_source(crtc, needle, crtc_path.name)
+
+    for needle in (
+        "#include \"vibeshine_drm_compat.h\"",
         "drm_connector_attach_vrr_capable_property(&connector->base)",
         "drm_connector_set_vrr_capable_property(&connector->base, true)",
         "drm_connector_attach_max_bpc_property(&connector->base, 8, 16)",
@@ -130,6 +154,18 @@ def validate_source_contract(driver_root: Path) -> None:
         "drm_connector_attach_colorspace_property(&connector->base)",
     ):
         require_source(connector, needle, connector_path.name)
+    require(
+        re.search(
+            r"#if VIBESHINE_DRM_HAS_VBLANK_HELPER\s+"
+            r"ret = drm_connector_attach_vrr_capable_property\(&connector->base\);.*?"
+            r"drm_connector_set_vrr_capable_property\(&connector->base, true\);\s+"
+            r"#endif",
+            connector,
+            flags=re.DOTALL,
+        )
+        is not None,
+        "vkms_connector.c advertises VRR without the VRR-capable vblank path",
+    )
 
     for pixel_format in (
         "DRM_FORMAT_XRGB2101010",

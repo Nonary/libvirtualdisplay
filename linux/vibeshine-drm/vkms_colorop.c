@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0+
 
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 #include <linux/slab.h>
 #include <drm/drm_colorop.h>
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 #include <drm/drm_plane.h>
+#endif
 
 #include "vkms_drv.h"
+#include "vibeshine_drm_compat.h"
+
+#if VIBESHINE_DRM_HAS_COLOR_PIPELINE
 
 static const u64 supported_tfs =
 	BIT(DRM_COLOROP_1D_CURVE_SRGB_EOTF) |
@@ -127,3 +134,10 @@ int vkms_initialize_colorops(struct drm_plane *plane)
 out:
 	return ret;
 }
+#else
+int vkms_initialize_colorops(struct drm_plane *plane)
+{
+	(void)plane;
+	return 0;
+}
+#endif

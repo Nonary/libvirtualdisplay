@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+
 
 #include <linux/crc32.h>
+#include <linux/version.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 #include <drm/drm_colorop.h>
+#endif
 #include <drm/drm_fourcc.h>
 #include <drm/drm_fixed.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -16,6 +19,7 @@
 
 #include "vkms_composer.h"
 #include "vkms_luts.h"
+#include "vibeshine_drm_compat.h"
 
 static u16 pre_mul_blend_channel(u16 src, u16 dst, u16 alpha)
 {
@@ -126,6 +130,7 @@ static void apply_lut(const struct vkms_crtc_state *crtc_state, struct line_buff
 	}
 }
 
+#if VIBESHINE_DRM_HAS_COLOR_PIPELINE
 VISIBLE_IF_KUNIT void apply_3x4_matrix(struct pixel_argb_s32 *pixel,
 				       const struct drm_color_ctm_3x4 *matrix)
 {
@@ -230,6 +235,14 @@ static void pre_blend_color_transform(const struct vkms_plane_state *plane_state
 		output_buffer->pixels[x].b = clamp_val(pixel.b, 0, 0xffff);
 	}
 }
+#else
+static void pre_blend_color_transform(const struct vkms_plane_state *plane_state,
+				      struct line_buffer *output_buffer)
+{
+	(void)plane_state;
+	(void)output_buffer;
+}
+#endif
 
 /**
  * direction_for_rotation() - Get the correct reading direction for a given rotation
@@ -471,6 +484,7 @@ static void blend(struct vkms_writeback_job *wb,
 {
 	struct vkms_plane_state **plane = crtc_state->active_planes;
 	u32 n_active_planes = crtc_state->num_active_planes;
+#if VIBESHINE_DRM_HAS_BACKGROUND_COLOR
 	u64 bgcolor = crtc_state->base.background_color;
 
 	const struct pixel_argb_u16 background_color = {
@@ -479,6 +493,9 @@ static void blend(struct vkms_writeback_job *wb,
 		.g = DRM_ARGB64_GETG(bgcolor),
 		.b = DRM_ARGB64_GETB(bgcolor),
 	};
+#else
+	const struct pixel_argb_u16 background_color = { .a = 0xffff };
+#endif
 
 	int crtc_y_limit = crtc_state->base.mode.vdisplay;
 	int crtc_x_limit = crtc_state->base.mode.hdisplay;

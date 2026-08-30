@@ -6,6 +6,7 @@
 #include <kunit/visibility.h>
 
 #include "vkms_config.h"
+#include "vibeshine_drm_compat.h"
 
 struct vkms_config *vkms_config_create(const char *dev_name)
 {

@@ -8,6 +8,7 @@
 #include "vkms_config.h"
 #include "vkms_configfs.h"
 #include "vkms_connector.h"
+#include "vibeshine_drm_compat.h"
 
 /* To avoid registering configfs more than once or unregistering on error */
 static bool is_configfs_registered;

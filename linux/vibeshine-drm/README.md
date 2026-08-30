@@ -10,8 +10,9 @@ monitor contract:
 
 - a CTA-861 EDID advertising BT.2020, PQ, HLG, and static HDR metadata;
 - atomic `HDR_OUTPUT_METADATA`, `Colorspace`, and 8-16 `max bpc` properties;
-- adaptive-sync capability with exactly one synthetic vblank per submitted
-  frame, independent of the disabled fixed-rate timer and nominal mode period;
+- adaptive-sync capability on Linux 7.0 and newer, with exactly one synthetic
+  vblank per submitted frame, independent of the disabled fixed-rate timer and
+  nominal mode period;
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
 - versioned, read-only presentation and frame-export ioctls so direct KMS
   capture can follow completed scanout changes and import the exact presented
@@ -74,11 +75,16 @@ generator, not `vibeshine_hdr_edid.h`, and regenerate the header with:
 ./generate_hdr_edid.py --header vibeshine_hdr_edid.h
 ```
 
-The current source is derived from Linux 7.2 and includes the compatibility
-shim needed for the Linux 7.1 DRM atomic API. The installer builds it for the
-running kernel (or registers it with DKMS when available). If it cannot be
-built or loaded, managed virtual displays remain unavailable; the helper does
-not substitute CPU-backed upstream VKMS scanout.
+The current source is derived from Linux 7.2 and includes compatibility paths
+for Linux 6.16 and newer. The installer builds it for the running kernel (or
+registers it with DKMS when available). If it cannot be built or loaded,
+managed virtual displays remain unavailable; the helper does not substitute
+CPU-backed upstream VKMS scanout.
+
+On kernels before Linux 7.0, the compatibility path uses fixed-refresh vblank
+and intentionally does not advertise adaptive sync. The programmable color
+pipeline and background-color property require Linux 7.1; HDR metadata,
+10-bit scanout, and direct frame export remain available on Linux 6.16.
 
 The installer generates a persistent local DKMS key at
 `/var/lib/dkms/mok.key`, signs every DKMS or direct build, and verifies the

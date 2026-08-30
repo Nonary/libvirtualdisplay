@@ -29,6 +29,8 @@ MODULE_SIG_ENFORCE_FILE="/sys/module/module/parameters/sig_enforce"
 DKMS_CONFIG_ROOT="/etc/dkms"
 TTY_DEVICE="/dev/tty"
 AUTO_ENROLL=0
+MINIMUM_KERNEL_MAJOR=6
+MINIMUM_KERNEL_MINOR=16
 
 log() {
   printf '%s: %s\n' "$PROGRAM_NAME" "$*"
@@ -546,6 +548,72 @@ validate_kernel_release() {
   esac
 }
 
+kernel_version_is_supported() {
+  local kernel_release=$1 kernel_major kernel_minor
+
+  if [[ ! "$kernel_release" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([-+].*)?$ ]]; then
+    return 2
+  fi
+  kernel_major=$((10#${BASH_REMATCH[1]}))
+  kernel_minor=$((10#${BASH_REMATCH[2]}))
+  ((kernel_major > MINIMUM_KERNEL_MAJOR ||
+    (kernel_major == MINIMUM_KERNEL_MAJOR && kernel_minor >= MINIMUM_KERNEL_MINOR)))
+}
+
+require_supported_kernel() {
+  local kernel_release=$1 result
+
+  if kernel_version_is_supported "$kernel_release"; then
+    return 0
+  else
+    result=$?
+  fi
+  if ((result == 2)); then
+    error "could not determine the Linux version from kernel release '${kernel_release}'"
+  else
+    error "managed virtual displays require Linux 6.16 or newer"
+    error "the running kernel is ${kernel_release} and is unsupported"
+  fi
+  error "Vibeshine was installed, but its virtual-display driver was not"
+  error "install and boot a supported Linux kernel, then retry:"
+  error "  sudo @VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} install"
+  return 1
+}
+
+kernel_build_files_are_available() {
+  local kernel_release=$1
+  local build_dir="$MODULES_ROOT/$kernel_release/build"
+
+  [[ -d "$build_dir" && -f "$build_dir/Makefile" ]]
+}
+
+arch_kernel_headers_package() {
+  local kernel_release=$1 kernel_package
+
+  command -v pacman >/dev/null 2>&1 || return 1
+  kernel_package=$(pacman -Qqo "$MODULES_ROOT/$kernel_release/vmlinuz" 2>/dev/null) || return 1
+  case "$kernel_package" in
+    "" | *$'\n'* | *[!A-Za-z0-9@._+:-]*) return 1 ;;
+  esac
+  printf '%s-headers\n' "$kernel_package"
+}
+
+report_missing_kernel_headers() {
+  local kernel_release=$1 build_dir headers_package
+
+  build_dir="$MODULES_ROOT/$kernel_release/build"
+  error "kernel build files are unavailable at ${build_dir}"
+  error "kernel headers for ${kernel_release} are missing"
+  if headers_package=$(arch_kernel_headers_package "$kernel_release"); then
+    error "install them with:"
+    error "  sudo pacman -S --needed ${headers_package}"
+  else
+    error "install matching kernel headers that provide ${build_dir}"
+  fi
+  error "then retry:"
+  error "  sudo @VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/${PROGRAM_NAME} install"
+}
+
 validate_source_tree() {
   local required_file
 
@@ -843,9 +911,8 @@ install_direct() (
     fi
     log "refreshing directly built module with an unexpected signature for ${kernel_release}"
   fi
-  if [[ ! -d "$build_dir" || ! -f "$build_dir/Makefile" ]]; then
-    error "kernel build files are unavailable at ${build_dir}"
-    error "install matching kernel headers or DKMS, then retry"
+  if ! kernel_build_files_are_available "$kernel_release"; then
+    report_missing_kernel_headers "$kernel_release"
     return 1
   fi
   require_command make || return 1
@@ -940,6 +1007,11 @@ install_module() {
 
   kernel_release=$(current_kernel_release) || return 1
   validate_kernel_release "$kernel_release" || return 1
+  require_supported_kernel "$kernel_release" || return 1
+  if ! kernel_build_files_are_available "$kernel_release"; then
+    report_missing_kernel_headers "$kernel_release"
+    return 1
+  fi
   validate_source_tree || return 1
   prepare_signing_key || return 1
   cleanup_obsolete_installations || cleanup_rc=1
@@ -1179,6 +1251,7 @@ module_status() {
 
   kernel_release=$(current_kernel_release) || return 1
   validate_kernel_release "$kernel_release" || return 1
+  require_supported_kernel "$kernel_release" || return 1
   if [[ -d "$SYS_MODULE_ROOT/$MODULE_NAME" ]]; then
     log "${MODULE_NAME} is loaded"
   fi
@@ -1191,7 +1264,11 @@ module_status() {
     installed=1
   fi
   if ((installed == 0)); then
-    log "the current HDR DRM module is not installed for ${kernel_release}"
+    if ! kernel_build_files_are_available "$kernel_release"; then
+      report_missing_kernel_headers "$kernel_release"
+    else
+      log "the current HDR DRM module is not installed for ${kernel_release}"
+    fi
     return 3
   fi
   if ! installed_module_matches_signing_certificate "$kernel_release"; then

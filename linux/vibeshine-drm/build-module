@@ -6,6 +6,8 @@ set -uo pipefail
 
 PROGRAM_NAME="vibeshine-drm-build"
 MODULES_ROOT=""
+MINIMUM_KERNEL_MAJOR=6
+MINIMUM_KERNEL_MINOR=16
 
 log() {
   printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -30,6 +32,34 @@ validate_kernel_release() {
   esac
 }
 
+kernel_version_is_supported() {
+  local kernel_release=$1 kernel_major kernel_minor
+
+  if [[ ! "$kernel_release" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([-+].*)?$ ]]; then
+    return 2
+  fi
+  kernel_major=$((10#${BASH_REMATCH[1]}))
+  kernel_minor=$((10#${BASH_REMATCH[2]}))
+  ((kernel_major > MINIMUM_KERNEL_MAJOR ||
+    (kernel_major == MINIMUM_KERNEL_MAJOR && kernel_minor >= MINIMUM_KERNEL_MINOR)))
+}
+
+require_supported_kernel() {
+  local kernel_release=$1 result
+
+  if kernel_version_is_supported "$kernel_release"; then
+    return 0
+  else
+    result=$?
+  fi
+  if ((result == 2)); then
+    error "could not determine the Linux version from kernel release '${kernel_release}'"
+  else
+    error "managed virtual displays require Linux 6.16 or newer; running kernel is ${kernel_release}"
+  fi
+  return 1
+}
+
 build_module() {
   local kernel_release=$1
   local source_dir=$2
@@ -40,6 +70,7 @@ build_module() {
   forwarded_make_args=("$@")
 
   validate_kernel_release "$kernel_release" || return 1
+  require_supported_kernel "$kernel_release" || return 1
   if [[ ! -d "$source_dir" || -L "$source_dir" || ! -f "$source_dir/Makefile" ]]; then
     error "module source directory is unavailable or unsafe: ${source_dir}"
     return 1

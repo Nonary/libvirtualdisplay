@@ -29,7 +29,6 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_colorop.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_file.h>
@@ -352,7 +351,9 @@ static void vkms_snapshot_plane_state(
 		state->fb_damage_clips || state->color_mgmt_changed;
 	snapshot->crtc = (unsigned long)state->crtc;
 	snapshot->framebuffer = (unsigned long)state->fb;
+#if VIBESHINE_DRM_HAS_COLOR_PIPELINE
 	snapshot->color_pipeline = (unsigned long)state->color_pipeline;
+#endif
 	snapshot->crtc_x = state->crtc_x;
 	snapshot->crtc_y = state->crtc_y;
 	snapshot->hotspot_x = state->hotspot_x;
@@ -392,9 +393,13 @@ static void vkms_snapshot_crtc_state(
 	snapshot->degamma_lut = (unsigned long)state->degamma_lut;
 	snapshot->ctm = (unsigned long)state->ctm;
 	snapshot->gamma_lut = (unsigned long)state->gamma_lut;
+#if VIBESHINE_DRM_HAS_BACKGROUND_COLOR
 	snapshot->background_color = state->background_color;
+#endif
 	snapshot->scaling_filter = state->scaling_filter;
+#if VIBESHINE_DRM_HAS_SHARPNESS_STRENGTH
 	snapshot->sharpness_strength = state->sharpness_strength;
+#endif
 	snapshot->vrr_enabled = state->vrr_enabled;
 }
 

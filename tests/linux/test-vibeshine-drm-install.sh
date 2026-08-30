@@ -49,7 +49,7 @@ TEST_MOK_VARIABLES="$TEST_ROOT/mok-variables"
 TEST_LOCKDOWN_FILE="$TEST_ROOT/lockdown"
 TEST_SIG_ENFORCE_FILE="$TEST_ROOT/sig-enforce"
 TEST_DKMS_CONFIG="$TEST_ROOT/dkms-config"
-TEST_KERNEL="6.99.1-vibeshine"
+TEST_KERNEL="6.16.0-vibeshine"
 mkdir -p -- "$TEST_SOURCE" "$TEST_MODULES/$TEST_KERNEL/build/scripts" "$TEST_SYS_MODULE" \
   "$TEST_BUILD_TMP" "$TEST_EFI_FIRMWARE" "$TEST_EFI_VARS" "$TEST_DKMS_CONFIG/framework.conf.d"
 printf 'obj-m += vibeshine_drm.o\n' >"$TEST_SOURCE/Makefile"
@@ -201,6 +201,106 @@ test_direct_install() (
   [[ ! -e "$marker" ]] || fail "direct-install marker remains after removal"
   assert_contains "$DIRECT_CALLS" "modprobe -r $MODULE_NAME"
   assert_contains "$DIRECT_CALLS" "depmod -a $TEST_KERNEL"
+)
+
+test_unsupported_kernel_stops_before_side_effects() (
+  UNSUPPORTED_KERNEL="6.15.99-vibeshine"
+  UNSUPPORTED_LOG="$TEST_ROOT/unsupported-kernel.log"
+  UNSUPPORTED_MOK_KEY="$TEST_ROOT/unsupported-dkms/mok.key"
+  UNSUPPORTED_MOK_CERTIFICATE="$TEST_ROOT/unsupported-dkms/mok.pub"
+
+  configure_install_paths \
+    "$TEST_SOURCE" "$TEST_ROOT/unsupported-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$UNSUPPORTED_MOK_KEY" "$UNSUPPORTED_MOK_CERTIFICATE"
+  KERNEL_RELEASE_OVERRIDE=$UNSUPPORTED_KERNEL
+  prepare_signing_key() {
+    fail "unsupported kernel generated a signing key"
+  }
+  cleanup_obsolete_installations() {
+    fail "unsupported kernel cleaned module installations"
+  }
+  dkms_available() {
+    fail "unsupported kernel attempted DKMS detection"
+  }
+
+  if install_module >"$UNSUPPORTED_LOG" 2>&1; then
+    fail "unsupported kernel was accepted"
+  fi
+  assert_contains "$UNSUPPORTED_LOG" "managed virtual displays require Linux 6.16 or newer"
+  assert_contains "$UNSUPPORTED_LOG" "the running kernel is ${UNSUPPORTED_KERNEL} and is unsupported"
+  assert_contains "$UNSUPPORTED_LOG" "install and boot a supported Linux kernel"
+  assert_contains "$UNSUPPORTED_LOG" "Vibeshine was installed, but its virtual-display driver was not"
+  [[ ! -e "$UNSUPPORTED_MOK_KEY" && ! -e "$UNSUPPORTED_MOK_CERTIFICATE" ]] ||
+    fail "unsupported kernel created signing files"
+)
+
+test_missing_headers_stops_before_dkms() (
+  MISSING_HEADERS_KERNEL="6.16.0-missing-headers"
+  MISSING_HEADERS_LOG="$TEST_ROOT/missing-headers.log"
+  MISSING_HEADERS_MOK_KEY="$TEST_ROOT/missing-headers-dkms/mok.key"
+  MISSING_HEADERS_MOK_CERTIFICATE="$TEST_ROOT/missing-headers-dkms/mok.pub"
+
+  mkdir -p -- "$TEST_MODULES/$MISSING_HEADERS_KERNEL"
+  : >"$TEST_MODULES/$MISSING_HEADERS_KERNEL/vmlinuz"
+  configure_install_paths \
+    "$TEST_SOURCE" "$TEST_ROOT/missing-headers-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$MISSING_HEADERS_MOK_KEY" "$MISSING_HEADERS_MOK_CERTIFICATE"
+  KERNEL_RELEASE_OVERRIDE=$MISSING_HEADERS_KERNEL
+  pacman() {
+    [[ ${1:-} == -Qqo && ${2:-} == "$TEST_MODULES/$MISSING_HEADERS_KERNEL/vmlinuz" ]] || return 1
+    printf 'linux-cachyos\n'
+  }
+  prepare_signing_key() {
+    fail "missing headers generated a signing key"
+  }
+  cleanup_obsolete_installations() {
+    fail "missing headers cleaned module installations"
+  }
+  dkms_available() {
+    fail "missing headers attempted DKMS detection"
+  }
+
+  if install_module >"$MISSING_HEADERS_LOG" 2>&1; then
+    fail "missing headers were accepted"
+  fi
+  assert_contains "$MISSING_HEADERS_LOG" "kernel headers for ${MISSING_HEADERS_KERNEL} are missing"
+  assert_contains "$MISSING_HEADERS_LOG" "sudo pacman -S --needed linux-cachyos-headers"
+  [[ ! -e "$MISSING_HEADERS_MOK_KEY" && ! -e "$MISSING_HEADERS_MOK_CERTIFICATE" ]] ||
+    fail "missing headers created signing files"
+)
+
+test_status_reports_kernel_requirements() (
+  STATUS_UNSUPPORTED_KERNEL="6.15.99-status"
+  STATUS_UNSUPPORTED_LOG="$TEST_ROOT/status-unsupported.log"
+  STATUS_HEADERS_KERNEL="6.16.0-status-noheaders"
+  STATUS_HEADERS_LOG="$TEST_ROOT/status-headers.log"
+
+  configure_install_paths \
+    "$TEST_SOURCE" "$TEST_ROOT/status-state" "$TEST_MODULES" "$TEST_SYS_MODULE" "$TEST_BUILD_TMP" \
+    "$TEST_MOK_KEY" "$TEST_MOK_CERTIFICATE"
+
+  KERNEL_RELEASE_OVERRIDE=$STATUS_UNSUPPORTED_KERNEL
+  if module_status >"$STATUS_UNSUPPORTED_LOG" 2>&1; then
+    fail "status accepted an unsupported kernel"
+  fi
+  assert_contains "$STATUS_UNSUPPORTED_LOG" "managed virtual displays require Linux 6.16 or newer"
+  assert_contains "$STATUS_UNSUPPORTED_LOG" "the running kernel is ${STATUS_UNSUPPORTED_KERNEL} and is unsupported"
+
+  mkdir -p -- "$TEST_MODULES/$STATUS_HEADERS_KERNEL"
+  : >"$TEST_MODULES/$STATUS_HEADERS_KERNEL/vmlinuz"
+  KERNEL_RELEASE_OVERRIDE=$STATUS_HEADERS_KERNEL
+  dkms_available() {
+    return 1
+  }
+  pacman() {
+    [[ ${1:-} == -Qqo && ${2:-} == "$TEST_MODULES/$STATUS_HEADERS_KERNEL/vmlinuz" ]] || return 1
+    printf 'linux-cachyos-lts\n'
+  }
+  if module_status >"$STATUS_HEADERS_LOG" 2>&1; then
+    fail "status accepted a missing driver installation"
+  fi
+  assert_contains "$STATUS_HEADERS_LOG" "kernel headers for ${STATUS_HEADERS_KERNEL} are missing"
+  assert_contains "$STATUS_HEADERS_LOG" "sudo pacman -S --needed linux-cachyos-lts-headers"
 )
 
 test_obsolete_direct_cleanup() (
@@ -567,6 +667,9 @@ test_loaded_module_freshness() (
 
 test_dkms_install
 test_direct_install
+test_unsupported_kernel_stops_before_side_effects
+test_missing_headers_stops_before_dkms
+test_status_reports_kernel_requirements
 test_obsolete_direct_cleanup
 
 # The direct fallback test uses its own state tree so an earlier direct marker

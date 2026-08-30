@@ -15,6 +15,8 @@
 #include <drm/drm_encoder.h>
 #include <drm/drm_writeback.h>
 
+#include "vibeshine_drm_compat.h"
+
 #define DEFAULT_DEVICE_NAME "vkms"
 
 #define XRES_MIN    10
@@ -213,9 +215,8 @@ struct vkms_crtc_state {
  * @encoder: DRM encoder used for this output
  * @connector: DRM connector used for this output
  * @wb_connecter: DRM writeback connector used for this output
- * @vblank_hrtimer: Timer used to trigger the vblank
- * @period_ns: vblank period, in nanoseconds, used to configure @vblank_hrtimer and to compute
- *	       vblank timestamps
+ * @vblank_hrtimer: Timer used to trigger vblank on kernels before Linux 7.0
+ * @period_ns: vblank period used by @vblank_hrtimer on kernels before Linux 7.0
  * @composer_workq: Ordered workqueue for @composer_state.composer_work.
  * @lock: Lock used to protect concurrent access to the composer
  * @composer_enabled: Protected by @lock, true when the VKMS composer is active (crc needed or
@@ -227,6 +228,10 @@ struct vkms_output {
 	struct drm_crtc crtc;
 	struct drm_writeback_connector wb_connector;
 	struct drm_encoder wb_encoder;
+#if !VIBESHINE_DRM_HAS_VBLANK_HELPER
+	struct hrtimer vblank_hrtimer;
+	ktime_t period_ns;
+#endif
 	struct workqueue_struct *composer_workq;
 	spinlock_t lock;
 
