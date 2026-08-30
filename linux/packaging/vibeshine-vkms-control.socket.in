@@ -11,5 +11,3 @@ Accept=yes
 RemoveOnStop=yes
 MaxConnections=16
 MaxConnectionsPerSource=4
-TriggerLimitIntervalSec=10s
-TriggerLimitBurst=32

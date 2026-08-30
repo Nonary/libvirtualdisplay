@@ -9,6 +9,7 @@ CONNECTION_SERVICE="$PACKAGING_DIR/vibeshine-vkms-control@.service.in"
 SYSUSERS_FILE="$PACKAGING_DIR/vibeshine-vkms.sysusers"
 QUIESCE_HELPER="$PACKAGING_DIR/vibeshine-vkms-quiesce"
 SERVICE_UNIT="$PACKAGING_DIR/vibeshine-vkms.service.in"
+SETUP_SERVICE="$PACKAGING_DIR/vibeshine-drm-setup.service.in"
 TEST_ROOT=$(mktemp -d)
 
 cleanup_test_root() {
@@ -38,6 +39,10 @@ grep -Fxq 'MaxConnections=16' "$SOCKET_UNIT" || fail 'control socket must cap co
 grep -Fxq 'MaxConnectionsPerSource=4' "$SOCKET_UNIT" || fail 'control socket must cap each peer source'
 grep -Fxq 'RuntimeMaxSec=5s' "$CONNECTION_SERVICE" || fail 'control helper must have a runtime deadline'
 grep -Fxq 'MemoryMax=32M' "$CONNECTION_SERVICE" || fail 'control helper must have a memory ceiling'
+grep -Fxq 'SuccessExitStatus=4 5' "$SETUP_SERVICE" || fail 'expected reboot and enrollment outcomes must not latch setup failed'
+if grep -Fq 'TriggerLimit' "$SOCKET_UNIT"; then
+  fail 'control socket must not enter a persistent failed state after a request burst'
+fi
 if grep -Fxq 'SocketGroup=video' "$SOCKET_UNIT"; then
   fail 'control socket must not grant every video-group member mutation access'
 fi
