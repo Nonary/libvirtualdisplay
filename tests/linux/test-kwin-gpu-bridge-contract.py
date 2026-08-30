@@ -31,11 +31,13 @@ def main() -> int:
     interposer_path = linux_root / "kwin_gpu_interposer.cpp"
     launcher_path = linux_root / "kwin_preload_launcher.cpp"
     dropin_path = linux_root / "packaging" / "vibeshine-kwin-gpu.conf.in"
+    login_dropin_path = linux_root / "packaging" / "vibeshine-login-kwin-gpu.conf.in"
     cmake_path = linux_root.parent / "src" / "driver" / "CMakeLists.txt"
 
     interposer = interposer_path.read_text(encoding="utf-8")
     launcher = launcher_path.read_text(encoding="utf-8")
     dropin = dropin_path.read_text(encoding="utf-8")
+    login_dropin = login_dropin_path.read_text(encoding="utf-8")
     cmake = cmake_path.read_text(encoding="utf-8")
 
     require_all(interposer, (
@@ -76,8 +78,21 @@ def main() -> int:
     require("Environment=LD_PRELOAD" not in dropin, "systemd drop-in leaks preload to KWin children")
     require("VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR" in dropin,
             "systemd drop-in does not select the capability-free launcher")
+    require_all(login_dropin, (
+        "ExecStart=\n",
+        "VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR",
+        "/kwin_wayland --no-lockscreen",
+        "--no-global-shortcuts",
+        "--no-kactivities",
+        "--inputmethod plasma-keyboard",
+        "--locale1",
+    ), login_dropin_path.name)
+    require("Environment=LD_PRELOAD" not in login_dropin,
+            "login-manager drop-in leaks preload to KWin children")
     require("BUILD_VIBESHINE_KWIN_GPU_BRIDGE" in cmake,
             "KWin bridge is not guarded by an explicit build option")
+    require("plasma-login-kwin_wayland.service.d" in cmake,
+            "KWin bridge is not installed for the Plasma login compositor")
 
     for obsolete in (
         linux_root / "kwin_hdr_interposer.cpp",

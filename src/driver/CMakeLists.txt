@@ -64,6 +64,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     configure_file(
             "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-kwin-gpu.conf.in"
             "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf" @ONLY)
+    configure_file(
+            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-login-kwin-gpu.conf.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-login-kwin-gpu.conf" @ONLY)
 
     install(TARGETS vibeshine_kwin_gpu
             LIBRARY DESTINATION "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}")
@@ -72,6 +75,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf"
             DESTINATION
             "${VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR}/plasma-kwin_wayland.service.d")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-login-kwin-gpu.conf"
+            RENAME vibeshine-kwin-gpu.conf
+            DESTINATION
+            "${VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR}/plasma-login-kwin_wayland.service.d")
 endif()
 
 option(BUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER "Build the Windows UMDF/IddCx Sunshine virtual display driver" OFF)
