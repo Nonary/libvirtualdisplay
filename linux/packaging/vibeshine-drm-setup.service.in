@@ -6,7 +6,10 @@ Before=vibeshine-vkms.service display-manager.service
 
 [Service]
 Type=oneshot
+@VIBESHINE_KWIN_CAPABILITY_EXEC_START@
 ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-drm-install install
+@VIBESHINE_KWIN_CAPABILITY_EXEC_STOP@
+@VIBESHINE_KWIN_CAPABILITY_REMAIN_AFTER_EXIT@
 SuccessExitStatus=4 5
 TimeoutStartSec=10min
 UMask=0022

@@ -32,6 +32,10 @@ fail() {
 grep -Fq '/vibeshine-vkms-quiesce' "$SERVICE_UNIT" || fail 'pool service must quiesce the driver after its shutdown-aware stop'
 grep -Fq 'Before=systemd-user-sessions.service display-manager.service' "$SERVICE_UNIT" || \
   fail 'pool service must remain active until all graphical user sessions have stopped'
+grep -Fxq 'RuntimeDirectory=vibeshine/vkms-leases' "$SERVICE_UNIT" || \
+  fail 'pool service must provision the broker lease directory before accepting connections'
+grep -Fxq 'RuntimeDirectoryMode=0700' "$SERVICE_UNIT" || \
+  fail 'broker lease directory must remain root-private'
 grep -Fxq 'g vibeshine-vkms - -' "$SYSUSERS_FILE" || fail 'sysusers file must provision the dedicated socket group'
 grep -Fxq 'Accept=yes' "$SOCKET_UNIT" || fail 'control socket must use one service instance per connection'
 grep -Fxq 'SocketGroup=vibeshine-vkms' "$SOCKET_UNIT" || fail 'control socket must use its dedicated access group'

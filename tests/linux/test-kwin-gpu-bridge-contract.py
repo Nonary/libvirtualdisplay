@@ -29,13 +29,13 @@ def main() -> int:
 
     linux_root = Path(sys.argv[1]).resolve()
     interposer_path = linux_root / "kwin_gpu_interposer.cpp"
-    launcher_path = linux_root / "kwin_preload_launcher.cpp"
+    capability_path = linux_root / "kwin_capability.c"
     dropin_path = linux_root / "packaging" / "vibeshine-kwin-gpu.conf.in"
     login_dropin_path = linux_root / "packaging" / "vibeshine-login-kwin-gpu.conf.in"
     cmake_path = linux_root.parent / "src" / "driver" / "CMakeLists.txt"
 
     interposer = interposer_path.read_text(encoding="utf-8")
-    launcher = launcher_path.read_text(encoding="utf-8")
+    capability = capability_path.read_text(encoding="utf-8")
     dropin = dropin_path.read_text(encoding="utf-8")
     login_dropin = login_dropin_path.read_text(encoding="utf-8")
     cmake = cmake_path.read_text(encoding="utf-8")
@@ -51,7 +51,10 @@ def main() -> int:
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
         "return 3",
-        "stop_preload_inheritance",
+        "stop_kwin_preload_inheritance",
+        "running_inside_kwin",
+        'readlink("/proc/self/exe"',
+        '"/usr/bin/kwin_wayland"',
         'unsetenv("LD_PRELOAD")',
     ), interposer_path.name)
     for function_name in ("drmGetDevice2", "drmGetDeviceFromDevId"):
@@ -68,49 +71,47 @@ def main() -> int:
     require("drmIoctl" not in interposer, "physical-connector DRM ioctl suppression returned")
     require("HEADLESS_HDR" not in interposer, "physical headless-HDR policy returned")
 
-    require_all(launcher, (
-        "dlopen(kInterposerPath",
-        "VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE",
-        'setenv("LD_PRELOAD"',
-        '"LD_AUDIT"',
-        '"LD_LIBRARY_PATH"',
-        "unsetenv(name)",
-        "PR_SET_NO_NEW_PRIVS",
-        'return fail("restrict KWin privilege gains")',
-        "fexecve(source",
-        "--verify-plasma-login-unit",
-        "kInterposerAbi = 3",
-    ), launcher_path.name)
-    require("VIBESHINE_KWIN_PARENT_LD_PRELOAD" not in launcher,
-            "launcher preserves an inherited preload across the greeter boundary")
-    require("mkostemp(" not in launcher,
-            "launcher copies KWin away from its Qt runtime path")
-    require("PR_SET_NO_NEW_PRIVS" in launcher and "fexecve(source" in launcher,
-            "launcher does not suppress file capabilities on the verified KWin inode")
-    require("Environment=LD_PRELOAD" not in dropin, "systemd drop-in leaks preload to KWin children")
-    require("VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR" in dropin,
-            "systemd drop-in does not select the capability-free launcher")
+    require_all(capability, (
+        '"/usr/bin/kwin_wayland"',
+        '"user.vibeshine.cap_sys_nice_removed"',
+        "O_NOFOLLOW",
+        "metadata->st_uid != 0",
+        "S_IWGRP | S_IWOTH",
+        'cap_from_text("cap_sys_nice=ep")',
+        "cap_compare(actual, empty)",
+        "cap_compare(actual, sys_nice)",
+        "cap_set_fd(fd, empty)",
+        "cap_set_fd(fd, sys_nice)",
+        "fsetxattr(fd, marker_name",
+        "fgetxattr(fd, marker_name",
+        "fremovexattr(fd, marker_name)",
+        'strcmp(argv[1], "prepare")',
+        'strcmp(argv[1], "restore")',
+    ), capability_path.name)
+    require_all(dropin, (
+        "Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_PATH@",
+        "Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1",
+    ), dropin_path.name)
+    require("ExecStart=" not in dropin, "desktop drop-in replaces the vendor KWin wrapper")
+    require("PATH=" not in dropin, "desktop drop-in intercepts KWin through PATH")
     require_all(login_dropin, (
         "UnsetEnvironment=LD_AUDIT",
-        "ExecCondition=",
-        "--verify-plasma-login-unit",
-        "ExecStart=\n",
-        "VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR",
-        "/kwin_wayland --no-lockscreen",
-        "--no-global-shortcuts",
-        "--no-kactivities",
-        "--inputmethod plasma-keyboard",
-        "--locale1",
+        "Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_PATH@",
+        "Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1",
     ), login_dropin_path.name)
-    require("Environment=LD_PRELOAD" not in login_dropin,
-            "login-manager drop-in leaks preload to KWin children")
+    require("ExecStart=" not in login_dropin, "login drop-in replaces the vendor KWin command")
     require("BUILD_VIBESHINE_KWIN_GPU_BRIDGE" in cmake,
             "KWin bridge is not guarded by an explicit build option")
     require("plasma-login-kwin_wayland.service.d" in cmake,
             "KWin bridge is not installed for the Plasma login compositor")
+    require("vibeshine_kwin_capability" in cmake,
+            "KWin capability helper is not built with the bridge")
+    require("kwin_preload_launcher" not in cmake,
+            "obsolete dynamic-loader launcher is still built")
 
     for obsolete in (
         linux_root / "kwin_hdr_interposer.cpp",
+        linux_root / "kwin_preload_launcher.cpp",
         linux_root / "packaging" / "vibeshine-kwin-hdr.conf.in",
         linux_root / "packaging" / "vibeshine-nvidia-display",
         linux_root / "packaging" / "vibeshine-nvidia-display.service.in",

@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -233,8 +234,25 @@ namespace {
     log_gpu_attachment();
   }
 
-  __attribute__((constructor)) void stop_preload_inheritance() {
+  bool running_inside_kwin() {
+    std::array<char, 4096> executable {};
+    const auto length = readlink("/proc/self/exe", executable.data(), executable.size() - 1);
+    if (length <= 0 || static_cast<std::size_t>(length) >= executable.size()) {
+      return false;
+    }
+    executable[static_cast<std::size_t>(length)] = '\0';
+    return std::strcmp(executable.data(), "/usr/bin/kwin_wayland") == 0;
+  }
+
+  __attribute__((constructor)) void stop_kwin_preload_inheritance() {
     if (!std::getenv(kPreloadActiveEnvironment.data())) {
+      return;
+    }
+
+    // The desktop service starts an unprivileged wrapper which must pass the
+    // preload to KWin. Remove it only after the real compositor has loaded the
+    // bridge so applications launched by KWin never inherit it.
+    if (!running_inside_kwin()) {
       return;
     }
 

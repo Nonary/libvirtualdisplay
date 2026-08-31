@@ -1,9 +1,6 @@
-# Plasma Login starts KWin directly with an absolute path, so the desktop
-# service's PATH interception cannot apply here. Preserve the distribution's
-# login-compositor arguments while launching the same verified KWin shadow and
-# GPU-association bridge used by the normal desktop session.
+# Plasma Login starts KWin directly. Scope the same root-owned GPU bridge to
+# the compositor; it removes itself from the environment before child launch.
 [Service]
-UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD LD_PROFILE LD_SHOW_AUXV
-ExecCondition=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@/kwin_wayland --verify-plasma-login-unit
-ExecStart=
-ExecStart=@VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR@/kwin_wayland --no-lockscreen --no-global-shortcuts --no-kactivities --inputmethod plasma-keyboard --locale1
+UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PROFILE LD_SHOW_AUXV
+Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_PATH@
+Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1

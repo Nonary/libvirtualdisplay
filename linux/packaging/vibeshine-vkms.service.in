@@ -8,6 +8,8 @@ Before=systemd-user-sessions.service display-manager.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+RuntimeDirectory=vibeshine/vkms-leases
+RuntimeDirectoryMode=0700
 ExecStartPre=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-drm-install status
 ExecStart=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms start
 ExecStop=@VIBESHINE_PRIVILEGED_LIBEXEC_INSTALL_DIR@/vibeshine-vkms stop
