@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -80,67 +81,6 @@ namespace {
     }
     return setenv(kPreloadActiveEnvironment, "1", 1) == 0 &&
       setenv("LD_PRELOAD", kInterposerPath, 1) == 0;
-  }
-
-  bool protected_runtime_directory(const std::string &path) {
-    struct stat metadata {};
-    return lstat(path.c_str(), &metadata) == 0 &&
-      S_ISDIR(metadata.st_mode) && metadata.st_uid == getuid() &&
-      (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0;
-  }
-
-  std::string prepare_shadow_directory() {
-    const auto *runtime = std::getenv("XDG_RUNTIME_DIR");
-    if (!runtime || runtime[0] != '/' || !protected_runtime_directory(runtime)) {
-      errno = EPERM;
-      return {};
-    }
-
-    auto directory = std::string {runtime} + "/vibeshine-kwin";
-    if (mkdir(directory.c_str(), S_IRWXU) < 0 && errno != EEXIST) {
-      return {};
-    }
-    if (!protected_runtime_directory(directory)) {
-      errno = EPERM;
-      return {};
-    }
-    return directory;
-  }
-
-  bool copy_exactly(const int source, const int destination, const off_t expected_size) {
-    std::array<char, 64 * 1024> buffer {};
-    off_t copied = 0;
-    while (copied < expected_size) {
-      const auto remaining = expected_size - copied;
-      const auto requested = static_cast<std::size_t>(
-        remaining < static_cast<off_t>(buffer.size()) ? remaining : buffer.size());
-      const auto bytes_read = read(source, buffer.data(), requested);
-      if (bytes_read < 0 && errno == EINTR) {
-        continue;
-      }
-      if (bytes_read <= 0) {
-        errno = bytes_read == 0 ? EIO : errno;
-        return false;
-      }
-
-      ssize_t written = 0;
-      while (written < bytes_read) {
-        const auto result = write(
-          destination,
-          buffer.data() + written,
-          static_cast<std::size_t>(bytes_read - written));
-        if (result < 0 && errno == EINTR) {
-          continue;
-        }
-        if (result <= 0) {
-          errno = result == 0 ? EIO : errno;
-          return false;
-        }
-        written += result;
-      }
-      copied += bytes_read;
-    }
-    return true;
   }
 
   bool plasma_login_unit_matches() {
@@ -229,86 +169,10 @@ int main(const int argc, char **argv) {
     return fail_message("system KWin is not a trusted root-owned executable");
   }
 
-  const auto shadow_directory = prepare_shadow_directory();
-  if (shadow_directory.empty()) {
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
     close(source);
-    return fail("prepare protected KWin runtime directory");
+    return fail("restrict KWin privilege gains");
   }
-  auto temporary_path = shadow_directory + "/.kwin_wayland.XXXXXX";
-  std::vector<char> temporary_name(temporary_path.begin(), temporary_path.end());
-  temporary_name.push_back('\0');
-  const auto executable = mkostemp(temporary_name.data(), O_CLOEXEC);
-  if (executable < 0) {
-    close(source);
-    return fail("create temporary KWin shadow");
-  }
-  if (!copy_exactly(source, executable, metadata.st_size)) {
-    const auto saved_errno = errno;
-    close(source);
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("copy system KWin");
-  }
-  close(source);
-
-  if (fchmod(executable, S_IRUSR | S_IXUSR) < 0) {
-    const auto saved_errno = errno;
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("mark KWin image executable");
-  }
-  if (fsync(executable) < 0) {
-    const auto saved_errno = errno;
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("sync KWin shadow");
-  }
-  struct stat shadow_metadata {};
-  if (fstat(executable, &shadow_metadata) < 0) {
-    const auto saved_errno = errno;
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("inspect KWin shadow");
-  }
-
-  // Linux refuses to execute an inode while any descriptor still has it open
-  // for writing (ETXTBSY). Reopen the already-verified anonymous image through
-  // procfs before unlinking it, then close the writable description before
-  // fexecve(). This retains the pathname-race protection without trying to
-  // execute the mkostemp() O_RDWR descriptor.
-  const auto descriptor_path = std::string {"/proc/self/fd/"} + std::to_string(executable);
-  const auto launch_image = open(descriptor_path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (launch_image < 0) {
-    const auto saved_errno = errno;
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("reopen KWin shadow read-only");
-  }
-  struct stat launch_metadata {};
-  if (fstat(launch_image, &launch_metadata) < 0 ||
-      launch_metadata.st_dev != shadow_metadata.st_dev ||
-      launch_metadata.st_ino != shadow_metadata.st_ino ||
-      launch_metadata.st_size != metadata.st_size || !S_ISREG(launch_metadata.st_mode)) {
-    const auto saved_errno = errno == 0 ? EIO : errno;
-    close(launch_image);
-    close(executable);
-    unlink(temporary_name.data());
-    errno = saved_errno;
-    return fail("verify read-only KWin shadow");
-  }
-  if (unlink(temporary_name.data()) < 0) {
-    const auto saved_errno = errno;
-    close(launch_image);
-    close(executable);
-    errno = saved_errno;
-    return fail("unlink KWin shadow");
-  }
-  close(executable);
 
   std::vector<char *> arguments;
   arguments.reserve(static_cast<std::size_t>(argc) + 1);
@@ -319,11 +183,11 @@ int main(const int argc, char **argv) {
   arguments.push_back(nullptr);
 
   if (!configure_interposer_environment()) {
-    close(launch_image);
+    close(source);
     return fail("configure KWin GPU bridge environment");
   }
-  std::fprintf(stderr, "vibeshine-kwin-launcher: starting verified capability-free KWin shadow\n");
-  fexecve(launch_image, arguments.data(), environ);
-  close(launch_image);
-  return fail("execute KWin shadow");
+  std::fprintf(stderr, "vibeshine-kwin-launcher: starting verified no-new-privs KWin\n");
+  fexecve(source, arguments.data(), environ);
+  close(source);
+  return fail("execute KWin");
 }
