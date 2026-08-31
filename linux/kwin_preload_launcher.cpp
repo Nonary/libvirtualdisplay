@@ -266,12 +266,49 @@ int main(const int argc, char **argv) {
     errno = saved_errno;
     return fail("sync KWin shadow");
   }
+  struct stat shadow_metadata {};
+  if (fstat(executable, &shadow_metadata) < 0) {
+    const auto saved_errno = errno;
+    close(executable);
+    unlink(temporary_name.data());
+    errno = saved_errno;
+    return fail("inspect KWin shadow");
+  }
+
+  // Linux refuses to execute an inode while any descriptor still has it open
+  // for writing (ETXTBSY). Reopen the already-verified anonymous image through
+  // procfs before unlinking it, then close the writable description before
+  // fexecve(). This retains the pathname-race protection without trying to
+  // execute the mkostemp() O_RDWR descriptor.
+  const auto descriptor_path = std::string {"/proc/self/fd/"} + std::to_string(executable);
+  const auto launch_image = open(descriptor_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (launch_image < 0) {
+    const auto saved_errno = errno;
+    close(executable);
+    unlink(temporary_name.data());
+    errno = saved_errno;
+    return fail("reopen KWin shadow read-only");
+  }
+  struct stat launch_metadata {};
+  if (fstat(launch_image, &launch_metadata) < 0 ||
+      launch_metadata.st_dev != shadow_metadata.st_dev ||
+      launch_metadata.st_ino != shadow_metadata.st_ino ||
+      launch_metadata.st_size != metadata.st_size || !S_ISREG(launch_metadata.st_mode)) {
+    const auto saved_errno = errno == 0 ? EIO : errno;
+    close(launch_image);
+    close(executable);
+    unlink(temporary_name.data());
+    errno = saved_errno;
+    return fail("verify read-only KWin shadow");
+  }
   if (unlink(temporary_name.data()) < 0) {
     const auto saved_errno = errno;
+    close(launch_image);
     close(executable);
     errno = saved_errno;
     return fail("unlink KWin shadow");
   }
+  close(executable);
 
   std::vector<char *> arguments;
   arguments.reserve(static_cast<std::size_t>(argc) + 1);
@@ -282,10 +319,11 @@ int main(const int argc, char **argv) {
   arguments.push_back(nullptr);
 
   if (!configure_interposer_environment()) {
+    close(launch_image);
     return fail("configure KWin GPU bridge environment");
   }
   std::fprintf(stderr, "vibeshine-kwin-launcher: starting verified capability-free KWin shadow\n");
-  fexecve(executable, arguments.data(), environ);
-  close(executable);
+  fexecve(launch_image, arguments.data(), environ);
+  close(launch_image);
   return fail("execute KWin shadow");
 }

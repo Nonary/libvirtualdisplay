@@ -75,7 +75,11 @@ def main() -> int:
         '"LD_AUDIT"',
         '"LD_LIBRARY_PATH"',
         "unsetenv(name)",
-        "fexecve(executable",
+        'open(descriptor_path.c_str(), O_RDONLY | O_CLOEXEC)',
+        "launch_metadata.st_ino != shadow_metadata.st_ino",
+        'return fail("verify read-only KWin shadow")',
+        "close(executable);\n\n  std::vector<char *> arguments",
+        "fexecve(launch_image",
         "--verify-plasma-login-unit",
         "kInterposerAbi = 3",
     ), launcher_path.name)
@@ -83,6 +87,9 @@ def main() -> int:
             "launcher preserves an inherited preload across the greeter boundary")
     require("rename(temporary_name.data(), shadow_path" not in launcher,
             "launcher reopens a same-UID mutable KWin pathname")
+    require(launcher.index("close(executable);\n\n  std::vector<char *> arguments") <
+            launcher.index("fexecve(launch_image"),
+            "launcher executes while its KWin shadow is still open for writing")
     require("Environment=LD_PRELOAD" not in dropin, "systemd drop-in leaks preload to KWin children")
     require("VIBESHINE_KWIN_GPU_LAUNCHER_INSTALL_DIR" in dropin,
             "systemd drop-in does not select the capability-free launcher")
