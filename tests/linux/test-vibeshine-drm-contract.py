@@ -203,14 +203,18 @@ def validate_source_contract(driver_root: Path) -> None:
     )
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
     require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
+    require_source(driver_header, "atomic64_t synthetic_vblank_counter", driver_header_path.name)
     require_source(driver_header, "struct mutex shutdown_lock", driver_header_path.name)
     require_source(driver_header, "struct notifier_block reboot_notifier", driver_header_path.name)
     for needle in (
         "if (crtc->state->vrr_enabled)",
         "drm_crtc_vblank_cancel_timer(crtc)",
         "vkms_crtc_get_vblank_timestamp",
-        "if (in_vblank_irq)",
-        "return false",
+        "vkms_crtc_get_vblank_counter",
+        ".get_vblank_counter     = vkms_crtc_get_vblank_counter",
+        "atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns())",
+        "atomic64_inc(&output->synthetic_vblank_counter)",
+        "drm_crtc_set_max_vblank_count(crtc, U32_MAX)",
         "atomic64_set(&vkms_output->vrr_vblank_timestamp_ns",
         "*vblank_time = ns_to_ktime(timestamp_ns)",
         "vkms_crtc_handle_vblank_timeout(crtc)",
@@ -218,6 +222,14 @@ def validate_source_contract(driver_root: Path) -> None:
         "drm_crtc_vblank_start_timer(crtc)",
     ):
         require_source(crtc, needle, crtc_path.name)
+    require("if (in_vblank_irq)\n\t\treturn false" not in crtc,
+            "VRR timestamping still disables precise timestamps in interrupt context")
+    require(
+        crtc.index("atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns())") <
+        crtc.index("atomic64_inc(&output->synthetic_vblank_counter)") <
+        crtc.index("drm_crtc_handle_vblank(crtc)"),
+        "synthetic vblank timestamp and counter are not published before delivery",
+    )
     for needle in (
         "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
         "obj->import_attach->dmabuf",

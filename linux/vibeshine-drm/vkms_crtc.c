@@ -27,6 +27,8 @@ static void vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 	fence_cookie = dma_fence_begin_signalling();
 
 	spin_lock(&output->lock);
+	atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns());
+	atomic64_inc(&output->synthetic_vblank_counter);
 	ret = drm_crtc_handle_vblank(crtc);
 	if (!ret)
 		DRM_ERROR("vkms failure on handling vblank");
@@ -149,6 +151,13 @@ static void vkms_atomic_crtc_reset(struct drm_crtc *crtc)
 	INIT_WORK(&vkms_state->composer_work, vkms_composer_worker);
 }
 
+static u32 vkms_crtc_get_vblank_counter(struct drm_crtc *crtc)
+{
+	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+
+	return (u32)atomic64_read(&output->synthetic_vblank_counter);
+}
+
 static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 					   int *max_error,
 					   ktime_t *vblank_time,
@@ -162,19 +171,14 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 		return drm_crtc_vblank_helper_get_vblank_timestamp_from_timer(
 			crtc, max_error, vblank_time, in_vblank_irq);
 
-	/*
-	 * A synthetic VRR interrupt represents exactly one submitted frame.
-	 * Returning no high-precision timestamp here makes the DRM no-hardware-
-	 * counter path advance by one instead of inferring zero or several
-	 * vblanks from the nominal mode period.
+	/* The explicit synthetic counter advances exactly once per delivered
+	 * event, so the real immediate timestamp cannot make DRM infer zero or
+	 * several nominal-period vblanks.
 	 */
-	if (in_vblank_irq)
-		return false;
-
-	/* The fixed timer is stopped in VRR mode, so retain the last flip time. */
+	(void)in_vblank_irq;
 	timestamp_ns = atomic64_read(&output->vrr_vblank_timestamp_ns);
 	if (!timestamp_ns)
-		timestamp_ns = ktime_get_ns();
+		return false;
 	*max_error = 0;
 	*vblank_time = ns_to_ktime(timestamp_ns);
 
@@ -208,6 +212,7 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.reset                  = vkms_atomic_crtc_reset,
 	.atomic_duplicate_state = vkms_atomic_crtc_duplicate_state,
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
+	.get_vblank_counter     = vkms_crtc_get_vblank_counter,
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	.enable_vblank          = drm_crtc_vblank_helper_enable_vblank_timer,
 	.disable_vblank         = drm_crtc_vblank_helper_disable_vblank_timer,
@@ -324,8 +329,6 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	    old_crtc_state->active)
 		drm_crtc_vblank_cancel_timer(crtc);
 	if (vrr_flip) {
-		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns,
-			     ktime_get_ns());
 		vkms_crtc_handle_vblank_timeout(crtc);
 	} else if (vrr_disabled) {
 		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns, 0);
@@ -422,6 +425,8 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);
+	atomic64_set(&vkms_out->synthetic_vblank_counter, 0);
+	drm_crtc_set_max_vblank_count(crtc, U32_MAX);
 	atomic64_set(&vkms_out->vrr_vblank_timestamp_ns, 0);
 	atomic64_set(&vkms_out->present_sequence, 0);
 	atomic_set(&vkms_out->pending_commits, 0);

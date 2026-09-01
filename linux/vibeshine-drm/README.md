@@ -12,7 +12,8 @@ monitor contract:
 - atomic `HDR_OUTPUT_METADATA`, `Colorspace`, and 8-16 `max bpc` properties;
 - adaptive-sync capability on Linux 7.0 and newer, with exactly one synthetic
   vblank per submitted frame, independent of the disabled fixed-rate timer and
-  nominal mode period;
+  nominal mode period; an explicit raw vblank counter preserves the immediate
+  event timestamp without DRM inferring false sequence jumps;
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
 - versioned, read-only presentation and frame-export ioctls so direct KMS
   capture can follow completed scanout changes and import the exact presented
