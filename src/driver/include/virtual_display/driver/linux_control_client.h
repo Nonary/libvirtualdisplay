@@ -36,7 +36,11 @@ namespace virtual_display::driver {
   public:
     explicit LinuxControlClient(
       std::string socket_path = std::string {kDefaultLinuxControlSocketPath},
-      std::chrono::milliseconds timeout = std::chrono::seconds {2}
+      // The socket-activated mutator has a five-second runtime limit plus a
+      // one-second cgroup stop limit. Keep the client deadline strictly later
+      // so a timed-out request can never continue mutating after this call
+      // returns and releases the caller's shutdown fence.
+      std::chrono::milliseconds timeout = std::chrono::seconds {8}
     );
 
     [[nodiscard]] LinuxControlResult query_connector(std::string_view output_name) const;

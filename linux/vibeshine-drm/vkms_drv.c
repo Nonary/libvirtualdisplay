@@ -20,10 +20,12 @@
 #include <linux/fcntl.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/panic.h>
 #include <linux/reboot.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
+#include <linux/timer.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_gem.h>
@@ -76,6 +78,14 @@ MODULE_PARM_DESC(enable_plane_pipeline, "Enable/Disable plane pipeline support")
 static bool create_default_dev = true;
 module_param_named(create_default_dev, create_default_dev, bool, 0444);
 MODULE_PARM_DESC(create_default_dev, "Create or not the default VKMS device");
+
+/*
+ * Seconds a power-off or halt may spend in the kernel's device walk after the
+ * reboot notifier before it is bugchecked into a restart. A restart never
+ * waits at all; see vkms_reboot_notifier(). Filesystems are already synced and
+ * unmounted or read-only at that point, so this only bounds the walk itself.
+ */
+#define VKMS_POWEROFF_DEADLINE_SECS 5U
 
 DEFINE_DRM_GEM_FOPS(vkms_driver_fops);
 
@@ -810,6 +820,54 @@ static const struct attribute_group vkms_device_attr_group = {
 	.attrs = vkms_device_attrs,
 };
 
+/*
+ * The reboot notifier is the last point at which this module runs code with
+ * the system still alive. Everything after it -- device_shutdown() of the
+ * physical GPU drivers in particular -- runs on PID 1 with no timeout and no
+ * way back to userspace. A GPU whose firmware has already faulted (NVIDIA
+ * Xid 38 followed by a locked GPU is the observed case) makes that walk block
+ * forever, and hardware watchdogs are not reliably present or functional.
+ *
+ * A restart therefore does not enter that walk at all: the notifier bugchecks
+ * immediately. panic() records the failure through kmsg_dump()/pstore (and a
+ * loaded crash kernel, if any) and then resets through the same emergency
+ * path as SysRq-B. Filesystems are already synced and unmounted or read-only
+ * by the time reboot notifiers run, so nothing is lost by skipping the walk.
+ *
+ * A power-off or halt still has to reach the firmware, so it is given a short
+ * deadline instead. The timer keeps ticking while PID 1 is stuck in a driver
+ * callback and bugchecks the same way, so a stuck power-off ends in a restart
+ * rather than a hang, which is the recoverable outcome for a streaming host.
+ */
+static void __noreturn vkms_bugcheck(const char *reason)
+{
+	/*
+	 * kernel.panic=0 would leave the panic sitting on the console forever,
+	 * which is the one outcome this path exists to prevent; -1 restarts
+	 * immediately. An explicit positive delay set by the administrator is
+	 * honoured.
+	 */
+	if (panic_timeout == 0)
+		panic_timeout = -1;
+	panic("vibeshine_drm: %s\n", reason);
+}
+
+static void vkms_shutdown_deadline_expired(struct timer_list *timer)
+{
+	(void)timer;
+	vkms_bugcheck("kernel power-off did not complete within the deadline");
+}
+
+static DEFINE_TIMER(vkms_shutdown_deadline_timer, vkms_shutdown_deadline_expired);
+
+static void vkms_arm_shutdown_deadline(void)
+{
+	DRM_INFO("bugchecking into a restart if kernel power-off exceeds %u s\n",
+		 VKMS_POWEROFF_DEADLINE_SECS);
+	mod_timer(&vkms_shutdown_deadline_timer,
+		  jiffies + secs_to_jiffies(VKMS_POWEROFF_DEADLINE_SECS));
+}
+
 static int vkms_reboot_notifier(struct notifier_block *notifier,
 				unsigned long action, void *data)
 {
@@ -817,8 +875,15 @@ static int vkms_reboot_notifier(struct notifier_block *notifier,
 						    struct vkms_device,
 						    reboot_notifier);
 
-	(void)action;
 	(void)data;
+	if (action == SYS_RESTART)
+		vkms_bugcheck("restarting through bugcheck instead of the device shutdown walk");
+
+	/*
+	 * Arm before releasing anything: drm_dev_unplug() below sleeps in
+	 * synchronize_srcu(), and the deadline has to cover that too.
+	 */
+	vkms_arm_shutdown_deadline();
 	DRM_INFO("releasing virtual scanout before system shutdown\n");
 	vkms_shutdown_release(vkmsdev);
 
@@ -872,6 +937,11 @@ int vkms_create(struct vkms_config *config)
 		goto out_devres;
 	}
 
+	/* Every CRTC exposes the same synthetic U32 counter. Configure the
+	 * static device-wide maximum before vblank initialization; the per-CRTC
+	 * runtime setter is only valid while that CRTC is in modeset/off state.
+	 */
+	vkms_device->drm.max_vblank_count = U32_MAX;
 	ret = drm_vblank_init(&vkms_device->drm,
 			      vkms_config_get_num_crtcs(config));
 	if (ret) {
@@ -961,11 +1031,17 @@ static void __exit vkms_exit(void)
 {
 	vkms_configfs_unregister();
 
-	if (!default_config)
-		return;
+	if (default_config) {
+		vkms_destroy(default_config);
+		vkms_config_destroy(default_config);
+	}
 
-	vkms_destroy(default_config);
-	vkms_config_destroy(default_config);
+	/*
+	 * Every reboot notifier is unregistered by now, so nothing can re-arm
+	 * the deadline; shut the timer down so an unload during a shutdown that
+	 * is still completing cannot leave a callback behind.
+	 */
+	timer_shutdown_sync(&vkms_shutdown_deadline_timer);
 }
 
 module_init(vkms_init);

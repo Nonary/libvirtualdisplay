@@ -223,8 +223,9 @@ struct vkms_crtc_state {
  *		      writeback)
  * @composer_state: Protected by @lock, current state of this VKMS output
  * @composer_lock: Lock used internally to protect @composer_state members
- * @synthetic_vblank_counter: Raw 32-bit counter exposed to DRM so immediate
- *                            VRR events never rely on nominal-period inference
+ * @synthetic_vblank_counter: Raw 32-bit counter exposed to DRM so generated
+ *                            VRR events never rely on nominal-period inference,
+ *                            including cancellation races core declines to deliver
  */
 struct vkms_output {
 	struct drm_crtc crtc;

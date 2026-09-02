@@ -18,7 +18,7 @@
 #include "vkms_drv.h"
 #include "vibeshine_drm_compat.h"
 
-static void vkms_crtc_handle_vblank(struct drm_crtc *crtc)
+static bool vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 {
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
 	struct vkms_crtc_state *state;
@@ -30,8 +30,11 @@ static void vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 	atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns());
 	atomic64_inc(&output->synthetic_vblank_counter);
 	ret = drm_crtc_handle_vblank(crtc);
-	if (!ret)
-		DRM_ERROR("vkms failure on handling vblank");
+	if (!ret) {
+		spin_unlock(&output->lock);
+		dma_fence_end_signalling(fence_cookie);
+		return false;
+	}
 
 	state = output->composer_state;
 	spin_unlock(&output->lock);
@@ -58,14 +61,13 @@ static void vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 	}
 
 	dma_fence_end_signalling(fence_cookie);
-
+	return true;
 }
 
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 static bool vkms_crtc_handle_vblank_timeout(struct drm_crtc *crtc)
 {
-	vkms_crtc_handle_vblank(crtc);
-	return true;
+	return vkms_crtc_handle_vblank(crtc);
 }
 #else
 static enum hrtimer_restart vkms_vblank_simulate(struct hrtimer *timer)
@@ -79,9 +81,8 @@ static enum hrtimer_restart vkms_vblank_simulate(struct hrtimer *timer)
 	if (ret_overrun != 1)
 		pr_warn("%s: vblank timer overrun\n", __func__);
 
-	vkms_crtc_handle_vblank(&output->crtc);
-
-	return HRTIMER_RESTART;
+	return vkms_crtc_handle_vblank(&output->crtc) ?
+		HRTIMER_RESTART : HRTIMER_NORESTART;
 }
 
 static int vkms_enable_vblank(struct drm_crtc *crtc)
@@ -171,8 +172,8 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 		return drm_crtc_vblank_helper_get_vblank_timestamp_from_timer(
 			crtc, max_error, vblank_time, in_vblank_irq);
 
-	/* The explicit synthetic counter advances exactly once per delivered
-	 * event, so the real immediate timestamp cannot make DRM infer zero or
+	/* The explicit synthetic counter advances exactly once per generated
+	 * event attempt, so the real immediate timestamp cannot make DRM infer zero or
 	 * several nominal-period vblanks.
 	 */
 	(void)in_vblank_irq;
@@ -426,7 +427,6 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);
 	atomic64_set(&vkms_out->synthetic_vblank_counter, 0);
-	drm_crtc_set_max_vblank_count(crtc, U32_MAX);
 	atomic64_set(&vkms_out->vrr_vblank_timestamp_ns, 0);
 	atomic64_set(&vkms_out->present_sequence, 0);
 	atomic_set(&vkms_out->pending_commits, 0);

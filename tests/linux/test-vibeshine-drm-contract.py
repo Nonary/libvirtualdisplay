@@ -214,10 +214,10 @@ def validate_source_contract(driver_root: Path) -> None:
         ".get_vblank_counter     = vkms_crtc_get_vblank_counter",
         "atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns())",
         "atomic64_inc(&output->synthetic_vblank_counter)",
-        "drm_crtc_set_max_vblank_count(crtc, U32_MAX)",
         "atomic64_set(&vkms_output->vrr_vblank_timestamp_ns",
         "*vblank_time = ns_to_ktime(timestamp_ns)",
-        "vkms_crtc_handle_vblank_timeout(crtc)",
+        "return vkms_crtc_handle_vblank(crtc)",
+        "HRTIMER_RESTART : HRTIMER_NORESTART",
         "vkms_crtc_atomic_enable",
         "drm_crtc_vblank_start_timer(crtc)",
     ):
@@ -230,6 +230,12 @@ def validate_source_contract(driver_root: Path) -> None:
         crtc.index("drm_crtc_handle_vblank(crtc)"),
         "synthetic vblank timestamp and counter are not published before delivery",
     )
+    require("drm_crtc_set_max_vblank_count" not in crtc,
+            "static synthetic counters still use the runtime per-CRTC vblank setter")
+    failed_delivery = crtc.index("if (!ret) {", crtc.index("drm_crtc_handle_vblank(crtc)"))
+    composer_read = crtc.index("state = output->composer_state", failed_delivery)
+    require(failed_delivery < crtc.index("return false;", failed_delivery) < composer_read,
+            "rejected vblank delivery can still queue composer work")
     for needle in (
         "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
         "obj->import_attach->dmabuf",
@@ -242,8 +248,35 @@ def validate_source_contract(driver_root: Path) -> None:
         "vkms_reboot_notifier",
         "quiesce_store",
         "vkms_crtc_release_presented_frame",
+        "vkms_device->drm.max_vblank_count = U32_MAX",
+        "#define VKMS_POWEROFF_DEADLINE_SECS 5U",
+        "static void __noreturn vkms_bugcheck(const char *reason)",
+        "if (panic_timeout == 0)\n\t\tpanic_timeout = -1;",
+        'panic("vibeshine_drm: %s\\n", reason);',
+        "static DEFINE_TIMER(vkms_shutdown_deadline_timer, vkms_shutdown_deadline_expired);",
+        "timer_shutdown_sync(&vkms_shutdown_deadline_timer);",
     ):
         require_source(drv, needle, drv_path.name)
+    require("module_param_named(shutdown_deadline_secs" not in drv,
+            "the restart bugcheck must not be optional")
+    notifier_start = drv.index("static int vkms_reboot_notifier(")
+    notifier_end = drv.index("return NOTIFY_DONE;", notifier_start)
+    notifier = drv[notifier_start:notifier_end]
+    restart_check = notifier.find("if (action == SYS_RESTART)\n\t\tvkms_bugcheck(")
+    require(restart_check >= 0, "a restart does not bugcheck immediately in the reboot notifier")
+    require(
+        restart_check < notifier.index("vkms_arm_shutdown_deadline();") <
+        notifier.index("vkms_shutdown_release(vkmsdev);"),
+        "power-off does not arm the bugcheck deadline before releasing the device",
+    )
+    exit_body = drv[drv.index("static void __exit vkms_exit(void)"):drv.index("module_init(vkms_init);")]
+    require("timer_shutdown_sync(&vkms_shutdown_deadline_timer);" in exit_body,
+            "module exit does not shut the bugcheck deadline timer down")
+    require(
+        drv.index("vkms_device->drm.max_vblank_count = U32_MAX") <
+        drv.index("drm_vblank_init(&vkms_device->drm"),
+        "device-wide synthetic counter maximum is not configured before vblank initialization",
+    )
     require(
         re.search(
             r"static int vkms_wait_present_ioctl\(.*?"

@@ -2,6 +2,10 @@
 Description=Vibeshine virtual-display control connection
 Requires=vibeshine-vkms.service
 After=vibeshine-vkms.service
+# Let an admitted connector request finish before the machine host completes
+# its shutdown fence; the bounded request cgroup still ends before the
+# client's longer protocol deadline.
+Before=vibeshine.service
 
 [Service]
 Type=exec
@@ -12,6 +16,9 @@ StandardOutput=socket
 StandardError=journal
 UMask=0077
 RuntimeMaxSec=5s
+TimeoutStopSec=1s
+KillMode=control-group
+SendSIGKILL=yes
 MemoryMax=32M
 TasksMax=16
 NoNewPrivileges=yes

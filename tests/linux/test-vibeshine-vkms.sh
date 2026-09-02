@@ -42,6 +42,9 @@ grep -Fxq 'SocketGroup=vibeshine-vkms' "$SOCKET_UNIT" || fail 'control socket mu
 grep -Fxq 'MaxConnections=16' "$SOCKET_UNIT" || fail 'control socket must cap concurrent root helpers'
 grep -Fxq 'MaxConnectionsPerSource=4' "$SOCKET_UNIT" || fail 'control socket must cap each peer source'
 grep -Fxq 'RuntimeMaxSec=5s' "$CONNECTION_SERVICE" || fail 'control helper must have a runtime deadline'
+grep -Fxq 'TimeoutStopSec=1s' "$CONNECTION_SERVICE" || fail 'control helper must have a bounded stop deadline'
+grep -Fxq 'KillMode=control-group' "$CONNECTION_SERVICE" || fail 'control helper must revoke its complete request cgroup'
+grep -Fxq 'SendSIGKILL=yes' "$CONNECTION_SERVICE" || fail 'control helper must not outlive the client mutation deadline'
 grep -Fxq 'MemoryMax=32M' "$CONNECTION_SERVICE" || fail 'control helper must have a memory ceiling'
 grep -Fxq 'SuccessExitStatus=4 5' "$SETUP_SERVICE" || fail 'expected reboot and enrollment outcomes must not latch setup failed'
 if grep -Fq 'TriggerLimit' "$SOCKET_UNIT"; then

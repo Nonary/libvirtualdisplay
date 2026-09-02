@@ -680,7 +680,7 @@ mutate_connector() (
     printf 'ERROR connector lease unavailable\n'
     return 1
   fi
-  if ! exec {lock_fd}>>"$lock_path" || ! flock -x "$lock_fd"; then
+  if ! exec {lock_fd}>>"$lock_path" || ! flock -x -w 1 "$lock_fd"; then
     error "could not lock connector lease: ${lock_path}"
     printf 'ERROR connector lease unavailable\n'
     return 1
