@@ -27,6 +27,10 @@ namespace {
   std::atomic<drm_get_device2_fn> real_drm_get_device2 {nullptr};
   std::atomic<drm_get_device_from_dev_id_fn> real_drm_get_device_from_dev_id {nullptr};
   std::atomic<bool> gpu_attachment_logged {false};
+  // The library is trusted by the secure-mode loader, so any set-user-ID
+  // program could be started with it preloaded. Every hook stays a plain
+  // pass-through unless this process is the KWin compositor itself.
+  std::atomic<bool> hooks_enabled {false};
   std::atomic<bool> ambiguous_gpu_logged {false};
   std::mutex metadata_mutex;
   drmPciBusInfo stable_bus_info {};
@@ -250,12 +254,16 @@ namespace {
     }
 
     // The desktop service starts an unprivileged wrapper which must pass the
-    // preload to KWin. Remove it only after the real compositor has loaded the
-    // bridge so applications launched by KWin never inherit it.
+    // preload to KWin. Enable the bridge only inside the real compositor and
+    // remove the preload from its environment so applications launched by
+    // KWin never inherit it. The secure-mode loader already strips LD_PRELOAD
+    // for the capability-bearing KWin; this also covers a KWin started
+    // without the capability.
     if (!running_inside_kwin()) {
       return;
     }
 
+    hooks_enabled.store(true, std::memory_order_release);
     (void)unsetenv("LD_PRELOAD");
     (void)unsetenv(kPreloadActiveEnvironment.data());
   }
@@ -270,7 +278,7 @@ extern "C" int drmGetDevices2(const std::uint32_t flags, drmDevicePtr devices[],
   }
 
   const auto count = function(flags, devices, max_devices);
-  if (count > 0 && devices) {
+  if (count > 0 && devices && hooks_enabled.load(std::memory_order_acquire)) {
     attach_vibeshine_displays_to_nvidia(devices, count);
   }
   return count;
@@ -285,7 +293,7 @@ extern "C" int drmGetDevice2(const int fd, const std::uint32_t flags,
   }
 
   const auto result = function(fd, flags, device);
-  if (result == 0 && device && *device) {
+  if (result == 0 && device && *device && hooks_enabled.load(std::memory_order_acquire)) {
     attach_vibeshine_display_to_nvidia(*device);
   }
   return result;
@@ -303,12 +311,12 @@ extern "C" int drmGetDeviceFromDevId(const dev_t device_id, const std::uint32_t 
   }
 
   const auto result = function(device_id, flags, device);
-  if (result == 0 && device && *device) {
+  if (result == 0 && device && *device && hooks_enabled.load(std::memory_order_acquire)) {
     attach_vibeshine_display_to_nvidia(*device);
   }
   return result;
 }
 
 extern "C" unsigned int vibeshine_kwin_gpu_interposer_abi() {
-  return 3;
+  return 4;
 }

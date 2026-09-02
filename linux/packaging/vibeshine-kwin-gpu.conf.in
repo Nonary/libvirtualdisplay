@@ -1,6 +1,9 @@
-# KDE's wrapper passes this root-owned GPU bridge to KWin. The bridge removes
-# itself from KWin's environment before the compositor starts child processes.
+# KDE's wrapper passes this GPU bridge to KWin. KWin carries cap_sys_nice, so
+# the loader runs in secure mode and only honours a bare library name that
+# resolves to a set-user-ID file in the trusted system library directory.
+# The loader drops LD_PRELOAD from the environment before main() runs, so
+# compositor children never inherit the bridge.
 [Service]
 UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PROFILE LD_SHOW_AUXV
-Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_PATH@
+Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_NAME@
 Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1

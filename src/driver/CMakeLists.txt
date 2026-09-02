@@ -30,8 +30,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     # Associate the display-only virtual KMS node with KWin's NVIDIA renderer
     # so GBM allocates scanout on the GPU rather than through kms_swrast.
     find_package(PkgConfig REQUIRED)
+    include(GNUInstallDirs)
     pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_DRM REQUIRED IMPORTED_TARGET libdrm)
-    pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_CAP REQUIRED IMPORTED_TARGET libcap)
 
     add_library(vibeshine_kwin_gpu SHARED
             "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_gpu_interposer.cpp")
@@ -42,24 +42,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
             PkgConfig::LIBVIRTUALDISPLAY_KWIN_DRM
             ${CMAKE_DL_LIBS})
 
-    add_executable(vibeshine_kwin_capability
-            "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_capability.c")
-    set_target_properties(vibeshine_kwin_capability PROPERTIES
-            OUTPUT_NAME vibeshine-kwin-capability)
-    target_link_libraries(vibeshine_kwin_capability PRIVATE
-            PkgConfig::LIBVIRTUALDISPLAY_KWIN_CAP)
-
-    # These are root-owned integration artifacts. Keep them independent of a
-    # user-selected executable prefix so the systemd user unit cannot point at
-    # a stale or user-writable library after package installation.
-    set(VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR "/usr/lib/vibeshine" CACHE PATH
-            "System directory for the Vibeshine KWin GPU bridge")
+    # The distro KWin binary carries cap_sys_nice, so the dynamic loader runs it
+    # in secure-execution mode and ignores LD_PRELOAD paths. glibc's documented
+    # exception is a bare library name resolved from the trusted system library
+    # directory whose file carries the set-user-ID bit. Install the bridge that
+    # way instead of stripping KWin's capability: KWin keeps realtime
+    # scheduling and the vendor binary is never modified. The bit is a trust
+    # marker only; a shared object is never executed with it.
+    set(VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR "${CMAKE_INSTALL_FULL_LIBDIR}" CACHE PATH
+            "Trusted system library directory for the Vibeshine KWin GPU bridge")
     set(VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR "/usr/lib/systemd/user" CACHE PATH
             "Systemd user-unit directory for the Vibeshine KWin GPU bridge drop-in")
-    set(VIBESHINE_KWIN_GPU_HELPER_INSTALL_DIR "/usr/libexec/vibeshine" CACHE PATH
-            "System directory for the Vibeshine KWin capability helper")
-    set(VIBESHINE_KWIN_GPU_LIBRARY_PATH
-            "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}/libvibeshine-kwin-gpu.so")
+    set(VIBESHINE_KWIN_GPU_LIBRARY_NAME "libvibeshine-kwin-gpu.so")
     configure_file(
             "${LIBVIRTUALDISPLAY_LINUX_ROOT}/packaging/vibeshine-kwin-gpu.conf.in"
             "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf" @ONLY)
@@ -68,9 +62,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
             "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-login-kwin-gpu.conf" @ONLY)
 
     install(TARGETS vibeshine_kwin_gpu
-            LIBRARY DESTINATION "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}")
-    install(TARGETS vibeshine_kwin_capability
-            RUNTIME DESTINATION "${VIBESHINE_KWIN_GPU_HELPER_INSTALL_DIR}")
+            LIBRARY DESTINATION "${VIBESHINE_KWIN_GPU_LIBRARY_INSTALL_DIR}"
+            PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+                        WORLD_READ WORLD_EXECUTE SETUID)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/vibeshine-kwin-gpu.conf"
             DESTINATION
             "${VIBESHINE_KWIN_GPU_SYSTEMD_USER_INSTALL_DIR}/plasma-kwin_wayland.service.d")

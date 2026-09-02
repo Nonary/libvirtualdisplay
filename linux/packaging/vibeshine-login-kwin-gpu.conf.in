@@ -1,6 +1,7 @@
-# Plasma Login starts KWin directly. Scope the same root-owned GPU bridge to
-# the compositor; it removes itself from the environment before child launch.
+# Plasma Login starts KWin directly. Scope the same trusted GPU bridge to the
+# greeter compositor by bare name; the secure-mode loader validates the
+# set-user-ID library in the system directory and drops LD_PRELOAD afterwards.
 [Service]
 UnsetEnvironment=LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PROFILE LD_SHOW_AUXV
-Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_PATH@
+Environment=LD_PRELOAD=@VIBESHINE_KWIN_GPU_LIBRARY_NAME@
 Environment=VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE=1
