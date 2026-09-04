@@ -39,6 +39,7 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
+#include <drm/drm_prime.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_vblank.h>
@@ -217,6 +218,41 @@ static int vkms_export_read_fence(struct dma_buf *dma_buf)
 	return fd;
 }
 
+static struct dma_buf *vkms_get_frame_dmabuf(struct drm_file *file_priv,
+					  struct drm_gem_object *obj)
+{
+	struct dma_buf *dma_buf;
+	u32 handle;
+	int ret;
+
+	if (!obj)
+		return ERR_PTR(-EINVAL);
+
+	if (obj->import_attach) {
+		dma_buf = obj->import_attach->dmabuf;
+		if (!dma_buf)
+			return ERR_PTR(-EINVAL);
+		get_dma_buf(dma_buf);
+		return dma_buf;
+	}
+
+	/*
+	 * Software compositors scan out native shmem objects rather than imported
+	 * GPU buffers. Use PRIME's handle path so its locking, export cache and
+	 * GEM/device references also apply to these completed framebuffers. The
+	 * temporary handle is private to this call; the returned DMA-BUF owns its
+	 * own reference after the handle is deleted.
+	 */
+	ret = drm_gem_handle_create(file_priv, obj, &handle);
+	if (ret)
+		return ERR_PTR(ret);
+
+	dma_buf = drm_gem_prime_handle_to_dmabuf(obj->dev, file_priv, handle,
+					       DRM_CLOEXEC | DRM_RDWR);
+	drm_gem_handle_delete(file_priv, handle);
+	return dma_buf;
+}
+
 static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv)
 {
@@ -273,13 +309,12 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, i);
 		struct dma_buf *dma_buf;
 
-		if (!obj || !obj->import_attach || !obj->import_attach->dmabuf) {
-			ret = -EXDEV;
+		dma_buf = vkms_get_frame_dmabuf(file_priv, obj);
+		if (IS_ERR(dma_buf)) {
+			ret = PTR_ERR(dma_buf);
 			goto out;
 		}
 
-		dma_buf = obj->import_attach->dmabuf;
-		get_dma_buf(dma_buf);
 		request->dma_buf_fds[i] = dma_buf_fd(dma_buf, O_CLOEXEC);
 		if (request->dma_buf_fds[i] < 0) {
 			dma_buf_put(dma_buf);

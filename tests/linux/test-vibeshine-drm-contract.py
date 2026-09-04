@@ -104,6 +104,93 @@ int main(void) { return 0; }
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_frame_export(driver_root: Path) -> None:
+    """Exercise the actual export helper with kernel ownership APIs stubbed."""
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    start = driver.index("static struct dma_buf *vkms_get_frame_dmabuf(")
+    end = driver.index("static int vkms_get_frame_ioctl(", start)
+    helper = driver[start:end]
+    source = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stddef.h>
+typedef unsigned int u32;
+#define DRM_CLOEXEC 1
+#define DRM_RDWR 2
+#define ERR_PTR(error) ((void *)(intptr_t)(error))
+struct dma_buf { int references; } native_buffer, imported_buffer;
+struct dma_buf_attachment { struct dma_buf *dmabuf; } attachment;
+struct drm_device { int unused; } device;
+struct drm_file { int unused; } file;
+struct drm_gem_object {
+    struct dma_buf_attachment *import_attach;
+    struct drm_device *dev;
+};
+static int create_error, export_error, live_handles, create_calls, export_calls;
+static void get_dma_buf(struct dma_buf *buffer) { ++buffer->references; }
+static int drm_gem_handle_create(struct drm_file *f, struct drm_gem_object *o, u32 *h) {
+    assert(f == &file && o->dev == &device);
+    ++create_calls;
+    if (create_error) return create_error;
+    ++live_handles;
+    *h = 123;
+    return 0;
+}
+static struct dma_buf *drm_gem_prime_handle_to_dmabuf(struct drm_device *d,
+        struct drm_file *f, u32 h, u32 flags) {
+    assert(d == &device && f == &file && h == 123 && live_handles == 1);
+    assert(flags == (DRM_CLOEXEC | DRM_RDWR));
+    ++export_calls;
+    if (export_error) return ERR_PTR(export_error);
+    get_dma_buf(&native_buffer);
+    return &native_buffer;
+}
+static int drm_gem_handle_delete(struct drm_file *f, u32 h) {
+    assert(f == &file && h == 123 && live_handles == 1);
+    --live_handles;
+    return 0;
+}
+""" + helper + r"""
+int main(void) {
+    struct drm_gem_object obj = { .dev = &device };
+    assert(vkms_get_frame_dmabuf(&file, NULL) == ERR_PTR(-EINVAL));
+    assert(create_calls == 0);
+
+    attachment.dmabuf = &imported_buffer;
+    obj.import_attach = &attachment;
+    assert(vkms_get_frame_dmabuf(&file, &obj) == &imported_buffer);
+    assert(imported_buffer.references == 1 && create_calls == 0 && export_calls == 0);
+    attachment.dmabuf = NULL;
+    assert(vkms_get_frame_dmabuf(&file, &obj) == ERR_PTR(-EINVAL));
+    assert(create_calls == 0);
+
+    obj.import_attach = NULL;
+    assert(vkms_get_frame_dmabuf(&file, &obj) == &native_buffer);
+    assert(native_buffer.references == 1 && live_handles == 0);
+    assert(create_calls == 1 && export_calls == 1);
+
+    create_error = -ENOMEM;
+    assert(vkms_get_frame_dmabuf(&file, &obj) == ERR_PTR(-ENOMEM));
+    assert(live_handles == 0 && export_calls == 1 && native_buffer.references == 1);
+    create_error = 0;
+    export_error = -EIO;
+    assert(vkms_get_frame_dmabuf(&file, &obj) == ERR_PTR(-EIO));
+    assert(live_handles == 0 && export_calls == 2 && native_buffer.references == 1);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-export-") as temporary_dir:
+        source_path = Path(temporary_dir) / "frame-export.c"
+        binary_path = Path(temporary_dir) / "frame-export"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             str(source_path), "-o", str(binary_path)], check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
 def validate_source_contract(driver_root: Path) -> None:
     compat_path = driver_root / "vibeshine_drm_compat.h"
     connector_path = driver_root / "vkms_connector.c"
@@ -336,6 +423,7 @@ def main() -> int:
 
     validate_source_contract(driver_root)
     validate_uapi_layout(driver_root)
+    validate_frame_export(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
 
