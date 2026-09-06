@@ -16,6 +16,7 @@
 #include <drm/drm_writeback.h>
 
 #include "vibeshine_drm_compat.h"
+#include "vibeshine_drm_uapi.h"
 
 #define DEFAULT_DEVICE_NAME "vkms"
 
@@ -31,6 +32,7 @@
 #define NUM_OVERLAY_PLANES 8
 
 #define VKMS_LUT_SIZE 256
+#define VIBESHINE_DRM_TRACE_HISTORY_SIZE 4096U
 
 /**
  * struct vkms_frame_info - Structure to store the state of a frame
@@ -217,6 +219,7 @@ struct vkms_crtc_state {
  * @wb_connecter: DRM writeback connector used for this output
  * @vblank_hrtimer: Timer used to trigger vblank on kernels before Linux 7.0
  * @period_ns: vblank period used by @vblank_hrtimer on kernels before Linux 7.0
+ * @vrr_hrtimer: One-shot timer enforcing the mode's maximum VRR refresh rate
  * @composer_workq: Ordered workqueue for @composer_state.composer_work.
  * @lock: Lock used to protect concurrent access to the composer
  * @composer_enabled: Protected by @lock, true when the VKMS composer is active (crc needed or
@@ -234,6 +237,9 @@ struct vkms_output {
 #if !VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct hrtimer vblank_hrtimer;
 	ktime_t period_ns;
+#endif
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
+	struct hrtimer vrr_hrtimer;
 #endif
 	struct workqueue_struct *composer_workq;
 	spinlock_t lock;
@@ -256,6 +262,8 @@ struct vkms_output {
 	unsigned int present_waiters;
 	spinlock_t present_lock;
 	wait_queue_head_t present_waitq;
+
+	struct vibeshine_drm_trace_event *present_trace;
 };
 
 struct vkms_config;

@@ -18,6 +18,7 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fcntl.h>
+#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/panic.h>
@@ -49,6 +50,7 @@
 #include "vkms_drv.h"
 #include "vibeshine_drm_change.h"
 #include "vibeshine_drm_present.h"
+#include "vibeshine_drm_vrr.h"
 #include "vibeshine_drm_uapi.h"
 #include "vibeshine_drm_compat.h"
 #include "vibeshine_drm_version.h"
@@ -96,6 +98,9 @@ DEFINE_DRM_GEM_FOPS(vkms_driver_fops);
 #define DRM_IOCTL_VIBESHINE_GET_FRAME \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_GET_FRAME, \
 		 struct vibeshine_drm_frame)
+#define DRM_IOCTL_VIBESHINE_GET_PRESENT_TRACE \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_GET_PRESENT_TRACE, \
+		 struct vibeshine_drm_present_trace)
 
 static int vkms_wait_present_ioctl(struct drm_device *dev, void *data,
 				   struct drm_file *file_priv)
@@ -170,6 +175,72 @@ static bool vkms_frame_request_valid(const struct vibeshine_drm_frame *request)
 	};
 
 	return !memcmp(request, &expected, sizeof(expected));
+}
+
+static bool
+vkms_present_trace_request_valid(const struct vibeshine_drm_present_trace *request)
+{
+	struct vibeshine_drm_present_trace expected = {
+		.abi_version = VIBESHINE_DRM_TRACE_ABI_VERSION,
+		.crtc_id = request->crtc_id,
+		.after_sequence = request->after_sequence,
+	};
+
+	return !memcmp(request, &expected, sizeof(expected));
+}
+
+static int vkms_get_present_trace_ioctl(struct drm_device *dev, void *data,
+					struct drm_file *file_priv)
+{
+	struct vibeshine_drm_present_trace *request = data;
+	struct vkms_output *output;
+	struct drm_crtc *crtc;
+	u64 current_sequence;
+	u64 first_sequence;
+	u64 sequence;
+
+	if (!vkms_present_trace_request_valid(request))
+		return -EINVAL;
+	if (request->after_sequence == U64_MAX)
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EACCES;
+
+	crtc = drm_crtc_find(dev, file_priv, request->crtc_id);
+	if (!crtc)
+		return -ENOENT;
+
+	output = drm_crtc_to_vkms_output(crtc);
+	spin_lock_irq(&output->present_lock);
+	current_sequence = atomic64_read(&output->present_sequence);
+	first_sequence = request->after_sequence + 1;
+	if (current_sequence >= VIBESHINE_DRM_TRACE_HISTORY_SIZE) {
+		u64 oldest_sequence = current_sequence - VIBESHINE_DRM_TRACE_HISTORY_SIZE + 1;
+
+		if (first_sequence < oldest_sequence) {
+			first_sequence = oldest_sequence;
+			request->flags |= VIBESHINE_DRM_TRACE_OVERFLOW;
+		}
+	}
+
+	request->newest_sequence = current_sequence;
+	for (sequence = first_sequence;
+	     sequence <= current_sequence &&
+	     request->count < VIBESHINE_DRM_TRACE_MAX_EVENTS;
+	     ++sequence) {
+		const struct vibeshine_drm_trace_event *event =
+			&output->present_trace[(sequence - 1) %
+					       VIBESHINE_DRM_TRACE_HISTORY_SIZE];
+
+		if (event->sequence != sequence) {
+			request->flags |= VIBESHINE_DRM_TRACE_OVERFLOW;
+			continue;
+		}
+		request->events[request->count++] = *event;
+	}
+	spin_unlock_irq(&output->present_lock);
+
+	return 0;
 }
 
 static void vkms_close_frame_fds(struct vibeshine_drm_frame *frame)
@@ -348,6 +419,7 @@ out:
 static const struct drm_ioctl_desc vkms_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VIBESHINE_WAIT_PRESENT, vkms_wait_present_ioctl, 0),
 	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_PRESENT_TRACE, vkms_get_present_trace_ioctl, 0),
 };
 
 static bool vkms_commit_touches_crtc(struct drm_atomic_commit *state,
@@ -529,6 +601,31 @@ static bool vkms_commit_changes_crtc(struct drm_atomic_commit *state,
 	return false;
 }
 
+static void vkms_wait_for_vrr_presentation_slot(struct drm_crtc *crtc,
+						 struct vkms_output *output)
+{
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	ktime_t expires;
+	u64 deadline_ns;
+	u64 previous_ns;
+	u64 period_ns;
+	u64 now_ns;
+
+	period_ns = max_t(int, READ_ONCE(vblank->framedur_ns), 0);
+	spin_lock_irq(&output->present_lock);
+	previous_ns = output->present_timestamp_ns;
+	spin_unlock_irq(&output->present_lock);
+
+	now_ns = ktime_get_ns();
+	deadline_ns = vibeshine_drm_vrr_presentation_deadline_ns(
+		previous_ns, now_ns, period_ns);
+	while (deadline_ns > now_ns) {
+		expires = ns_to_ktime(deadline_ns);
+		schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
+		now_ns = ktime_get_ns();
+	}
+}
+
 static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
@@ -548,19 +645,29 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		output = drm_crtc_to_vkms_output(crtc);
 		primary_state = drm_atomic_get_new_plane_state(state, crtc->primary);
 		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+		if (scanout_changed && crtc_state && crtc_state->active &&
+		    crtc_state->vrr_enabled)
+			vkms_wait_for_vrr_presentation_slot(crtc, output);
 		if (primary_state && primary_state->fb && primary_state->visible) {
 			new_present_fb = primary_state->fb;
 			drm_framebuffer_get(new_present_fb);
 		}
 		spin_lock_irq(&output->present_lock);
 		if (scanout_changed) {
+			u64 completed_sequence;
+			struct vibeshine_drm_trace_event *trace_event;
+
 			if (primary_state || (crtc_state && !crtc_state->active)) {
 				old_present_fb = output->present_fb;
 				output->present_fb = new_present_fb;
 				new_present_fb = NULL;
 			}
 			output->present_timestamp_ns = ktime_get_ns();
-			atomic64_inc(&output->present_sequence);
+			completed_sequence = atomic64_inc_return(&output->present_sequence);
+			trace_event = &output->present_trace[(completed_sequence - 1) %
+							 VIBESHINE_DRM_TRACE_HISTORY_SIZE];
+			trace_event->sequence = completed_sequence;
+			trace_event->timestamp_ns = output->present_timestamp_ns;
 		}
 		if (WARN_ON_ONCE(atomic_read(&output->pending_commits) <= 0))
 			atomic_set(&output->pending_commits, 0);

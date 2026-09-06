@@ -89,6 +89,13 @@ _Static_assert(offsetof(struct vibeshine_drm_frame, modifier) == 40, "unexpected
 _Static_assert(offsetof(struct vibeshine_drm_frame, dma_buf_fds) == 52, "unexpected fd offset");
 _Static_assert(offsetof(struct vibeshine_drm_frame, sync_file_fds) == 100, "unexpected fence offset");
 _Static_assert(offsetof(struct vibeshine_drm_frame, reserved) == 120, "unexpected frame reserved offset");
+_Static_assert(sizeof(struct vibeshine_drm_trace_event) == 16, "unexpected trace event size");
+_Static_assert(sizeof(struct vibeshine_drm_present_trace) == 1088, "unexpected trace ABI size");
+_Static_assert(offsetof(struct vibeshine_drm_present_trace, after_sequence) == 8, "unexpected trace cursor offset");
+_Static_assert(offsetof(struct vibeshine_drm_present_trace, newest_sequence) == 16, "unexpected trace newest offset");
+_Static_assert(offsetof(struct vibeshine_drm_present_trace, count) == 24, "unexpected trace count offset");
+_Static_assert(offsetof(struct vibeshine_drm_present_trace, events) == 32, "unexpected trace events offset");
+_Static_assert(offsetof(struct vibeshine_drm_present_trace, reserved) == 1056, "unexpected trace reserved offset");
 
 int main(void) { return 0; }
 """
@@ -290,7 +297,9 @@ def validate_source_contract(driver_root: Path) -> None:
     )
     require_source(driver_header, "bool frame_mapped", driver_header_path.name)
     require_source(driver_header, "struct drm_framebuffer *present_fb", driver_header_path.name)
+    require_source(driver_header, "struct vibeshine_drm_trace_event *present_trace", driver_header_path.name)
     require_source(driver_header, "atomic64_t synthetic_vblank_counter", driver_header_path.name)
+    require_source(driver_header, "struct hrtimer vrr_hrtimer", driver_header_path.name)
     require_source(driver_header, "struct mutex shutdown_lock", driver_header_path.name)
     require_source(driver_header, "struct notifier_block reboot_notifier", driver_header_path.name)
     for needle in (
@@ -307,6 +316,9 @@ def validate_source_contract(driver_root: Path) -> None:
         "HRTIMER_RESTART : HRTIMER_NORESTART",
         "vkms_crtc_atomic_enable",
         "drm_crtc_vblank_start_timer(crtc)",
+        "vkms_schedule_vrr_vblank(crtc)",
+        "hrtimer_start(&output->vrr_hrtimer, ns_to_ktime(deadline_ns)",
+        "hrtimer_cancel(&output->vrr_hrtimer)",
     ):
         require_source(crtc, needle, crtc_path.name)
     require("if (in_vblank_irq)\n\t\treturn false" not in crtc,
@@ -319,15 +331,19 @@ def validate_source_contract(driver_root: Path) -> None:
     )
     require("drm_crtc_set_max_vblank_count" not in crtc,
             "static synthetic counters still use the runtime per-CRTC vblank setter")
+    require("if (vrr_flip) {\n\t\tvkms_crtc_handle_vblank_timeout(crtc);" not in crtc,
+            "VRR flips still bypass the mode's maximum refresh interval")
     failed_delivery = crtc.index("if (!ret) {", crtc.index("drm_crtc_handle_vblank(crtc)"))
     composer_read = crtc.index("state = output->composer_state", failed_delivery)
     require(failed_delivery < crtc.index("return false;", failed_delivery) < composer_read,
             "rejected vblank delivery can still queue composer work")
     for needle in (
         "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
+        "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_PRESENT_TRACE, vkms_get_present_trace_ioctl, 0)",
         "obj->import_attach->dmabuf",
         "dma_buf_fd(dma_buf, O_CLOEXEC)",
         "drm_framebuffer_get(new_present_fb)",
+        "vkms_wait_for_vrr_presentation_slot(crtc, output)",
         "capable(CAP_SYS_ADMIN)",
         "static bool enable_cursor;",
         "devm_register_reboot_notifier",
@@ -344,6 +360,11 @@ def validate_source_contract(driver_root: Path) -> None:
         "timer_shutdown_sync(&vkms_shutdown_deadline_timer);",
     ):
         require_source(drv, needle, drv_path.name)
+    require(
+        drv.index("vkms_wait_for_vrr_presentation_slot(crtc, output)") <
+        drv.index("output->present_timestamp_ns = ktime_get_ns()"),
+        "capture presentation is published before the VRR maximum-rate wait",
+    )
     require("module_param_named(shutdown_deadline_secs" not in drv,
             "the restart bugcheck must not be optional")
     notifier_start = drv.index("static int vkms_reboot_notifier(")

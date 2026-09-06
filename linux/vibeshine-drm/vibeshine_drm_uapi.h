@@ -8,6 +8,7 @@
 /* Driver-private DRM command indices start at DRM_COMMAND_BASE. */
 #define DRM_VIBESHINE_WAIT_PRESENT 0x00
 #define DRM_VIBESHINE_GET_FRAME 0x01
+#define DRM_VIBESHINE_GET_PRESENT_TRACE 0x02
 
 #define VIBESHINE_DRM_PRESENT_ABI_VERSION 1
 #define VIBESHINE_DRM_PRESENT_MAX_TIMEOUT_MS 1000
@@ -21,6 +22,40 @@
 
 #define VIBESHINE_DRM_FRAME_READY (1U << 0)
 #define VIBESHINE_DRM_FRAME_EMPTY (1U << 1)
+
+#define VIBESHINE_DRM_TRACE_ABI_VERSION 1
+#define VIBESHINE_DRM_TRACE_MAX_EVENTS 64
+#define VIBESHINE_DRM_TRACE_OVERFLOW (1U << 0)
+
+struct vibeshine_drm_trace_event {
+	__u64 sequence;
+	__u64 timestamp_ns;
+};
+
+/**
+ * struct vibeshine_drm_present_trace - drain completed presentation history
+ * @abi_version: must be VIBESHINE_DRM_TRACE_ABI_VERSION
+ * @crtc_id: DRM object ID of the target CRTC
+ * @after_sequence: in: last trace sequence consumed by this caller
+ * @newest_sequence: out: newest sequence present when the snapshot was taken
+ * @count: out: number of valid entries in @events
+ * @flags: out: VIBESHINE_DRM_TRACE_* flags
+ * @events: out: ordered presentation events newer than @after_sequence
+ * @reserved: must be zero
+ *
+ * The diagnostic history is bounded. OVERFLOW means events older than the
+ * first returned entry were overwritten before the caller drained them.
+ */
+struct vibeshine_drm_present_trace {
+	__u32 abi_version;
+	__u32 crtc_id;
+	__u64 after_sequence;
+	__u64 newest_sequence;
+	__u32 count;
+	__u32 flags;
+	struct vibeshine_drm_trace_event events[VIBESHINE_DRM_TRACE_MAX_EVENTS];
+	__u64 reserved[4];
+};
 
 /**
  * struct vibeshine_drm_wait_present - wait for a changed CRTC scanout
