@@ -621,6 +621,8 @@ static void vkms_wait_for_vrr_presentation_slot(struct drm_crtc *crtc,
 		previous_ns, now_ns, period_ns);
 	while (deadline_ns > now_ns) {
 		expires = ns_to_ktime(deadline_ns);
+		/* schedule_hrtimeout restores TASK_RUNNING even on an early wake. */
+		set_current_state(TASK_UNINTERRUPTIBLE);
 		schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
 		now_ns = ktime_get_ns();
 	}

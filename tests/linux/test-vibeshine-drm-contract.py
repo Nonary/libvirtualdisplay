@@ -198,6 +198,80 @@ int main(void) {
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_vrr_sleep(driver_root: Path) -> None:
+    """Run the real wait helper against the scheduler's task-state contract."""
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    start = driver.index("static void vkms_wait_for_vrr_presentation_slot(")
+    end = driver.index("static void vkms_signal_presented_crtcs(", start)
+    source = r"""
+#include <assert.h>
+#include <stdint.h>
+#include "vibeshine_drm_vrr.h"
+typedef uint64_t u64;
+typedef uint64_t ktime_t;
+struct drm_vblank_crtc { int framedur_ns; } vblank;
+struct drm_crtc { int unused; } crtc;
+struct vkms_output { int present_lock; u64 present_timestamp_ns; } output;
+#define READ_ONCE(x) (x)
+#define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+#define spin_lock_irq(lock) ((void)(lock))
+#define spin_unlock_irq(lock) ((void)(lock))
+#define TASK_RUNNING 0
+#define TASK_UNINTERRUPTIBLE 2
+#define HRTIMER_MODE_ABS 0
+static int task_state, sleeps, wake_early;
+static u64 now;
+static struct drm_vblank_crtc *drm_crtc_vblank_crtc(struct drm_crtc *c) {
+    assert(c == &crtc); return &vblank;
+}
+static u64 ktime_get_ns(void) { return now; }
+static ktime_t ns_to_ktime(u64 t) { return t; }
+#define set_current_state(state) (task_state = (state))
+static int schedule_hrtimeout(ktime_t *expires, int mode) {
+    assert(mode == HRTIMER_MODE_ABS);
+    /* TASK_RUNNING would return immediately instead of sleeping. */
+    assert(task_state == TASK_UNINTERRUPTIBLE);
+    assert(*expires > now);
+    ++sleeps;
+    task_state = TASK_RUNNING;
+    if (wake_early) {
+        wake_early = 0;
+        ++now;
+        return -1;
+    }
+    now = *expires;
+    return 0;
+}
+""" + driver[start:end] + r"""
+int main(void) {
+    vblank.framedur_ns = 8333333;
+    output.present_timestamp_ns = 10000000;
+    now = 12000000;
+    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
+    assert(sleeps == 1 && now == 18333333 && task_state == TASK_RUNNING);
+    now = 12000000; sleeps = 0; wake_early = 1;
+    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
+    assert(sleeps == 2 && now == 18333333 && task_state == TASK_RUNNING);
+    sleeps = 0;
+    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
+    assert(sleeps == 0 && task_state == TASK_RUNNING);
+    output.present_timestamp_ns = 0;
+    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
+    assert(sleeps == 0 && task_state == TASK_RUNNING);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-vrr-sleep-") as temporary_dir:
+        source_path = Path(temporary_dir) / "vrr-sleep.c"
+        binary_path = Path(temporary_dir) / "vrr-sleep"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             "-I", str(driver_root), str(source_path), "-o", str(binary_path)], check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
 def validate_source_contract(driver_root: Path) -> None:
     compat_path = driver_root / "vibeshine_drm_compat.h"
     connector_path = driver_root / "vkms_connector.c"
@@ -445,6 +519,7 @@ def main() -> int:
     validate_source_contract(driver_root)
     validate_uapi_layout(driver_root)
     validate_frame_export(driver_root)
+    validate_vrr_sleep(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
 
