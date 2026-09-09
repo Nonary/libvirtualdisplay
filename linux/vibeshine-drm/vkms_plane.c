@@ -60,9 +60,12 @@ static const u32 vkms_formats[] = {
  * backend requires explicit block-linear modifiers; advertising only LINEAR
  * makes KWin fall back to a CPU dumb-buffer copy for every frame.
  *
- * The six block heights below are the uncompressed Turing+ layout advertised
- * by nvidia-drm. The PRIME importer preserves the producer DMA-BUF, so the
- * virtual device never needs to understand or touch the tiled pixels.
+ * nvidia-drm advertises six block heights with generation 2/page kind 0x06
+ * on Turing+, or generation 0/page kind 0xfe on Fermi-Volta (including Pascal).
+ * KWin intersects these with the render GPU's formats/modifiers. Omitting the
+ * older layouts forces GTX 10-series outputs back onto linear CPU buffers.
+ * The PRIME importer preserves the producer DMA-BUF, so the virtual device
+ * never needs to understand or touch the tiled pixels.
  */
 static const u64 vkms_format_modifiers[] = {
 	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 5),
@@ -71,6 +74,12 @@ static const u64 vkms_format_modifiers[] = {
 	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 2),
 	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 1),
 	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 0),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 5),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 4),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 3),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 2),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 1),
+	DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 0),
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID,
 };
@@ -88,6 +97,12 @@ static bool vkms_format_mod_supported(struct drm_plane *plane, u32 format,
 	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 2):
 	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 1):
 	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 0):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 5):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 4):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 3):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 2):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 1):
+	case DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 0, 0xfe, 0):
 		break;
 	default:
 		return false;

@@ -198,6 +198,94 @@ int main(void) {
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_scanout_negotiation(driver_root: Path) -> None:
+    """Intersect NVIDIA producer layouts with the real plane capabilities."""
+    plane = (driver_root / "vkms_plane.c").read_text(encoding="utf-8")
+    start = plane.index("static const u32 vkms_formats[]")
+    end = plane.index("static struct drm_plane_state *", start)
+    source = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <libdrm/drm_fourcc.h>
+typedef uint32_t u32;
+typedef uint64_t u64;
+struct drm_plane;
+""" + plane[start:end] + r"""
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+
+static bool can_scanout(u32 format, u64 producer_modifier) {
+    size_t f, m;
+    for (f = 0; f < ARRAY_SIZE(vkms_formats); ++f) {
+        if (vkms_formats[f] != format) continue;
+        for (m = 0; vkms_format_modifiers[m] != DRM_FORMAT_MOD_INVALID; ++m) {
+            if (vkms_format_modifiers[m] == producer_modifier &&
+                vkms_format_mod_supported(NULL, format, producer_modifier))
+                return true;
+        }
+    }
+    return false;
+}
+
+int main(void) {
+    /* nvidia-drm advertises block heights 0..5, sector layout 1, no compression.
+     * Fermi-Volta (including GTX 1070): generation 0, generic page kind 0xfe.
+     * Turing+: generation 2, generic page kind 0x06. Keep wire values explicit
+     * so a mistaken generation/kind in the driver does not alter the fixture.
+     */
+    const u64 nvidia_layouts[] = {0x03000000004fe010ULL, 0x0300000000606010ULL};
+    const u32 rgb_formats[] = {
+        DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
+        DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
+        DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR2101010,
+    };
+    size_t g, f, i, j;
+    unsigned int height;
+    for (g = 0; g < ARRAY_SIZE(nvidia_layouts); ++g) {
+        for (height = 0; height <= 5; ++height) {
+            const u64 modifier = nvidia_layouts[g] | height;
+            for (f = 0; f < ARRAY_SIZE(rgb_formats); ++f) {
+                /* Both SDR and HDR must negotiate a GPU layout without
+                 * falling back to LINEAR on either GPU generation. */
+                assert(can_scanout(rgb_formats[f], modifier));
+            }
+            /* NVIDIA's scanout RGB whitelist does not include AR30/XR30. */
+            assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_ARGB2101010, modifier));
+            assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB2101010, modifier));
+            assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_NV12, modifier));
+        }
+        assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, nvidia_layouts[g] | 6));
+        assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, nvidia_layouts[g] | (1ULL << 23)));
+    }
+    /* Do not accept an unadvertised layout through the atomic-check callback. */
+    assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, 0x03000000006fe010ULL));
+    assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, 0x0300000000000010ULL));
+    assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, 0x0100000000000001ULL));
+    assert(!vkms_format_mod_supported(NULL, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_INVALID));
+
+    assert(vkms_format_modifiers[ARRAY_SIZE(vkms_format_modifiers) - 1] == DRM_FORMAT_MOD_INVALID);
+    for (i = 0; i + 1 < ARRAY_SIZE(vkms_format_modifiers); ++i) {
+        for (j = i + 1; j < ARRAY_SIZE(vkms_format_modifiers); ++j)
+            assert(vkms_format_modifiers[i] != vkms_format_modifiers[j]);
+    }
+    /* Software/linear compatibility remains available for all plane formats. */
+    for (f = 0; f < ARRAY_SIZE(vkms_formats); ++f)
+        assert(can_scanout(vkms_formats[f], DRM_FORMAT_MOD_LINEAR));
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-scanout-") as temporary_dir:
+        source_path = Path(temporary_dir) / "scanout-negotiation.c"
+        binary_path = Path(temporary_dir) / "scanout-negotiation"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             "-Wno-unused-parameter", str(source_path), "-o", str(binary_path)], check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
 def validate_vrr_sleep(driver_root: Path) -> None:
     """Run the real wait helper against the scheduler's task-state contract."""
     driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
@@ -519,6 +607,7 @@ def main() -> int:
     validate_source_contract(driver_root)
     validate_uapi_layout(driver_root)
     validate_frame_export(driver_root)
+    validate_scanout_negotiation(driver_root)
     validate_vrr_sleep(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
