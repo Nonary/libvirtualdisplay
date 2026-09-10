@@ -75,6 +75,10 @@ build_module() {
     error "module source directory is unavailable or unsafe: ${source_dir}"
     return 1
   fi
+  source_dir=$(CDPATH='' cd -- "$source_dir" && pwd -P) || {
+    error "could not resolve module source directory: ${source_dir}"
+    return 1
+  }
 
   build_dir="$MODULES_ROOT/$kernel_release/build"
   config_file="$build_dir/.config"

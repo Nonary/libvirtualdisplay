@@ -111,6 +111,41 @@ int main(void) { return 0; }
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_requested_mode_policy(driver_root: Path) -> None:
+    source = r"""
+#include <assert.h>
+#include "vibeshine_drm_mode.h"
+
+int main(void) {
+    const struct vibeshine_drm_requested_mode requested = {3024, 1890, 90000};
+    struct vibeshine_drm_requested_mode doubled = {0};
+    assert(vibeshine_drm_requested_mode_valid(&requested));
+    assert(vibeshine_drm_doubled_mode(&requested, &doubled));
+    assert(doubled.width == requested.width);
+    assert(doubled.height == requested.height);
+    assert(doubled.refresh_millihz == 180000);
+
+    const struct vibeshine_drm_requested_mode limit = {1920, 1080, 500000};
+    assert(vibeshine_drm_doubled_mode(&limit, &doubled));
+    assert(doubled.refresh_millihz == 1000000);
+
+    const struct vibeshine_drm_requested_mode over_limit = {1920, 1080, 500001};
+    assert(!vibeshine_drm_doubled_mode(&over_limit, &doubled));
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-mode-") as temporary_dir:
+        source_path = Path(temporary_dir) / "requested-mode.c"
+        binary_path = Path(temporary_dir) / "requested-mode"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Werror", "-I", str(driver_root),
+             str(source_path), "-o", str(binary_path)],
+            check=True,
+        )
+        subprocess.run([str(binary_path)], check=True)
+
+
 def validate_frame_export(driver_root: Path) -> None:
     """Exercise the actual export helper with kernel ownership APIs stubbed."""
     driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
@@ -363,6 +398,7 @@ int main(void) {
 def validate_source_contract(driver_root: Path) -> None:
     compat_path = driver_root / "vibeshine_drm_compat.h"
     connector_path = driver_root / "vkms_connector.c"
+    mode_header_path = driver_root / "vibeshine_drm_mode.h"
     driver_header_path = driver_root / "vkms_drv.h"
     plane_path = driver_root / "vkms_plane.c"
     configfs_path = driver_root / "vkms_configfs.c"
@@ -371,6 +407,7 @@ def validate_source_contract(driver_root: Path) -> None:
     drv_path = driver_root / "vkms_drv.c"
     compat = compat_path.read_text(encoding="utf-8")
     connector = connector_path.read_text(encoding="utf-8")
+    mode_header = mode_header_path.read_text(encoding="utf-8")
     driver_header = driver_header_path.read_text(encoding="utf-8")
     plane = plane_path.read_text(encoding="utf-8")
     configfs = configfs_path.read_text(encoding="utf-8")
@@ -413,8 +450,17 @@ def validate_source_contract(driver_root: Path) -> None:
         "DRM_MODE_COLORIMETRY_BT2020_RGB",
         "DRM_MODE_COLORIMETRY_BT2020_YCC",
         "drm_connector_attach_colorspace_property(&connector->base)",
+        "vibeshine_drm_doubled_mode(&requested, &doubled)",
+        "entry->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED",
+        "entry->type = DRM_MODE_TYPE_DRIVER;",
     ):
         require_source(connector, needle, connector_path.name)
+    for needle in (
+        "VIBESHINE_DRM_MAX_REFRESH_MILLIHZ / 2",
+        "doubled->refresh_millihz *= 2",
+        "vibeshine_drm_requested_mode_clock_khz",
+    ):
+        require_source(mode_header, needle, mode_header_path.name)
     require(
         re.search(
             r"#if VIBESHINE_DRM_HAS_VBLANK_HELPER\s+"
@@ -571,6 +617,8 @@ def validate_source_contract(driver_root: Path) -> None:
     require(".get_crc_sources" not in crtc, "GPU pass-through CRTC still advertises software CRC")
     require_source(configfs, "if (writeback)", configfs_path.name)
     require_source(configfs, "return -EOPNOTSUPP", configfs_path.name)
+    require_source(configfs, "CONFIGFS_ATTR(connector_, requested_mode)", configfs_path.name)
+    require_source(configfs, "vkms_trigger_connector_hotplug", configfs_path.name)
 
     require(re.search(r'\.ci_name\s*=\s*"vibeshine-drm"', configfs) is not None,
             "configfs root is not named vibeshine-drm")
@@ -606,6 +654,7 @@ def main() -> int:
 
     validate_source_contract(driver_root)
     validate_uapi_layout(driver_root)
+    validate_requested_mode_policy(driver_root)
     validate_frame_export(driver_root)
     validate_scanout_negotiation(driver_root)
     validate_vrr_sleep(driver_root)

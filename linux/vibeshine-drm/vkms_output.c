@@ -104,6 +104,9 @@ int vkms_output_init(struct vkms_device *vkmsdev)
 			return PTR_ERR(connector_cfg->connector);
 		}
 
+		vkms_connector_set_requested_mode(connector_cfg->connector,
+						  &connector_cfg->requested_mode);
+
 		vkms_config_connector_for_each_possible_encoder(connector_cfg,
 								idx,
 								possible_encoder) {

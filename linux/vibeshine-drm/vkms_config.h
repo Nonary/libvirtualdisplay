@@ -11,6 +11,7 @@
 #include <drm/drm_connector.h>
 
 #include "vkms_drv.h"
+#include "vibeshine_drm_mode.h"
 
 /**
  * struct vkms_config - General configuration for VKMS driver
@@ -106,6 +107,7 @@ struct vkms_config_encoder {
  * @link: Link to the others connector in vkms_config
  * @config: The vkms_config this connector belongs to
  * @status: Status (connected, disconnected...) of the connector
+ * @requested_mode: Exact client mode published when the device is instantiated.
  * @possible_encoders: Array of encoders that can be used with this connector
  * @connector: Internal usage. This pointer should never be considered as valid.
  *             It can be used to store a temporary reference to a VKMS connector
@@ -117,6 +119,7 @@ struct vkms_config_connector {
 	struct vkms_config *config;
 
 	enum drm_connector_status status;
+	struct vibeshine_drm_requested_mode requested_mode;
 	struct xarray possible_encoders;
 
 	/* Internal usage */

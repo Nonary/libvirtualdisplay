@@ -190,6 +190,7 @@ create_configfs_item() {
       connector)
         mkdir -- "$path/possible_encoders" || return 1
         : >"$path/status" || return 1
+        printf '0 0 0\n' >"$path/requested_mode" || return 1
         ;;
       *)
         error "internal error: unknown configfs item kind '${kind}'"
@@ -331,6 +332,7 @@ prepare_fake_item_for_removal() {
       ;;
     connector)
       rm -f -- "$path/status"
+      rm -f -- "$path/requested_mode"
       rmdir -- "$path/possible_encoders" 2>/dev/null || true
       ;;
   esac
@@ -461,6 +463,10 @@ validate_topology() {
     attribute_equals "$plane/type" 1 || return 1
     attribute_equals "$crtc/writeback" 0 || return 1
     attribute_is_connection_state "$connector/status" || return 1
+    if [[ ! -f "$connector/requested_mode" || -L "$connector/requested_mode" ]]; then
+      error "required VKMS requested-mode attribute is missing or unsafe: ${connector}/requested_mode"
+      return 1
+    fi
     validate_link "$plane/possible_crtcs/crtc${index}" "$crtc" || return 1
     validate_link "$encoder/possible_crtcs/crtc${index}" "$crtc" || return 1
     validate_link "$connector/possible_encoders/encoder${index}" "$encoder" || return 1
@@ -831,6 +837,67 @@ control_connector() {
 
 }
 
+control_requested_mode() (
+  local connector_name=$1 width=$2 height=$3 refresh=$4 caller_uid=$5
+  local connector_dir mode_path status_path lock_path lock_fd owner_uid=""
+
+  if [[ ! "$connector_name" =~ ^Virtual-[1-4]$ ||
+        ! "$width" =~ ^[1-9][0-9]{0,3}$ || ! "$height" =~ ^[1-9][0-9]{0,3}$ ||
+        ! "$refresh" =~ ^[1-9][0-9]{0,6}$ ]] ||
+     ((width < 64 || width > 8192 || height < 64 || height > 8192 ||
+       refresh < 1000 || refresh > 1000000)); then
+    printf 'ERROR invalid requested mode\n'
+    return 1
+  fi
+  if ! configfs_is_mounted || ! select_control_backend; then
+    printf 'ERROR display pool unavailable\n'
+    return 1
+  fi
+  connector_dir="$VKMS_DEVICE_DIR/connectors/$connector_name"
+  mode_path="$connector_dir/requested_mode"
+  status_path="$connector_dir/status"
+  if [[ ! -d "$connector_dir" || -L "$connector_dir" ||
+        ! -f "$VKMS_DEVICE_DIR/enabled" || -L "$VKMS_DEVICE_DIR/enabled" ||
+        ! -f "$status_path" || -L "$status_path" ||
+        ! -f "$mode_path" || -L "$mode_path" ]]; then
+    printf 'ERROR requested-mode control unavailable\n'
+    return 1
+  fi
+  if [[ $(<"$VKMS_DEVICE_DIR/enabled") != 1 ]]; then
+    printf 'ERROR display pool disabled\n'
+    return 1
+  fi
+
+  umask 077
+  if ! ensure_lease_root; then
+    printf 'ERROR connector lease unavailable\n'
+    return 1
+  fi
+  lock_path="$LEASE_ROOT/${connector_name}.lock"
+  if [[ -L "$lock_path" || (-e "$lock_path" && ! -f "$lock_path") ]] ||
+     ! exec {lock_fd}>>"$lock_path" || ! flock -x -w 1 "$lock_fd"; then
+    printf 'ERROR connector lease unavailable\n'
+    return 1
+  fi
+  if ! read_connector_lease "$connector_name" owner_uid ||
+     [[ -z "$owner_uid" || "$owner_uid" != "$caller_uid" ]]; then
+    printf 'ERROR connector not owned by caller\n'
+    return 1
+  fi
+  if [[ $(<"$status_path") != "$CONNECTOR_STATUS_CONNECTED" ]]; then
+    printf 'ERROR connector is disconnected\n'
+    return 1
+  fi
+  # The kernel derives and advertises the 2x companion mode from this atomic
+  # base-mode triple. Never disconnect a live connector to change its catalog.
+  if ! printf '%s %s %s\n' "$width" "$height" "$refresh" >"$mode_path" ||
+     [[ $(<"$mode_path") != "$width $height $refresh" ]]; then
+    printf 'ERROR requested mode update failed\n'
+    return 1
+  fi
+  printf 'OK mode %s %s %s %s\n' "$connector_name" "$width" "$height" "$refresh"
+)
+
 control_connection() {
   local caller_uid=${1:-}
   local request
@@ -850,6 +917,11 @@ control_connection() {
     return 1
   fi
 
+  if [[ "$request" =~ ^mode\ (Virtual-[1-4])\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,3})\ ([1-9][0-9]{0,6})$ ]]; then
+    control_requested_mode "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+      "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "$caller_uid"
+    return
+  fi
   case "$request" in
     "connect Virtual-1" | "connect Virtual-2" | "connect Virtual-3" | "connect Virtual-4" | \
     "disconnect Virtual-1" | "disconnect Virtual-2" | "disconnect Virtual-3" | "disconnect Virtual-4" | \
