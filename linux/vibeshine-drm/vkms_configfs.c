@@ -565,8 +565,46 @@ static ssize_t connector_status_store(struct config_item *item,
 
 CONFIGFS_ATTR(connector_, status);
 
+static ssize_t connector_requested_mode_show(struct config_item *item, char *page)
+{
+	struct vkms_configfs_connector *connector;
+	struct vibeshine_drm_requested_mode mode;
+
+	connector = connector_item_to_vkms_configfs_connector(item);
+	scoped_guard(mutex, &connector->dev->lock)
+		mode = connector->config->requested_mode;
+	return sprintf(page, "%u %u %u\n", mode.width, mode.height,
+		       mode.refresh_millihz);
+}
+
+static ssize_t connector_requested_mode_store(struct config_item *item,
+					      const char *page, size_t count)
+{
+	struct vkms_configfs_connector *connector;
+	struct vibeshine_drm_requested_mode mode;
+	char trailing;
+
+	if (!count || count > 64 ||
+	    sscanf(page, "%u %u %u %c", &mode.width, &mode.height,
+		   &mode.refresh_millihz, &trailing) != 3 ||
+	    !vibeshine_drm_requested_mode_valid(&mode))
+		return -EINVAL;
+	connector = connector_item_to_vkms_configfs_connector(item);
+	scoped_guard(mutex, &connector->dev->lock) {
+		connector->config->requested_mode = mode;
+		if (connector->dev->enabled) {
+			vkms_connector_set_requested_mode(connector->config->connector, &mode);
+			vkms_trigger_connector_hotplug(connector->dev->config->dev);
+		}
+	}
+	return count;
+}
+
+CONFIGFS_ATTR(connector_, requested_mode);
+
 static struct configfs_attribute *connector_item_attrs[] = {
 	&connector_attr_status,
+	&connector_attr_requested_mode,
 	NULL,
 };
 

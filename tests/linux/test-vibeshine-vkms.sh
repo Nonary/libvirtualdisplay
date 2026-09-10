@@ -102,6 +102,7 @@ for ((pipeline = 0; pipeline < VKMS_OUTPUT_COUNT; ++pipeline)); do
   assert_file_value "$plane/type" 1
   assert_file_value "$crtc/writeback" 0
   assert_file_value "$connector/status" "$CONNECTOR_STATUS_DISCONNECTED"
+  assert_file_value "$connector/requested_mode" "0 0 0"
   assert_link_target "$plane/possible_crtcs/crtc${pipeline}" "$crtc"
   assert_link_target "$encoder/possible_crtcs/crtc${pipeline}" "$crtc"
   assert_link_target "$connector/possible_encoders/encoder${pipeline}" "$encoder"
@@ -119,6 +120,13 @@ response=$(printf 'connect Virtual-2\n' | control_connection "$OWNER_UID") || fa
 [[ "$response" == "OK connected Virtual-2" ]] || fail "unexpected connect response: ${response}"
 assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/status" "$CONNECTOR_STATUS_CONNECTED"
 assert_file_value "$LEASE_PATH" "$OWNER_UID"
+response=$(printf 'mode Virtual-2 3024 1890 90000\n' | control_connection "$OWNER_UID") || fail "mode request failed"
+[[ "$response" == "OK mode Virtual-2 3024 1890 90000" ]] || fail "unexpected mode response: ${response}"
+assert_file_value "$VKMS_DEVICE_DIR/connectors/Virtual-2/requested_mode" "3024 1890 90000"
+if response=$(printf 'mode Virtual-2 3024 1890 120000\n' | control_connection "$OTHER_UID"); then
+  fail "cross-uid mode request succeeded"
+fi
+[[ "$response" == "ERROR connector not owned by caller" ]] || fail "unexpected cross-uid mode response: ${response}"
 response=$(printf 'status Virtual-2\n' | control_connection "$OTHER_UID") || fail "status request failed"
 [[ "$response" == "STATUS connected Virtual-2" ]] || fail "unexpected status response: ${response}"
 assert_file_value "$LEASE_PATH" "$OWNER_UID"
@@ -184,6 +192,16 @@ for invalid_request in 'connect Virtual-0' 'connect Virtual-5' 'connect Virtual-
     fail "invalid control request succeeded: ${invalid_request}"
   fi
   [[ "$response" == "ERROR malformed request" ]] || fail "unexpected protocol error: ${response}"
+done
+
+for invalid_mode in \
+  'mode Virtual-0 3024 1890 90000' \
+  'mode Virtual-2 63 1890 90000' \
+  'mode Virtual-2 3024 1890 0' \
+  'mode Virtual-2 3024 1890 1000001'; do
+  if response=$(printf '%s\n' "$invalid_mode" | control_connection "$OWNER_UID"); then
+    fail "invalid mode request succeeded: ${invalid_mode}"
+  fi
 done
 
 oversized_request=$(printf '%0130d' 0)

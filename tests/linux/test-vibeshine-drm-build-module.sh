@@ -41,10 +41,12 @@ configure_build_paths "$TEST_MODULES"
 build_module "$CLANG_KERNEL" "$TEST_SOURCE" || fail "Clang kernel build dispatch failed"
 build_module "$GCC_KERNEL" "$TEST_SOURCE" || fail "GCC kernel build dispatch failed"
 build_module "$GCC_KERNEL" "$TEST_SOURCE" LLVM=1 || fail "forwarded Kbuild arguments failed"
+(cd -- "$TEST_ROOT" && build_module "$GCC_KERNEL" source) || fail "relative source build dispatch failed"
 
 clang_call=$(sed -n '1p' "$MAKE_CALLS")
 gcc_call=$(sed -n '2p' "$MAKE_CALLS")
 forwarded_call=$(sed -n '3p' "$MAKE_CALLS")
+relative_call=$(sed -n '4p' "$MAKE_CALLS")
 [[ "$clang_call" == *"M=$TEST_SOURCE"* ]] || fail "Clang build omitted the module source path"
 [[ "$clang_call" == *"LLVM=1"* ]] || fail "Clang build omitted LLVM=1"
 [[ "$clang_call" == *"modules" ]] || fail "Clang build omitted the modules target"
@@ -54,6 +56,7 @@ forwarded_call=$(sed -n '3p' "$MAKE_CALLS")
 [[ "$forwarded_call" == *"M=$TEST_SOURCE"* ]] || fail "forwarded build omitted the module source path"
 [[ "$forwarded_call" == *"LLVM=1"* ]] || fail "forwarded build omitted the DKMS Kbuild argument"
 [[ "$forwarded_call" == *"modules" ]] || fail "forwarded build omitted the modules target"
+[[ "$relative_call" == *"M=$TEST_SOURCE"* ]] || fail "relative source path was not canonicalized"
 
 grep -Fq 'BUILD_EXCLUSIVE_KERNEL_MIN="6.16"' "$DKMS_CONFIG_UNDER_TEST" ||
   fail "DKMS configuration omitted the supported kernel floor"
@@ -66,6 +69,6 @@ fi
 if build_module "$UNSUPPORTED_KERNEL" "$TEST_SOURCE"; then
   fail "unsupported kernel was accepted"
 fi
-[[ $(wc -l <"$MAKE_CALLS") -eq 3 ]] || fail "unsupported kernel invoked make"
+[[ $(wc -l <"$MAKE_CALLS") -eq 4 ]] || fail "unsupported kernel invoked make"
 
 printf 'PASS: vibeshine-drm build-module shell tests\n'

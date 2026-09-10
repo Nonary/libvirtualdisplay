@@ -30,6 +30,10 @@ static const struct drm_connector_funcs vkms_connector_funcs = {
 static int vkms_conn_get_modes(struct drm_connector *connector)
 {
 	const struct drm_edid *drm_edid;
+	struct vkms_connector *vkms = drm_connector_to_vkms_connector(connector);
+	struct vibeshine_drm_requested_mode requested, doubled;
+	struct drm_display_mode *entry;
+	unsigned long flags;
 	int count;
 
 	drm_edid = drm_edid_alloc(vibeshine_hdr_edid,
@@ -45,6 +49,57 @@ static int vkms_conn_get_modes(struct drm_connector *connector)
 	/* Keep the normal VKMS mode pool for arbitrary client resolutions. */
 	count += drm_add_modes_noedid(connector, XRES_MAX, YRES_MAX);
 	drm_set_preferred_mode(connector, 3840, 2160);
+
+	spin_lock_irqsave(&vkms->requested_mode_lock, flags);
+	requested = vkms->requested_mode;
+	spin_unlock_irqrestore(&vkms->requested_mode_lock, flags);
+	if (!vibeshine_drm_requested_mode_valid(&requested))
+		return count;
+
+	/* The stream rate remains the preferred mode. The additional 2x mode lets
+	 * the compositor or game opt into lower-latency scanout without replacing
+	 * the client's exact requested rate.
+	 */
+	list_for_each_entry(entry, &connector->probed_modes, head)
+		entry->type &= ~DRM_MODE_TYPE_PREFERRED;
+
+	entry = drm_mode_create(connector->dev);
+	if (!entry)
+		return count;
+	entry->hdisplay = requested.width;
+	entry->hsync_start = requested.width + 48;
+	entry->hsync_end = requested.width + 80;
+	entry->htotal = requested.width + 160;
+	entry->vdisplay = requested.height;
+	entry->vsync_start = requested.height + 3;
+	entry->vsync_end = requested.height + 6;
+	entry->vtotal = requested.height + 45;
+	entry->clock = vibeshine_drm_requested_mode_clock_khz(&requested);
+	entry->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
+	entry->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	drm_mode_set_name(entry);
+	drm_mode_probed_add(connector, entry);
+	count++;
+
+	if (!vibeshine_drm_doubled_mode(&requested, &doubled))
+		return count;
+	entry = drm_mode_create(connector->dev);
+	if (!entry)
+		return count;
+	entry->hdisplay = doubled.width;
+	entry->hsync_start = doubled.width + 48;
+	entry->hsync_end = doubled.width + 80;
+	entry->htotal = doubled.width + 160;
+	entry->vdisplay = doubled.height;
+	entry->vsync_start = doubled.height + 3;
+	entry->vsync_end = doubled.height + 6;
+	entry->vtotal = doubled.height + 45;
+	entry->clock = vibeshine_drm_requested_mode_clock_khz(&doubled);
+	entry->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
+	entry->type = DRM_MODE_TYPE_DRIVER;
+	drm_mode_set_name(entry);
+	drm_mode_probed_add(connector, entry);
+	count++;
 
 	return count;
 }
@@ -74,6 +129,7 @@ struct vkms_connector *vkms_connector_init(struct vkms_device *vkmsdev,
 	connector = drmm_kzalloc(dev, sizeof(*connector), GFP_KERNEL);
 	if (!connector)
 		return ERR_PTR(-ENOMEM);
+	spin_lock_init(&connector->requested_mode_lock);
 
 	ret = drmm_connector_init(dev, &connector->base, &vkms_connector_funcs,
 				  DRM_MODE_CONNECTOR_VIRTUAL, NULL);
@@ -120,4 +176,15 @@ void vkms_trigger_connector_hotplug(struct vkms_device *vkmsdev)
 	struct drm_device *dev = &vkmsdev->drm;
 
 	drm_kms_helper_hotplug_event(dev);
+}
+
+void vkms_connector_set_requested_mode(
+	struct vkms_connector *connector,
+	const struct vibeshine_drm_requested_mode *mode)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&connector->requested_mode_lock, flags);
+	connector->requested_mode = *mode;
+	spin_unlock_irqrestore(&connector->requested_mode_lock, flags);
 }
