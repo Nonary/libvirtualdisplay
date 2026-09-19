@@ -18,12 +18,10 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fcntl.h>
-#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/panic.h>
 #include <linux/reboot.h>
-#include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
 #include <linux/timer.h>
@@ -50,7 +48,6 @@
 #include "vkms_drv.h"
 #include "vibeshine_drm_change.h"
 #include "vibeshine_drm_present.h"
-#include "vibeshine_drm_vrr.h"
 #include "vibeshine_drm_uapi.h"
 #include "vibeshine_drm_compat.h"
 #include "vibeshine_drm_version.h"
@@ -601,33 +598,6 @@ static bool vkms_commit_changes_crtc(struct drm_atomic_commit *state,
 	return false;
 }
 
-static void vkms_wait_for_vrr_presentation_slot(struct drm_crtc *crtc,
-						 struct vkms_output *output)
-{
-	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
-	ktime_t expires;
-	u64 deadline_ns;
-	u64 previous_ns;
-	u64 period_ns;
-	u64 now_ns;
-
-	period_ns = max_t(int, READ_ONCE(vblank->framedur_ns), 0);
-	spin_lock_irq(&output->present_lock);
-	previous_ns = output->present_timestamp_ns;
-	spin_unlock_irq(&output->present_lock);
-
-	now_ns = ktime_get_ns();
-	deadline_ns = vibeshine_drm_vrr_presentation_deadline_ns(
-		previous_ns, now_ns, period_ns);
-	while (deadline_ns > now_ns) {
-		expires = ns_to_ktime(deadline_ns);
-		/* schedule_hrtimeout restores TASK_RUNNING even on an early wake. */
-		set_current_state(TASK_UNINTERRUPTIBLE);
-		schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
-		now_ns = ktime_get_ns();
-	}
-}
-
 static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
@@ -647,9 +617,6 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		output = drm_crtc_to_vkms_output(crtc);
 		primary_state = drm_atomic_get_new_plane_state(state, crtc->primary);
 		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
-		if (scanout_changed && crtc_state && crtc_state->active &&
-		    crtc_state->vrr_enabled)
-			vkms_wait_for_vrr_presentation_slot(crtc, output);
 		if (primary_state && primary_state->fb && primary_state->visible) {
 			new_present_fb = primary_state->fb;
 			drm_framebuffer_get(new_present_fb);
@@ -740,7 +707,13 @@ static void vkms_atomic_commit_tail(struct drm_atomic_commit *old_state)
 
 	drm_atomic_helper_wait_for_flip_done(dev, old_state);
 
-	/* Keep later commits serialized until this presentation is published. */
+	/*
+	 * Flip completion above already observes the CRTC's vblank/VRR schedule.
+	 * Publish immediately: throttling again from the previous publication
+	 * timestamp turns commit-worker wakeup latency into a second refresh clock
+	 * and holds up subsequent commits near the mode's maximum refresh rate.
+	 * Keep later commits serialized until this presentation is published.
+	 */
 	vkms_signal_presented_crtcs(old_state);
 	drm_atomic_helper_commit_hw_done(old_state);
 

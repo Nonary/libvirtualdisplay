@@ -321,11 +321,11 @@ int main(void) {
         subprocess.run([str(binary_path)], check=True)
 
 
-def validate_vrr_sleep(driver_root: Path) -> None:
-    """Run the real wait helper against the scheduler's task-state contract."""
-    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
-    start = driver.index("static void vkms_wait_for_vrr_presentation_slot(")
-    end = driver.index("static void vkms_signal_presented_crtcs(", start)
+def validate_vrr_schedule(driver_root: Path) -> None:
+    """Exercise the real nonblocking CRTC scheduler, the sole refresh limiter."""
+    driver = (driver_root / "vkms_crtc.c").read_text(encoding="utf-8")
+    start = driver.index("static void vkms_schedule_vrr_vblank(")
+    end = driver.index("\n#else", start)
     source = r"""
 #include <assert.h>
 #include <stdint.h>
@@ -334,59 +334,63 @@ typedef uint64_t u64;
 typedef uint64_t ktime_t;
 struct drm_vblank_crtc { int framedur_ns; } vblank;
 struct drm_crtc { int unused; } crtc;
-struct vkms_output { int present_lock; u64 present_timestamp_ns; } output;
+struct vkms_output { u64 vrr_vblank_timestamp_ns; int vrr_hrtimer; } output;
 #define READ_ONCE(x) (x)
 #define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
-#define spin_lock_irq(lock) ((void)(lock))
-#define spin_unlock_irq(lock) ((void)(lock))
-#define TASK_RUNNING 0
-#define TASK_UNINTERRUPTIBLE 2
+#define atomic64_read(value) (*(value))
 #define HRTIMER_MODE_ABS 0
-static int task_state, sleeps, wake_early;
-static u64 now;
+static int scheduled, delivered;
+static u64 now, deadline;
 static struct drm_vblank_crtc *drm_crtc_vblank_crtc(struct drm_crtc *c) {
     assert(c == &crtc); return &vblank;
 }
+static struct vkms_output *drm_crtc_to_vkms_output(struct drm_crtc *c) {
+    assert(c == &crtc); return &output;
+}
 static u64 ktime_get_ns(void) { return now; }
 static ktime_t ns_to_ktime(u64 t) { return t; }
-#define set_current_state(state) (task_state = (state))
-static int schedule_hrtimeout(ktime_t *expires, int mode) {
+static void hrtimer_start(int *timer, ktime_t expires, int mode) {
+    assert(timer == &output.vrr_hrtimer);
     assert(mode == HRTIMER_MODE_ABS);
-    /* TASK_RUNNING would return immediately instead of sleeping. */
-    assert(task_state == TASK_UNINTERRUPTIBLE);
-    assert(*expires > now);
-    ++sleeps;
-    task_state = TASK_RUNNING;
-    if (wake_early) {
-        wake_early = 0;
-        ++now;
-        return -1;
-    }
-    now = *expires;
-    return 0;
+    assert(expires > now);
+    ++scheduled;
+    deadline = expires;
+}
+static void vkms_crtc_handle_vblank_timeout(struct drm_crtc *c) {
+    assert(c == &crtc);
+    ++delivered;
+    output.vrr_vblank_timestamp_ns = now;
 }
 """ + driver[start:end] + r"""
 int main(void) {
     vblank.framedur_ns = 8333333;
-    output.present_timestamp_ns = 10000000;
+    output.vrr_vblank_timestamp_ns = 10000000;
     now = 12000000;
-    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
-    assert(sleeps == 1 && now == 18333333 && task_state == TASK_RUNNING);
-    now = 12000000; sleeps = 0; wake_early = 1;
-    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
-    assert(sleeps == 2 && now == 18333333 && task_state == TASK_RUNNING);
-    sleeps = 0;
-    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
-    assert(sleeps == 0 && task_state == TASK_RUNNING);
-    output.present_timestamp_ns = 0;
-    vkms_wait_for_vrr_presentation_slot(&crtc, &output);
-    assert(sleeps == 0 && task_state == TASK_RUNNING);
+    vkms_schedule_vrr_vblank(&crtc);
+    assert(scheduled == 1 && delivered == 0 && deadline == 18333333);
+    assert(now == 12000000); /* Scheduling must not block the commit worker. */
+    now = deadline;
+    vkms_crtc_handle_vblank_timeout(&crtc);
+    /* A late publication must not move the next flip's refresh deadline. */
+    now += 2000000;
+    vkms_schedule_vrr_vblank(&crtc);
+    assert(scheduled == 2 && delivered == 1 && deadline == 26666666);
+    assert(now == 20333333);
+    now = deadline;
+    vkms_schedule_vrr_vblank(&crtc);
+    assert(scheduled == 2 && delivered == 2);
+    now += 10000000; /* Below refresh, deliver immediately. */
+    vkms_schedule_vrr_vblank(&crtc);
+    assert(scheduled == 2 && delivered == 3);
+    output.vrr_vblank_timestamp_ns = 0;
+    vkms_schedule_vrr_vblank(&crtc);
+    assert(scheduled == 2 && delivered == 4);
     return 0;
 }
 """
-    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-vrr-sleep-") as temporary_dir:
-        source_path = Path(temporary_dir) / "vrr-sleep.c"
-        binary_path = Path(temporary_dir) / "vrr-sleep"
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-vrr-schedule-") as temporary_dir:
+        source_path = Path(temporary_dir) / "vrr-schedule.c"
+        binary_path = Path(temporary_dir) / "vrr-schedule"
         source_path.write_text(source, encoding="utf-8")
         subprocess.run(
             [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
@@ -551,7 +555,6 @@ def validate_source_contract(driver_root: Path) -> None:
         "obj->import_attach->dmabuf",
         "dma_buf_fd(dma_buf, O_CLOEXEC)",
         "drm_framebuffer_get(new_present_fb)",
-        "vkms_wait_for_vrr_presentation_slot(crtc, output)",
         "capable(CAP_SYS_ADMIN)",
         "static bool enable_cursor;",
         "devm_register_reboot_notifier",
@@ -568,11 +571,18 @@ def validate_source_contract(driver_root: Path) -> None:
         "timer_shutdown_sync(&vkms_shutdown_deadline_timer);",
     ):
         require_source(drv, needle, drv_path.name)
-    require(
-        drv.index("vkms_wait_for_vrr_presentation_slot(crtc, output)") <
-        drv.index("output->present_timestamp_ns = ktime_get_ns()"),
-        "capture presentation is published before the VRR maximum-rate wait",
-    )
+    require("vkms_wait_for_vrr_presentation_slot" not in drv and
+            "schedule_hrtimeout" not in drv and
+            "vibeshine_drm_vrr_presentation_deadline_ns" not in drv,
+            "commit publication adds a second refresh clock after flip completion")
+    tail_start = drv.index("static void vkms_atomic_commit_tail(")
+    tail_end = drv.index("static const struct drm_driver", tail_start)
+    tail = drv[tail_start:tail_end]
+    require(tail.index("drm_atomic_helper_wait_for_flip_done(dev, old_state)") <
+            tail.index("vkms_signal_presented_crtcs(old_state)") <
+            tail.index("drm_atomic_helper_commit_hw_done(old_state)") <
+            tail.index("drm_atomic_helper_cleanup_planes(dev, old_state)"),
+            "publication must follow flip completion before releasing later commits and buffers")
     require("module_param_named(shutdown_deadline_secs" not in drv,
             "the restart bugcheck must not be optional")
     notifier_start = drv.index("static int vkms_reboot_notifier(")
@@ -657,7 +667,7 @@ def main() -> int:
     validate_requested_mode_policy(driver_root)
     validate_frame_export(driver_root)
     validate_scanout_negotiation(driver_root)
-    validate_vrr_sleep(driver_root)
+    validate_vrr_schedule(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
 

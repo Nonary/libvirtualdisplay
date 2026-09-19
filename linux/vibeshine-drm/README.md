@@ -11,8 +11,9 @@ monitor contract:
 - a CTA-861 EDID advertising BT.2020, PQ, HLG, and static HDR metadata;
 - atomic `HDR_OUTPUT_METADATA`, `Colorspace`, and 8-16 `max bpc` properties;
 - adaptive-sync capability on Linux 7.0 and newer, with exactly one synthetic
-  vblank per submitted frame, independent of the disabled fixed-rate timer and
-  nominal mode period; an explicit raw vblank counter preserves the immediate
+  vblank per submitted frame, scheduled no earlier than one nominal mode period
+  after the previous vblank, with the fixed-rate timer disabled; an explicit raw
+  vblank counter preserves the actual
   event timestamp without DRM inferring false sequence jumps;
 - 10-bit RGB plane formats in addition to upstream VKMS formats;
 - versioned, read-only presentation and frame-export ioctls so direct KMS
@@ -32,6 +33,13 @@ completed. A caller supplies its last sequence and may block for up to one
 second; the ioctl returns the newest sequence and its `CLOCK_MONOTONIC`
 timestamp. Consumers deliberately coalesce sequence gaps and import only the
 latest scanout buffer.
+
+The CRTC vblank schedule is the only display refresh limiter. Once the page
+flip completes, the commit worker publishes the frame immediately, without
+another refresh-period wait based on its previous publication timestamp.
+Otherwise worker scheduling delays accumulate in a second clock and stall
+subsequent commits near maximum refresh. Capture independently selects the
+newest completed frame at the stream's delivery rate.
 
 The response also reports when a newer atomic state has been submitted but is
 not presented yet. Capture waits until that pending count reaches zero before
