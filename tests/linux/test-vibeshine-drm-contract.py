@@ -585,19 +585,38 @@ def validate_source_contract(driver_root: Path) -> None:
             "publication must follow flip completion before releasing later commits and buffers")
     require("module_param_named(shutdown_deadline_secs" not in drv,
             "the restart bugcheck must not be optional")
-    notifier_start = drv.index("static int vkms_reboot_notifier(")
-    notifier_end = drv.index("return NOTIFY_DONE;", notifier_start)
-    notifier = drv[notifier_start:notifier_end]
-    restart_check = notifier.find("if (action == SYS_RESTART)\n\t\tvkms_bugcheck(")
-    require(restart_check >= 0, "a restart does not bugcheck immediately in the reboot notifier")
-    require(
-        restart_check < notifier.index("vkms_arm_shutdown_deadline();") <
-        notifier.index("vkms_shutdown_release(vkmsdev);"),
-        "power-off does not arm the bugcheck deadline before releasing the device",
-    )
+    # The restart bugcheck and power-off deadline must outlive every virtual
+    # device: a per-device notifier vanishes with the pool, and a restart then
+    # walks into the physical GPU's shutdown callback.
+    require_source(drv, "static int vkms_module_reboot_notifier(", drv_path.name)
+    module_start = drv.index("static int vkms_module_reboot_notifier(")
+    module_notifier = drv[module_start:drv.index("return NOTIFY_DONE;", module_start)]
+    restart_check = module_notifier.find("if (action == SYS_RESTART)\n\t\tvkms_bugcheck(")
+    require(restart_check >= 0, "a restart does not bugcheck immediately in the module reboot notifier")
+    require(restart_check < module_notifier.index("vkms_arm_shutdown_deadline();"),
+            "power-off does not arm the bugcheck deadline in the module reboot notifier")
+    nb_start = drv.index("static struct notifier_block vkms_module_reboot_nb = {")
+    require(".priority = 1," in drv[nb_start:drv.index("};", nb_start)],
+            "the module reboot notifier does not run before per-device releases")
+    device_start = drv.index("static int vkms_reboot_notifier(")
+    device_notifier = drv[device_start:drv.index("int vkms_create(", device_start)]
+    require("vkms_bugcheck(" not in device_notifier and "vkms_arm_shutdown_deadline" not in device_notifier,
+            "a per-device reboot notifier still owns the bugcheck or deadline")
+    require(device_notifier.index("if (action == SYS_RESTART)\n\t\treturn NOTIFY_DONE;") <
+            device_notifier.index("vkms_shutdown_release(vkmsdev);"),
+            "a restart still releases devices after the module notifier bugchecked")
+    init_body = drv[drv.index("static int __init vkms_init(void)"):drv.index("void vkms_destroy(")]
+    require(init_body.index("register_reboot_notifier(&vkms_module_reboot_nb)") <
+            init_body.index("vkms_configfs_register()"),
+            "the module reboot notifier is not registered before any device can exist")
+    require("unregister_reboot_notifier(&vkms_module_reboot_nb);" in init_body,
+            "failed module initialization leaves the reboot notifier registered")
     exit_body = drv[drv.index("static void __exit vkms_exit(void)"):drv.index("module_init(vkms_init);")]
     require("timer_shutdown_sync(&vkms_shutdown_deadline_timer);" in exit_body,
             "module exit does not shut the bugcheck deadline timer down")
+    require(exit_body.index("unregister_reboot_notifier(&vkms_module_reboot_nb);") <
+            exit_body.index("timer_shutdown_sync(&vkms_shutdown_deadline_timer);"),
+            "module exit can re-arm the deadline after shutting its timer down")
     require(
         drv.index("vkms_device->drm.max_vblank_count = U32_MAX") <
         drv.index("drm_vblank_init(&vkms_device->drm"),

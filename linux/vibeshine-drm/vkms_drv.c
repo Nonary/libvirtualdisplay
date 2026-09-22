@@ -985,6 +985,36 @@ static void vkms_arm_shutdown_deadline(void)
 		  jiffies + secs_to_jiffies(VKMS_POWEROFF_DEADLINE_SECS));
 }
 
+/*
+ * The restart bugcheck and the power-off deadline belong to the module, not
+ * to a virtual device. A per-device notifier disappears with its device, so
+ * a restart after the pool is removed (a deploy, a configfs teardown, or a
+ * failed recreation) would walk straight into the physical GPU's shutdown
+ * callback -- the hang this path exists to prevent. The higher priority runs
+ * this before every per-device release below.
+ */
+static int vkms_module_reboot_notifier(struct notifier_block *notifier,
+				       unsigned long action, void *data)
+{
+	(void)notifier;
+	(void)data;
+	if (action == SYS_RESTART)
+		vkms_bugcheck("restarting through bugcheck instead of the device shutdown walk");
+
+	/*
+	 * Arm before any device releases anything: drm_dev_unplug() sleeps in
+	 * synchronize_srcu(), and the deadline has to cover that too.
+	 */
+	vkms_arm_shutdown_deadline();
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block vkms_module_reboot_nb = {
+	.notifier_call = vkms_module_reboot_notifier,
+	.priority = 1,
+};
+
 static int vkms_reboot_notifier(struct notifier_block *notifier,
 				unsigned long action, void *data)
 {
@@ -993,14 +1023,10 @@ static int vkms_reboot_notifier(struct notifier_block *notifier,
 						    reboot_notifier);
 
 	(void)data;
+	/* The module notifier has already bugchecked a restart. */
 	if (action == SYS_RESTART)
-		vkms_bugcheck("restarting through bugcheck instead of the device shutdown walk");
+		return NOTIFY_DONE;
 
-	/*
-	 * Arm before releasing anything: drm_dev_unplug() below sleeps in
-	 * synchronize_srcu(), and the deadline has to cover that too.
-	 */
-	vkms_arm_shutdown_deadline();
 	DRM_INFO("releasing virtual scanout before system shutdown\n");
 	vkms_shutdown_release(vkmsdev);
 
@@ -1102,27 +1128,39 @@ static int __init vkms_init(void)
 	int ret;
 	struct vkms_config *config;
 
-	ret = vkms_configfs_register();
+	ret = register_reboot_notifier(&vkms_module_reboot_nb);
 	if (ret)
 		return ret;
+
+	ret = vkms_configfs_register();
+	if (ret)
+		goto out_notifier;
 
 	if (!create_default_dev)
 		return 0;
 
 	config = vkms_config_default_create(enable_cursor, enable_writeback,
 					    enable_overlay, enable_plane_pipeline);
-	if (IS_ERR(config))
-		return PTR_ERR(config);
+	if (IS_ERR(config)) {
+		ret = PTR_ERR(config);
+		goto out_configfs;
+	}
 
 	ret = vkms_create(config);
 	if (ret) {
 		vkms_config_destroy(config);
-		return ret;
+		goto out_configfs;
 	}
 
 	default_config = config;
 
 	return 0;
+
+out_configfs:
+	vkms_configfs_unregister();
+out_notifier:
+	unregister_reboot_notifier(&vkms_module_reboot_nb);
+	return ret;
 }
 
 void vkms_destroy(struct vkms_config *config)
@@ -1154,10 +1192,12 @@ static void __exit vkms_exit(void)
 	}
 
 	/*
-	 * Every reboot notifier is unregistered by now, so nothing can re-arm
-	 * the deadline; shut the timer down so an unload during a shutdown that
-	 * is still completing cannot leave a callback behind.
+	 * Every per-device notifier is gone with its device; drop the module one
+	 * too, so nothing can re-arm the deadline. Then shut the timer down so an
+	 * unload during a shutdown that is still completing cannot leave a
+	 * callback behind.
 	 */
+	unregister_reboot_notifier(&vkms_module_reboot_nb);
 	timer_shutdown_sync(&vkms_shutdown_deadline_timer);
 }
 
