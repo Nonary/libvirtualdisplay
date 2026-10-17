@@ -15,10 +15,28 @@ NVIDIA PCI device to unrelated GBM/EGL consumers inside the compositor.
 KWin 6.8 separates render allocation from KMS scanout allocation. Its software
 scanout path calls `CREATE_DUMB` on `gbm_device_get_fd()`, which must remain the
 virtual KMS fd: Linux rejects this ioctl on an NVIDIA render node with `EACCES`.
-The bridge recognizes the exported `DrmDevice *` allocator constructor and
-preserves native allocation for that ABI and for unrecognized ABIs. It still
-removes the preload environment before compositor children start. Physical
-GPU allocators and DRM permissions are unchanged. A running compositor must
+For a matching KWin 6.8 library, the bridge scopes software allocation back to
+an owned duplicate of the original virtual KMS fd. Dumb-buffer creation,
+mapping and destruction therefore use the KMS device; EGL and hardware
+allocation keep the NVIDIA render fd. This scope is thread-local and restored
+after nested or failed allocations. Physical seat allocators retain their fds.
+
+KWin 6.8 also resolves each display's compatible render device independently
+of its GBM allocator. For the Vibeshine faux device alone, the bridge asks
+KWin's compatibility policy for the same verified NVIDIA render device. The
+physical seat and libdrm device identities are unchanged. If that renderer is
+unavailable, KWin's original compatibility policy remains the fallback. Merely
+testing direct GBM allocation does not cover this decision: validation must
+also exercise KWin's GPU manager and the selected output renderer.
+
+The native shim requires the installed public KWin 6.8 headers and Qt Core at
+build time. At runtime it checks the exact KWin library filename used at build
+time before reading `GraphicsBufferOptions`. A different library or unknown
+allocator ABI preserves native allocation until the bridge is rebuilt and
+validated. Updating KWin without rebuilding the bridge can therefore return
+virtual capture to software buffers. The bridge still removes the preload
+environment before compositor children start. Physical GPU allocators and DRM
+permissions are unchanged. A running compositor must
 restart through the normal logout/reboot cycle to load an updated bridge;
 restarting the streaming service does not replace its already loaded library.
 

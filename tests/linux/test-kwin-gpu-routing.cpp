@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include <gbm.h>
 #include <xf86drm.h>
@@ -77,6 +78,16 @@ namespace {
   bool reject_render_type;
   bool legacy_allocator_symbol;
   bool native_allocator_symbol;
+#ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
+  std::function<void *(const void *, drmDevicePtr)> render_device_body;
+  void *native_render_device(const void *manager, drmDevicePtr device) {
+    return render_device_body(manager, device);
+  }
+  std::function<KWin::GraphicsBuffer *(void *, const KWin::GraphicsBufferOptions &)> allocate_body;
+  KWin::GraphicsBuffer *native_allocate(void *allocator, const KWin::GraphicsBufferOptions &options) {
+    return allocate_body(allocator, options);
+  }
+#endif
 
   void *lookup_allocator(void *scope, const char *name) {
     require(scope == RTLD_DEFAULT, "allocator lookup used a different symbol scope");
@@ -135,8 +146,15 @@ namespace {
   void reset() {
     require(owned_render_fds.empty(), "render fd ownership leaked across tests");
     hooks_enabled = true;
+    native_hooks_enabled = true;
     real_gbm_create_device = create_device;
     real_gbm_device_destroy = destroy_device;
+    real_gbm_device_get_fd = +[](gbm_device *device) { return device->fd; };
+#ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
+    real_native_render_device = native_render_device;
+    real_native_allocate = native_allocate;
+    software_allocation = false;
+#endif
     real_drm_get_devices2 = get_devices;
     real_drm_get_device2 = get_device;
     gpu_attachment_logged = false;
@@ -169,9 +187,14 @@ namespace {
       "virtual allocator did not use the selected NVIDIA render node");
     require((fcntl(device->fd, F_GETFD) & FD_CLOEXEC) != 0, "render fd can leak into children");
     const int render_fd = device->fd;
+    const int kms_fd = owned_render_fds.at(device).kms;
+    require(virtual_device->matches_fd(kms_fd) && (fcntl(kms_fd, F_GETFD) & FD_CLOEXEC),
+      "software allocator lost its owned KMS descriptor");
     gbm_device_destroy(device);
     require(fcntl(render_fd, F_GETFD) == -1 && errno == EBADF,
       "render fd survived GBM destruction");
+    require(fcntl(kms_fd, F_GETFD) == -1 && errno == EBADF,
+      "owned KMS fd survived GBM destruction");
     require(fcntl(virtual_device->fd, F_GETFD) >= 0, "caller-owned virtual KMS fd was closed");
     require_original_devices();
   }
@@ -253,11 +276,11 @@ int main() {
       require(hooks_enabled, "legacy KWin lost its virtual rendering bridge");
       require_routed(gbm_create_device(virtual_kms.fd), nvidia_one);
     });
-    run("KWin 6.8 scanout allocator keeps the KMS fd for dumb buffers", [&] {
+    run("unmatched native KWin library retains its complete native allocation path", [&] {
       native_allocator_symbol = true;
       setenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE", "1", 1);
       setenv("LD_PRELOAD", "libvibeshine-kwin-gpu.so", 1);
-      configure_allocator_routing(lookup_allocator);
+      configure_allocator_routing(lookup_allocator, false);
       require(!hooks_enabled, "native scanout allocator was routed to a render node");
       require(!std::getenv("LD_PRELOAD") && !std::getenv("VIBESHINE_KWIN_GPU_PRELOAD_ACTIVE"),
         "native allocator path leaked preload into compositor children");
@@ -359,7 +382,131 @@ int main() {
       native_devices = {&virtual_kms, &virtio};
       require_fallback();
     });
-    require(vibeshine_kwin_gpu_interposer_abi() == 5, "unexpected bridge ABI");
+#ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
+    run("native compatibility selects NVIDIA only for the managed virtual output", [&] {
+      int manager, selected;
+      render_device_body = [&](const void *actual, drmDevicePtr device) -> void * {
+        require(actual == &manager, "compatibility query changed the GPU manager");
+        require(device == &nvidia_one.record, "virtual output did not query the real NVIDIA renderer");
+        return &selected;
+      };
+      require(vibeshine_kwin_render_device(&manager, &virtual_kms.record) == &selected,
+        "virtual output lost its NVIDIA render association");
+      require_original_devices();
+      require(owned_render_fds.empty() && fcntl(last_node_fd, F_GETFD) == -1,
+        "compatibility query leaked its temporary render fd");
+      for (auto *physical : {&virtio, &nvidia_one, &unrelated_faux}) {
+        render_device_body = [&](const void *, drmDevicePtr device) -> void * {
+          require(device == &physical->record, "physical or unrelated output was rerouted");
+          return &selected;
+        };
+        const int before = enumerations;
+        require(vibeshine_kwin_render_device(&manager, &physical->record) == &selected &&
+          enumerations == before, "unrelated compatibility query inspected other GPUs");
+      }
+    });
+    run("native compatibility honors PCI choice and falls back when renderer is absent", [&] {
+      native_devices.push_back(&nvidia_two);
+      setenv("VIBESHINE_KWIN_RENDER_PCI", "0000:02:00.0", 1);
+      int original;
+      unsigned calls = 0;
+      render_device_body = [&](const void *, drmDevicePtr device) -> void * {
+        ++calls;
+        if (device == &nvidia_two.record)
+          return nullptr;
+        require(device == &virtual_kms.record, "missing render device selected another GPU");
+        return &original;
+      };
+      require(vibeshine_kwin_render_device(nullptr, &virtual_kms.record) == &original && calls == 2,
+        "missing render device did not preserve native virtual compatibility");
+      setenv("VIBESHINE_KWIN_RENDER_PCI", "bad", 1);
+      calls = 0;
+      require(vibeshine_kwin_render_device(nullptr, &virtual_kms.record) == &original && calls == 1,
+        "invalid PCI choice did not preserve native compatibility");
+      require_original_devices();
+    });
+    run("unmatched native ABI leaves render compatibility unchanged", [&] {
+      native_hooks_enabled = false;
+      int original;
+      render_device_body = [&](const void *, drmDevicePtr device) -> void * {
+        require(device == &virtual_kms.record, "ABI fallback changed renderer lookup");
+        return &original;
+      };
+      require(vibeshine_kwin_render_device(nullptr, &virtual_kms.record) == &original &&
+        enumerations == 0, "ABI fallback routed render compatibility");
+    });
+    run("matching native allocator uses NVIDIA hardware and original KMS software allocation", [&] {
+      native_allocator_symbol = true;
+      configure_allocator_routing(lookup_allocator, true);
+      require(hooks_enabled, "reviewed native allocator remained disabled");
+      auto *device = gbm_create_device(virtual_kms.fd);
+      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &options) -> KWin::GraphicsBuffer * {
+        const int fd = gbm_device_get_fd(device);
+        require(options.software ? virtual_kms.matches_fd(fd) : nvidia_one.matches_fd(fd),
+          "hardware and software allocation fds were conflated");
+        return nullptr;
+      };
+      KWin::GraphicsBufferOptions options;
+      options.software = true;
+      vibeshine_kwin_allocate(nullptr, options);
+      require(!software_allocation && nvidia_one.matches_fd(gbm_device_get_fd(device)),
+        "software scope escaped into EGL rendering");
+      options.software = false;
+      vibeshine_kwin_allocate(nullptr, options);
+      require_routed(device, nvidia_one);
+    });
+    run("native software scope leaves physical seat and unrelated threads unchanged", [&] {
+      auto *device = gbm_create_device(virtual_kms.fd);
+      auto *physical = gbm_create_device(virtio.fd);
+      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &) -> KWin::GraphicsBuffer * {
+        require(gbm_device_get_fd(physical) == virtio.fd, "software scope changed physical seat fd");
+        bool other_thread_rendered = false;
+        std::thread other([&] { other_thread_rendered = nvidia_one.matches_fd(gbm_device_get_fd(device)); });
+        other.join();
+        require(other_thread_rendered, "software scope leaked into another rendering thread");
+        return nullptr;
+      };
+      KWin::GraphicsBufferOptions options;
+      options.software = true;
+      vibeshine_kwin_allocate(nullptr, options);
+      gbm_device_destroy(physical);
+      require_routed(device, nvidia_one);
+    });
+    run("nested native hardware allocation restores outer software scope", [&] {
+      auto *device = gbm_create_device(virtual_kms.fd);
+      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &options) -> KWin::GraphicsBuffer * {
+        if (options.software) {
+          require(virtual_kms.matches_fd(gbm_device_get_fd(device)), "outer KMS scope missing");
+          KWin::GraphicsBufferOptions hardware;
+          hardware.software = false;
+          vibeshine_kwin_allocate(nullptr, hardware);
+          require(virtual_kms.matches_fd(gbm_device_get_fd(device)), "nested allocation lost outer KMS scope");
+        } else {
+          require(nvidia_one.matches_fd(gbm_device_get_fd(device)), "nested hardware allocation used KMS fd");
+        }
+        return nullptr;
+      };
+      KWin::GraphicsBufferOptions options;
+      options.software = true;
+      vibeshine_kwin_allocate(nullptr, options);
+      require(!software_allocation, "nested software scope leaked");
+      require_routed(device, nvidia_one);
+    });
+    run("native allocation exceptions restore rendering scope", [&] {
+      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &) -> KWin::GraphicsBuffer * {
+        throw std::runtime_error("allocation failed");
+      };
+      KWin::GraphicsBufferOptions options;
+      options.software = true;
+      try {
+        vibeshine_kwin_allocate(nullptr, options);
+        require(false, "allocation unexpectedly succeeded");
+      } catch (const std::runtime_error &) {
+        require(!software_allocation, "failed allocation leaked software scope");
+      }
+    });
+#endif
+    require(vibeshine_kwin_gpu_interposer_abi() == 7, "unexpected bridge ABI");
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -51,6 +51,29 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(test_kwin_gpu_routing PRIVATE
                 PkgConfig::LIBVIRTUALDISPLAY_TEST_KWIN ${CMAKE_DL_LIBS})
         add_test(NAME linux_kwin_gpu_routing COMMAND test_kwin_gpu_routing)
+        get_target_property(_kwin_bridge_definitions vibeshine_kwin_gpu COMPILE_DEFINITIONS)
+        if("${_kwin_bridge_definitions}" MATCHES "VIBESHINE_KWIN_NATIVE_ALLOCATOR=1")
+            find_package(Qt6 COMPONENTS Core REQUIRED)
+            find_package(Threads REQUIRED)
+            add_executable(test_kwin_gpu_routing_native "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-gpu-routing.cpp")
+            target_include_directories(test_kwin_gpu_routing_native PRIVATE "${LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR}")
+            target_compile_definitions(test_kwin_gpu_routing_native PRIVATE
+                    ${_kwin_bridge_definitions})
+            target_link_libraries(test_kwin_gpu_routing_native PRIVATE
+                    PkgConfig::LIBVIRTUALDISPLAY_TEST_KWIN
+                    Qt6::Core "${LIBVIRTUALDISPLAY_KWIN_LIBRARY}" Threads::Threads ${CMAKE_DL_LIBS})
+            add_test(NAME linux_kwin_gpu_routing_native COMMAND test_kwin_gpu_routing_native)
+            pkg_check_modules(LIBVIRTUALDISPLAY_TEST_EGL REQUIRED IMPORTED_TARGET egl epoxy)
+            add_executable(test_kwin_native_allocation "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-native-allocation.cpp")
+            set_target_properties(test_kwin_native_allocation PROPERTIES ENABLE_EXPORTS ON)
+            target_include_directories(test_kwin_native_allocation PRIVATE "${LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR}")
+            target_compile_definitions(test_kwin_native_allocation PRIVATE ${_kwin_bridge_definitions})
+            target_link_libraries(test_kwin_native_allocation PRIVATE
+                    PkgConfig::LIBVIRTUALDISPLAY_TEST_KWIN PkgConfig::LIBVIRTUALDISPLAY_TEST_EGL
+                    Qt6::Core "${LIBVIRTUALDISPLAY_KWIN_LIBRARY}" ${CMAKE_DL_LIBS})
+            add_test(NAME linux_kwin_native_allocation COMMAND test_kwin_native_allocation)
+            set_tests_properties(linux_kwin_native_allocation PROPERTIES SKIP_RETURN_CODE 77 LABELS "integration;gpu")
+        endif()
     endif()
     find_program(LIBVIRTUALDISPLAY_BASH_EXECUTABLE bash)
     if(LIBVIRTUALDISPLAY_BASH_EXECUTABLE)

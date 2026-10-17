@@ -46,11 +46,14 @@ def main() -> int:
         "matches > 1",
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
-        "return 5",
+        "return 7",
         "stop_kwin_preload_inheritance",
         "running_inside_kwin",
         "configure_allocator_routing(dlsym)",
-        "hooks_enabled.store(legacy_allocator && !native_allocator",
+        "native_allocator_runtime_compatible",
+        "VIBESHINE_KWIN_NATIVE_LIBRARY_NAME",
+        "software_allocation = options.software",
+        "hooks_enabled.store((legacy_allocator && !native_allocator) || native_supported",
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem",
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE",
         'readlink("/proc/self/exe"',
@@ -65,7 +68,7 @@ def main() -> int:
         "hooks_enabled.load(std::memory_order_acquire)",
         "drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER",
         "pci_matches(*opened->businfo.pci, identity)",
-        "owned_render_fds.emplace(allocator, render_fd)",
+        "owned_render_fds.emplace(allocator, allocator_fds {render_fd, kms_fd})",
     ), interposer_path.name)
     require("drmIoctl" not in interposer, "physical-connector DRM ioctl suppression returned")
     require("HEADLESS_HDR" not in interposer, "physical headless-HDR policy returned")
