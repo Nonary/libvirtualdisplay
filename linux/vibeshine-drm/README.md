@@ -90,6 +90,17 @@ with its normal page alignment. Other pixel depths and imported PRIME/tiled
 buffers retain their existing allocation and layout handling. This does not
 establish that every odd-sized codec configuration is supported.
 
+`tests/linux/test-native-dumb-allocation.py linux/vibeshine-drm` compiles the
+same `vibeshine_drm_dumb.c` used by Kbuild, with mocks confined to kernel APIs.
+The test observes backing allocation requests, returned stride/size, logical
+dimensions, row writes, overflow and error handling, and PRIME registration.
+For reproducible historical red/green evidence, run
+`tests/linux/test-native-dumb-regression.py --kernel-build /path/to/kernel/build
+--output-dir /path/to/new/evidence-directory`. It compiles the complete pre-fix
+driver from Git and calls its registered allocator through the same API mocks;
+the expected failure is pitch 13760 instead of 13824 at logical 3440x1440.
+These component tests do not establish AMD EGL/VAAPI runtime behavior.
+
 Both ioctls are observational and cannot modify display state. Presentation
 waiting does not require DRM master ownership; framebuffer export requires
 `CAP_SYS_ADMIN`, matching direct KMS capture. ABI additions must preserve the fixed-width

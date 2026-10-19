@@ -94,6 +94,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     find_program(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE NAMES python3)
     if(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE)
+        add_test(NAME linux_drm_native_allocation
+                COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/tests/linux/test-native-dumb-allocation.py"
+                    "${LIBVIRTUALDISPLAY_LINUX_ROOT}/vibeshine-drm")
         add_test(NAME linux_vkms_peercred
                 COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
                     "${PROJECT_SOURCE_DIR}/tests/linux/test-vkms-peercred.py"

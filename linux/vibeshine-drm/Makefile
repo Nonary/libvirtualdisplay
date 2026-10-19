@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 vibeshine_drm-y := \
 	vkms_drv.o \
+	vibeshine_drm_dumb.o \
 	vkms_plane.o \
 	vkms_output.o \
 	vkms_formats.o \

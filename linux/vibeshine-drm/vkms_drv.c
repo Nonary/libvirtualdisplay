@@ -20,8 +20,6 @@
 #include <linux/fcntl.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
-#include <linux/mm.h>
-#include <linux/overflow.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
@@ -47,6 +45,7 @@
 #include "vkms_configfs.h"
 #include "vkms_drv.h"
 #include "vibeshine_drm_change.h"
+#include "vibeshine_drm_dumb.h"
 #include "vibeshine_drm_present.h"
 #include "vibeshine_drm_uapi.h"
 #include "vibeshine_drm_compat.h"
@@ -740,56 +739,12 @@ static void vkms_atomic_commit_tail(struct drm_atomic_commit *old_state)
 	drm_atomic_helper_cleanup_planes(dev, old_state);
 }
 
-static int vkms_dumb_create(struct drm_file *file, struct drm_device *dev,
-			    struct drm_mode_create_dumb *args)
-{
-	struct drm_mode_create_dumb allocation = *args;
-	u32 pitch_bits, size;
-	int ret;
-
-	/* KWin's native software scanout uses 32-bit RGB dumb buffers. AMD's
-	 * linear DMA-BUF import needs 256-byte rows on GFX9-11 and 128 on GFX12.
-	 * Pad the private allocation, not the logical dimensions returned to the
-	 * compositor. CREATE_DUMB's pitch then governs both row writes and export.
-	 * Other pixel depths retain the kernel helper's existing behavior.
-	 */
-	if (args->bpp != 32)
-		return drm_gem_shmem_dumb_create(file, dev, args);
-
-	if (!args->width || !args->height ||
-	    check_add_overflow(args->width, 63U, &allocation.width))
-		return -EINVAL;
-	allocation.width &= ~63U;
-
-	/* Linux 6.16's shmem helper computes width * bpp and pitch * height
-	 * in u32. Recheck those bounds after padding, including PAGE_ALIGN's
-	 * addition, before asking any supported kernel helper to allocate.
-	 */
-	if (check_mul_overflow(allocation.width, args->bpp, &pitch_bits) ||
-	    check_mul_overflow(pitch_bits / 8, args->height, &size) ||
-	    size > U32_MAX - (PAGE_SIZE - 1))
-		return -EINVAL;
-
-	allocation.pitch = 0;
-	allocation.size = 0;
-	allocation.handle = 0;
-	ret = drm_gem_shmem_dumb_create(file, dev, &allocation);
-	if (ret)
-		return ret;
-
-	args->pitch = allocation.pitch;
-	args->size = allocation.size;
-	args->handle = allocation.handle;
-	return 0;
-}
-
 static const struct drm_driver vkms_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM,
 	.fops			= &vkms_driver_fops,
 	.ioctls			= vkms_ioctls,
 	.num_ioctls		= ARRAY_SIZE(vkms_ioctls),
-	VIBESHINE_DRM_SHMEM_PRIME_DRIVER_OPS,
-	.dumb_create		= vkms_dumb_create,
+	VIBESHINE_DRM_SHMEM_DRIVER_OPS,
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 
 	.name			= DRIVER_NAME,
