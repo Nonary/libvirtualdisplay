@@ -146,6 +146,193 @@ int main(void) {
         subprocess.run([str(binary_path)], check=True)
 
 
+def validate_shmem_prime_callbacks(driver_root: Path) -> None:
+    """Preserve the kernel-era PRIME default when replacing only dumb_create."""
+    source = r"""
+#include <assert.h>
+#include "vibeshine_drm_compat.h"
+void drm_gem_shmem_prime_import_no_map(void) {}
+void drm_gem_shmem_prime_import_sg_table(void) {}
+struct driver_ops {
+    void (*gem_prime_import)(void);
+    void (*gem_prime_import_sg_table)(void);
+};
+static const struct driver_ops ops = {VIBESHINE_DRM_SHMEM_PRIME_DRIVER_OPS};
+int main(void) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+    assert(ops.gem_prime_import == drm_gem_shmem_prime_import_no_map);
+    assert(ops.gem_prime_import_sg_table == 0);
+#else
+    assert(ops.gem_prime_import == 0);
+    assert(ops.gem_prime_import_sg_table == drm_gem_shmem_prime_import_sg_table);
+#endif
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-prime-") as temporary_dir:
+        root = Path(temporary_dir)
+        (root / "linux").mkdir()
+        (root / "linux/slab.h").write_text("", encoding="utf-8")
+        (root / "linux/version.h").write_text(
+            "#define KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))\n",
+            encoding="utf-8",
+        )
+        source_path = root / "prime-callback.c"
+        binary_path = root / "prime-callback"
+        source_path.write_text(source, encoding="utf-8")
+        for major, minor in ((6, 16), (6, 17), (6, 18), (7, 2)):
+            subprocess.run(
+                [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 f"-DLINUX_VERSION_CODE={(major << 16) + (minor << 8)}",
+                 "-I", str(root), "-I", str(driver_root), str(source_path), "-o", str(binary_path)],
+                check=True,
+            )
+            subprocess.run([str(binary_path)], check=True)
+
+
+def validate_native_dumb_allocation(driver_root: Path) -> None:
+    """Exercise the real native allocator, including its kernel-helper boundary."""
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    require("static int vkms_dumb_create(" in driver, "native dumb allocator is missing")
+    start = driver.index("static int vkms_dumb_create(")
+    end = driver.index("static const struct drm_driver vkms_driver", start)
+    require(re.search(r"\.dumb_create\s*=\s*vkms_dumb_create", driver[end:]) is not None,
+            "native dumb allocator is not installed in the DRM callbacks")
+    source = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef uint32_t u32;
+#define U32_MAX UINT32_MAX
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096U
+#endif
+#define check_add_overflow(a, b, result) __builtin_add_overflow(a, b, result)
+#define check_mul_overflow(a, b, result) __builtin_mul_overflow(a, b, result)
+struct drm_file { int unused; } file;
+struct drm_device { int unused; } device;
+struct drm_mode_create_dumb {
+    uint32_t height, width, bpp, flags, handle, pitch;
+    uint64_t size;
+};
+static struct drm_mode_create_dumb allocated;
+static unsigned int calls;
+static int allocation_error;
+static int drm_gem_shmem_dumb_create(struct drm_file *f, struct drm_device *d,
+                                   struct drm_mode_create_dumb *args) {
+    assert(f == &file && d == &device);
+    allocated = *args;
+    ++calls;
+    if (allocation_error) return allocation_error;
+    /* Model the oldest supported helper's 32-bit size arithmetic. */
+    args->pitch = (args->width * args->bpp + 7U) / 8U;
+    args->size = (args->pitch * args->height + PAGE_SIZE - 1U) & ~(PAGE_SIZE - 1U);
+    args->handle = 42;
+    return 0;
+}
+""" + driver[start:end] + r"""
+static void check_layout(uint32_t width, uint32_t height) {
+    struct drm_mode_create_dumb args = {
+        .width = width, .height = height, .bpp = 32,
+        .pitch = 17, .size = 18, .handle = 19,
+    };
+    uint64_t expected_pitch = ((uint64_t)width * 4U + 255U) / 256U * 256U;
+    uint64_t expected_size = (expected_pitch * height + PAGE_SIZE - 1U) &
+                             ~((uint64_t)PAGE_SIZE - 1U);
+    unsigned int previous_calls = calls;
+    assert(vkms_dumb_create(&file, &device, &args) == 0);
+    assert(calls == previous_calls + 1);
+    assert(args.width == width && args.height == height && args.bpp == 32);
+    assert(args.pitch == expected_pitch && args.size == expected_size && args.handle == 42);
+    assert(allocated.width == expected_pitch / 4U && allocated.height == height);
+    assert(allocated.pitch == 0 && allocated.size == 0 && allocated.handle == 0);
+    assert(args.size >= (uint64_t)args.pitch * height);
+}
+
+static void check_rejected(uint32_t width, uint32_t height) {
+    struct drm_mode_create_dumb args = {.width = width, .height = height, .bpp = 32};
+    struct drm_mode_create_dumb before = args;
+    unsigned int previous_calls = calls;
+    assert(vkms_dumb_create(&file, &device, &args) == -EINVAL);
+    assert(calls == previous_calls);
+    assert(memcmp(&args, &before, sizeof(args)) == 0);
+}
+
+static void check_row_writes(uint32_t width, uint32_t height) {
+    struct drm_mode_create_dumb args = {.width = width, .height = height, .bpp = 32};
+    assert(vkms_dumb_create(&file, &device, &args) == 0);
+    unsigned char *mapping = malloc(args.size);
+    assert(mapping);
+    memset(mapping, 0xa5, args.size);
+    /* KWin keeps the logical size and maps/writes rows using CREATE_DUMB's pitch. */
+    for (uint32_t y = 0; y < height; ++y)
+        memset(mapping + (size_t)y * args.pitch, 0x3c, (size_t)width * 4U);
+    for (uint32_t y = 0; y < height; ++y) {
+        assert(mapping[(size_t)y * args.pitch] == 0x3c);
+        assert(mapping[(size_t)y * args.pitch + width * 4U - 1U] == 0x3c);
+        for (uint32_t x = width * 4U; x < args.pitch; ++x)
+            assert(mapping[(size_t)y * args.pitch + x] == 0xa5);
+    }
+    assert(mapping[args.size - 1U] == 0xa5);
+    free(mapping);
+}
+
+int main(void) {
+    const uint32_t widths[] = {1, 63, 64, 65, 1280, 1920, 2176, 2190, 2448,
+                               2560, 3120, 3440, 3456, 3840, 8191, 8192};
+    const uint32_t heights[] = {1, 1179, 1440, 1848, 8192};
+    for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); ++w)
+        for (size_t h = 0; h < sizeof(heights) / sizeof(heights[0]); ++h)
+            check_layout(widths[w], heights[h]);
+    check_row_writes(3440, 1440);
+    check_row_writes(2190, 1179);
+
+    check_rejected(0, 1440);
+    check_rejected(3440, 0);
+    check_rejected(U32_MAX, 1); /* width alignment overflow */
+    check_rejected(U32_MAX - 63U, 1); /* oldest helper's width * bpp overflow */
+    check_rejected(U32_MAX / 32U, 1); /* alignment crosses that arithmetic limit */
+    check_layout((U32_MAX / 32U) & ~63U, 1);
+    check_rejected(64, U32_MAX / 256U + 1U); /* pitch * height overflow */
+    check_rejected(64, (U32_MAX & ~(PAGE_SIZE - 1U)) / 256U + 1U);
+    check_layout(64, (U32_MAX & ~(PAGE_SIZE - 1U)) / 256U);
+
+    struct drm_mode_create_dumb args = {.width = 3440, .height = 1440, .bpp = 32};
+    struct drm_mode_create_dumb before = args;
+    allocation_error = -ENOMEM;
+    assert(vkms_dumb_create(&file, &device, &args) == -ENOMEM);
+    assert(memcmp(&args, &before, sizeof(args)) == 0);
+    allocation_error = -EIO;
+    assert(vkms_dumb_create(&file, &device, &args) == -EIO);
+    allocation_error = 0;
+
+    /* Other pixel depths retain the existing kernel allocator's contract. */
+    const uint32_t depths[] = {8, 16, 24, 30, 48, 64};
+    for (size_t i = 0; i < sizeof(depths) / sizeof(depths[0]); ++i) {
+        args = (struct drm_mode_create_dumb){.width = 65, .height = 17, .bpp = depths[i]};
+        before = args;
+        unsigned int previous_calls = calls;
+        assert(vkms_dumb_create(&file, &device, &args) == 0);
+        assert(calls == previous_calls + 1);
+        assert(memcmp(&allocated, &before, sizeof(args)) == 0);
+    }
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-dumb-") as temporary_dir:
+        source_path = Path(temporary_dir) / "dumb-allocation.c"
+        binary_path = Path(temporary_dir) / "dumb-allocation"
+        source_path.write_text(source, encoding="utf-8")
+        for page_size in (4096, 65536):
+            subprocess.run(
+                [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 f"-DPAGE_SIZE={page_size}U", str(source_path), "-o", str(binary_path)], check=True,
+            )
+            subprocess.run([str(binary_path)], check=True)
+
+
 def validate_frame_export(driver_root: Path) -> None:
     """Exercise the actual export helper with kernel ownership APIs stubbed."""
     driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
@@ -769,6 +956,8 @@ def main() -> int:
     validate_reboot_notifier(driver_root)
     validate_uapi_layout(driver_root)
     validate_requested_mode_policy(driver_root)
+    validate_shmem_prime_callbacks(driver_root)
+    validate_native_dumb_allocation(driver_root)
     validate_frame_export(driver_root)
     validate_implicit_frame_layout(driver_root)
     validate_scanout_negotiation(driver_root)

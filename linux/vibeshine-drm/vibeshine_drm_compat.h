@@ -18,6 +18,17 @@
  */
 #define VIBESHINE_DRM_MIN_KERNEL_VERSION KERNEL_VERSION(6, 16, 0)
 
+/* Keep the kernel's default PRIME import while overriding dumb allocation.
+ * Linux 6.17 switched shmem imports to the no-map callback.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+#define VIBESHINE_DRM_SHMEM_PRIME_DRIVER_OPS \
+	.gem_prime_import = drm_gem_shmem_prime_import_no_map
+#else
+#define VIBESHINE_DRM_SHMEM_PRIME_DRIVER_OPS \
+	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table
+#endif
+
 /* Full color-pipeline and programmable background support use the 7.1 API. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 #define VIBESHINE_DRM_HAS_COLOR_PIPELINE 1

@@ -81,6 +81,15 @@ Non-linear imported PRIME objects are passed through to userspace as the
 renderer GPU's original DMA-BUF; the export ioctl fails rather than silently
 copying a virtual-device shmem buffer.
 
+Native 32-bit RGB dumb buffers use a 256-byte-aligned row pitch so AMD EGL
+can import their linear DMA-BUFs at widths such as 2190, 2448, 3120, and 3440.
+Only the backing allocation is padded: the compositor keeps the requested
+width and height, and uses the pitch returned by `CREATE_DUMB` for row writes,
+mapping, and framebuffer export. The kernel helper allocates the padded size
+with its normal page alignment. Other pixel depths and imported PRIME/tiled
+buffers retain their existing allocation and layout handling. This does not
+establish that every odd-sized codec configuration is supported.
+
 Both ioctls are observational and cannot modify display state. Presentation
 waiting does not require DRM master ownership; framebuffer export requires
 `CAP_SYS_ADMIN`, matching direct KMS capture. ABI additions must preserve the fixed-width
