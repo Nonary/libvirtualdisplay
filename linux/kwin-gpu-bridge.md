@@ -41,8 +41,10 @@ restart through the normal logout/reboot cycle to load an updated bridge;
 restarting the streaming service does not replace its already loaded library.
 
 When the native bridge cannot enable its hooks, its journal diagnostic reports
-both the library it was built for and the resolved allocator library loaded by
-KWin (or `unknown` when that identity cannot be established). A version mismatch
+both the library it was built for and the current resolved allocator pathname
+(or `unknown` when resolution fails). This pathname is not verified mapped DSO
+identity: a SONAME symlink may have changed since KWin loaded its allocator.
+The diagnostic explicitly marks mapped identity as unverified. A pathname mismatch
 explains why the safe native allocation path was retained; it does **not** prove
 that KWin changed ABI, that CPU upload is occurring, or that rebuilding will
 restore a particular frame rate. After installing a matching rebuilt package

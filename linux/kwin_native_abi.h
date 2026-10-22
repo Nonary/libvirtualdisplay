@@ -19,11 +19,12 @@ namespace vibeshine::kwin {
 
   struct native_abi_probe {
     native_abi_result result;
-    std::array<char, PATH_MAX> runtime_library {};
+    std::array<char, PATH_MAX> resolved_library {};
   };
 
-  // Resolve the library that owns the actual allocator, not a package version
-  // or the current libkwin.so symlink (which may change under a running KWin).
+  // Preserve the existing pathname-based guard. dladdr may return a SONAME
+  // symlink that has changed since load; realpath describes its current target,
+  // not necessarily the mapped DSO. Do not report this as loaded identity.
   inline native_abi_probe probe_native_abi(
     const char *symbol, const char *expected_library,
     void *(*lookup)(void *, const char *) = dlsym,
@@ -48,7 +49,7 @@ namespace vibeshine::kwin {
     if (!name) {
       return probe;
     }
-    std::snprintf(probe.runtime_library.data(), probe.runtime_library.size(), "%s", name + 1);
+    std::snprintf(probe.resolved_library.data(), probe.resolved_library.size(), "%s", name + 1);
     probe.result = std::strcmp(name + 1, expected_library) == 0 ?
       native_abi_result::compatible : native_abi_result::different_library;
     return probe;
@@ -62,7 +63,7 @@ namespace vibeshine::kwin {
     const char *reason = "allocator symbol unavailable";
     switch (probe.result) {
       case native_abi_result::different_library:
-        reason = "library version mismatch";
+        reason = "library pathname mismatch";
         break;
       case native_abi_result::unavailable_library:
         reason = "allocator library unavailable";
@@ -74,11 +75,11 @@ namespace vibeshine::kwin {
         break;
     }
     std::fprintf(output,
-      "[vibeshine-kwin-gpu] native GPU bridge disabled: %s (built for %s; loaded %s). "
+      "[vibeshine-kwin-gpu] native GPU bridge disabled: %s (built for %s; resolved current pathname %s; mapped library identity unverified). "
       "Keeping native KMS allocation; virtual capture may fall back to CPU upload. "
       "Install a bridge package rebuilt against the installed KWin, then log out and back in or reboot. "
       "Restarting the streaming service alone does not reload the compositor bridge.\n",
       reason, expected_library,
-      probe.runtime_library[0] ? probe.runtime_library.data() : "unknown");
+      probe.resolved_library[0] ? probe.resolved_library.data() : "unknown");
   }
 }
