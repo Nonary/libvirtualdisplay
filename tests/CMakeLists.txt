@@ -44,6 +44,19 @@ add_test(NAME driver_inf_in_sync
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_kwin_native_abi "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-native-abi.cpp")
+    target_link_libraries(test_kwin_native_abi PRIVATE ${CMAKE_DL_LIBS})
+    add_library(kwin_abi_fixture_a SHARED "${PROJECT_SOURCE_DIR}/tests/linux/kwin-abi-fixture.cpp")
+    add_library(kwin_abi_fixture_b SHARED "${PROJECT_SOURCE_DIR}/tests/linux/kwin-abi-fixture.cpp")
+    target_compile_definitions(kwin_abi_fixture_a PRIVATE KWIN_ABI_FIXTURE_VALUE=680)
+    target_compile_definitions(kwin_abi_fixture_b PRIVATE KWIN_ABI_FIXTURE_VALUE=681)
+    set_target_properties(kwin_abi_fixture_a PROPERTIES PREFIX "" SUFFIX "" OUTPUT_NAME "libkwin.so.6.8.0")
+    set_target_properties(kwin_abi_fixture_b PROPERTIES PREFIX "" SUFFIX "" OUTPUT_NAME "libkwin.so.6.8.1")
+    add_dependencies(test_kwin_native_abi kwin_abi_fixture_a kwin_abi_fixture_b)
+    # Linux CI builds this aggregate target before running all CTest entries.
+    add_dependencies(test_libvirtualdisplay test_kwin_native_abi)
+    add_test(NAME linux_kwin_native_abi COMMAND test_kwin_native_abi
+            "$<TARGET_FILE:kwin_abi_fixture_a>" "$<TARGET_FILE:kwin_abi_fixture_b>")
     if(TARGET vibeshine_kwin_gpu)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(LIBVIRTUALDISPLAY_TEST_KWIN REQUIRED IMPORTED_TARGET libdrm gbm)

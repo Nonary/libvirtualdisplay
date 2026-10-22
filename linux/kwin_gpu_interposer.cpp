@@ -23,6 +23,7 @@
 
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
   #include <core/graphicsbufferallocator.h>
+  #include "kwin_native_abi.h"
 #endif
 
 namespace {
@@ -63,18 +64,18 @@ namespace {
   constexpr char native_render_device_symbol[] = "_ZNK4KWin10GpuManager26findCompatibleRenderDeviceEP10_drmDevice";
 #endif
 
-  bool native_allocator_runtime_compatible() {
+  bool native_allocator_runtime_compatible(bool report_failure = false) {
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
     // GraphicsBufferOptions is a C++ ABI. Only read the layout of the exact
     // KWin library whose public headers were used to build this bridge.
-    const auto allocate = dlsym(RTLD_NEXT, native_allocate_symbol);
-    Dl_info info {};
-    std::array<char, 4096> resolved {};
-    if (allocate && dladdr(allocate, &info) && info.dli_fname &&
-        realpath(info.dli_fname, resolved.data())) {
-      const auto *name = std::strrchr(resolved.data(), '/');
-      return name && std::strcmp(name + 1, VIBESHINE_KWIN_NATIVE_LIBRARY_NAME) == 0;
+    const auto probe = vibeshine::kwin::probe_native_abi(
+      native_allocate_symbol, VIBESHINE_KWIN_NATIVE_LIBRARY_NAME);
+    if (report_failure) {
+      vibeshine::kwin::report_native_abi_failure(stderr, probe, VIBESHINE_KWIN_NATIVE_LIBRARY_NAME);
     }
+    return probe.result == vibeshine::kwin::native_abi_result::compatible;
+#else
+    (void)report_failure;
 #endif
     return false;
   }
@@ -266,6 +267,7 @@ namespace {
     (void)unsetenv("LD_PRELOAD");
     (void)unsetenv(kPreloadActiveEnvironment.data());
     if (!hooks_enabled.load(std::memory_order_acquire)) {
+      (void)native_allocator_runtime_compatible(true);
       constexpr char message[] =
         "[vibeshine-kwin-gpu] preserving native KMS allocator for current KWin ABI\n";
       (void)write(STDERR_FILENO, message, sizeof(message) - 1);
