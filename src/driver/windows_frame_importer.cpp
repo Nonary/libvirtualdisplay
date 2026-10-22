@@ -1,6 +1,7 @@
 #include "virtual_display/driver/windows_frame_importer.h"
 #include "virtual_display/driver/windows_control_protocol.h"
 #ifdef _WIN32
+#include <dxgi1_4.h>
 
 namespace virtual_display::driver {
   namespace {
