@@ -44,6 +44,9 @@ add_test(NAME driver_inf_in_sync
             "${PROJECT_SOURCE_DIR}/src/driver/windows_driver/SunshineVirtualDisplayDriver.inf")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_kwin_native_abi "${PROJECT_SOURCE_DIR}/tests/linux/test-kwin-native-abi.cpp")
+    target_link_libraries(test_kwin_native_abi PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME linux_kwin_native_abi COMMAND test_kwin_native_abi)
     if(TARGET vibeshine_kwin_gpu)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(LIBVIRTUALDISPLAY_TEST_KWIN REQUIRED IMPORTED_TARGET libdrm gbm)

@@ -40,6 +40,16 @@ permissions are unchanged. A running compositor must
 restart through the normal logout/reboot cycle to load an updated bridge;
 restarting the streaming service does not replace its already loaded library.
 
+When the native bridge cannot enable its hooks, its journal diagnostic reports
+both the library it was built for and the resolved allocator library loaded by
+KWin (or `unknown` when that identity cannot be established). A version mismatch
+explains why the safe native allocation path was retained; it does **not** prove
+that KWin changed ABI, that CPU upload is occurring, or that rebuilding will
+restore a particular frame rate. After installing a matching rebuilt package
+and restarting the compositor, verify the virtual GPU association, capture
+import path, and requested frame cadence separately. Do not bypass the exact
+library guard to suppress the warning.
+
 KWin still chooses its primary GPU using its own renderer/output policy;
 accelerating the faux renderer can change that choice.
 
