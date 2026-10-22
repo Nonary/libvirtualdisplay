@@ -1,6 +1,7 @@
 #pragma once
 
 #include "virtual_display/driver/control_protocol.h"
+#include "virtual_display/driver/frame_transport_protocol.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,10 @@ namespace virtual_display::driver {
     explicit ControlClient(ControlTransport &transport);
 
     ControlResult<ProtocolVersion> query_protocol_version();
+    ControlResult<FrameTransportCapabilities> query_frame_transport_capabilities();
+    ControlResult<FrameTransportTarget> query_frame_transport_target(
+      const FrameTransportTargetRequest &request
+    );
     ControlOperationResult check_protocol_compatible();
     ControlResult<CreateTemporaryDisplayResult> create_temporary_display(const CreateTemporaryDisplayRequest &request);
     ControlResult<CreateTemporaryDisplayResult> create_temporary_display_owned(

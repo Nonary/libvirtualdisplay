@@ -10,8 +10,14 @@ add_library(${MODULE_ALIAS} ALIAS ${MODULE})
 target_include_directories(${MODULE} PUBLIC include)
 target_compile_features(${MODULE} PUBLIC cxx_std_20)
 
+option(LIBVIRTUALDISPLAY_ENABLE_FRAME_TRANSPORT
+        "Enable the experimental IddCx frame-push producer and registration IOCTLs" OFF)
+if(LIBVIRTUALDISPLAY_ENABLE_FRAME_TRANSPORT)
+    target_compile_definitions(${MODULE} PUBLIC VDD_ENABLE_FRAME_TRANSPORT=1)
+endif()
+
 if(WIN32)
-    target_link_libraries(${MODULE} PRIVATE setupapi)
+    target_link_libraries(${MODULE} PRIVATE setupapi d3d11 dxgi kernelbase)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

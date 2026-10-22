@@ -119,6 +119,13 @@ namespace virtual_display::driver {
     std::uint32_t reap_expired(std::chrono::steady_clock::time_point now);
 
     [[nodiscard]] std::optional<TemporaryDisplayRecord> find_temporary_display(std::uint64_t display_id) const;
+    // Capture authorization is stronger than display enumeration: only a live,
+    // owner-capability-protected temporary lease may export its composed pixels.
+    [[nodiscard]] std::optional<TemporaryDisplayRecord> authorize_temporary_display_owner(
+      const LeaseDisplayRequest &request,
+      const OwnerCapability &owner_capability,
+      std::chrono::steady_clock::time_point now
+    ) const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> temporary_displays() const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> temporary_displays_for_lease(std::uint64_t lease_id) const;
     [[nodiscard]] std::vector<TemporaryDisplayRecord> pending_departure_temporary_displays() const;

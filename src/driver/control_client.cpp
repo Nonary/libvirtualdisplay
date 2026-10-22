@@ -23,6 +23,48 @@ namespace virtual_display::driver {
     return {version.status, version.native_error};
   }
 
+  ControlResult<FrameTransportCapabilities> ControlClient::query_frame_transport_capabilities() {
+    const auto version = query_protocol_version();
+    if (!version.ok()) {
+      return {version.status, {}, version.native_error};
+    }
+    if (version.value.minor < kFrameTransportCapabilitiesProtocolMinor) {
+      // Older signed drivers keep their normal display/capture path, without an
+      // unsupported IOCTL or an inference from their minor version.
+      return {};
+    }
+    auto result = ioctl_out<FrameTransportCapabilities>(kIoctlQueryFrameTransportCapabilities, nullptr, 0);
+    if (result.ok() &&
+        (result.value.version != kFrameTransportCapabilitiesVersion ||
+         result.value.size != sizeof(FrameTransportCapabilities) ||
+         result.value.reserved != 0 ||
+         ((result.value.capabilities & kFrameTransportCapabilityKeyedMutexRing) != 0 &&
+          result.value.max_ring_slots != kFrameRingSlotCount))) {
+      result.status = ControlStatus::InvalidOutput;
+    }
+    return result;
+  }
+
+  ControlResult<FrameTransportTarget> ControlClient::query_frame_transport_target(
+    const FrameTransportTargetRequest &request
+  ) {
+    const auto version = query_protocol_version();
+    if (!version.ok()) {
+      return {version.status, {}, version.native_error};
+    }
+    if (version.value.minor < kFrameTransportCapabilitiesProtocolMinor) {
+      return {ControlStatus::ProtocolIncompatible, {}, 0};
+    }
+    if (!valid_frame_transport_target_request(request)) {
+      return {ControlStatus::InvalidOutput, {}, 0};
+    }
+    auto result = ioctl_out<FrameTransportTarget>(kIoctlQueryFrameTransportTarget, &request, sizeof(request));
+    if (result.ok() && !valid_frame_transport_target(result.value, request)) {
+      result.status = ControlStatus::InvalidOutput;
+    }
+    return result;
+  }
+
   ControlResult<CreateTemporaryDisplayResult> ControlClient::create_temporary_display(
     const CreateTemporaryDisplayRequest &request
   ) {

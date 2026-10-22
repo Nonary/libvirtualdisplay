@@ -402,7 +402,12 @@ if (!released.ok()) {
 
 ### Protocol notes
 
-- The current protocol version is `3.8.0`. Protocol 3.7 adds owned temporary
+- The current protocol version is `3.8.0`. Protocol 3.8 adds requested-resolution
+  mode catalogs and an explicit frame transport capability query. The
+  IddCx producer and owner-authenticated frame ring are available only in an
+  explicit experimental build option that defaults off; Windows/WDK/GPU
+  qualification is still required. See [the frame transport notes](docs/frame-transport.md).
+- Protocol 3.7 adds owned temporary
   display creation and capability-based lease reclaim without exposing lease IDs
   through global display-state queries.
 - Reclaim rotates only lease ownership and expiry. Connector assignment and the

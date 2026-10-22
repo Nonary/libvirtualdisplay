@@ -90,6 +90,7 @@ TEST(VirtualDisplayDriverControlProtocol, ComputesBufferedUnknownDeviceIoctlCode
   EXPECT_EQ(vdd::kIoctlSetRenderAdapter, 0x0022a42cu);
   EXPECT_EQ(vdd::kIoctlCreateTemporaryDisplayOwned, 0x0022e430u);
   EXPECT_EQ(vdd::kIoctlReclaimTemporaryDisplay, 0x0022e434u);
+  EXPECT_EQ(vdd::kIoctlQueryFrameTransportCapabilities, 0x00226438u);
 }
 
 TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionUsesDedicatedNamespace) {

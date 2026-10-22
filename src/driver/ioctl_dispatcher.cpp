@@ -79,6 +79,20 @@ namespace virtual_display::driver {
     std::size_t bytes_returned = 0;
 
     switch (ioctl_code) {
+      case kIoctlQueryFrameTransportCapabilities: {
+        if (input_size != 0) {
+          return {IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+        FrameTransportCapabilities capabilities {};
+#if defined(VDD_ENABLE_FRAME_TRANSPORT) && defined(_WIN32)
+        capabilities.capabilities = kFrameTransportCapabilityKeyedMutexRing;
+        capabilities.max_ring_slots = kFrameRingSlotCount;
+#endif
+        if (!write_output(output, output_size, capabilities, bytes_returned)) {
+          return {IoctlStatus::InvalidOutputBuffer, 0, {}};
+        }
+        return {IoctlStatus::Success, bytes_returned, {}};
+      }
       case kIoctlGetProtocolVersion: {
         ProtocolVersion version {};
         if (!write_output(output, output_size, version, bytes_returned)) {

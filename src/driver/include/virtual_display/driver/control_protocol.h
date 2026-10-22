@@ -101,6 +101,8 @@ namespace virtual_display::driver {
     SetRenderAdapter = 0x90b,
     CreateTemporaryDisplayOwned = 0x90c,
     ReclaimTemporaryDisplay = 0x90d,
+    QueryFrameTransportCapabilities = 0x90e,
+    QueryFrameTransportTarget = 0x911,
   };
 
   enum class IoctlAccess : std::uint32_t {
@@ -147,6 +149,33 @@ namespace virtual_display::driver {
     ioctl_code(IoctlFunction::CreateTemporaryDisplayOwned, IoctlAccess::ReadWrite);
   inline constexpr std::uint32_t kIoctlReclaimTemporaryDisplay =
     ioctl_code(IoctlFunction::ReclaimTemporaryDisplay, IoctlAccess::ReadWrite);
+  inline constexpr std::uint32_t kIoctlQueryFrameTransportCapabilities =
+    ioctl_code(IoctlFunction::QueryFrameTransportCapabilities, IoctlAccess::Read);
+  inline constexpr std::uint32_t kIoctlQueryFrameTransportTarget =
+    ioctl_code(IoctlFunction::QueryFrameTransportTarget, IoctlAccess::Read);
+
+  inline constexpr std::uint32_t kFrameTransportCapabilitiesVersion = 1;
+  inline constexpr std::uint16_t kFrameTransportCapabilitiesProtocolMinor = 8;
+  inline constexpr std::uint64_t kFrameTransportCapabilityKeyedMutexRing = 1;
+  inline constexpr std::uint32_t kFrameRingSlotCount = 4;
+
+  // A protocol version alone never promises a working GPU transport. The native
+  // capability is exposed only by an explicitly enabled build containing the
+  // importer, producer, and teardown path; the feature remains disabled by
+  // default and still requires Windows/WDK/GPU qualification. Existing display
+  // control requests are unchanged.
+  struct FrameTransportCapabilities {
+    Guid api_namespace {kApiNamespaceGuid};
+    std::uint32_t version {kFrameTransportCapabilitiesVersion};
+    std::uint32_t size {sizeof(FrameTransportCapabilities)};
+    std::uint64_t capabilities {};
+    std::uint32_t max_ring_slots {};
+    std::uint32_t reserved {};
+  };
+
+  static_assert(std::is_standard_layout_v<FrameTransportCapabilities>);
+  static_assert(sizeof(FrameTransportCapabilities) == 40);
+  static_assert(offsetof(FrameTransportCapabilities, capabilities) == 24);
 
   struct ProtocolVersion {
     Guid api_namespace {kApiNamespaceGuid};

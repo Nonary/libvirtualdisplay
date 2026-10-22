@@ -5,6 +5,8 @@
 #include "virtual_display/driver/ioctl_dispatcher.h"
 #include "virtual_display/driver/hdr_capabilities.h"
 #include "virtual_display/driver/lease_store.h"
+#include "virtual_display/driver/frame_ring_server.h"
+#include "virtual_display/driver/windows_frame_importer.h"
 #include "virtual_display/driver/windows_control_protocol.h"
 #include "virtual_display/driver/windows_driver_modes.h"
 #include "virtual_display/driver/windows_driver_state.h"
@@ -27,7 +29,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
+#include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -103,6 +108,9 @@ namespace {
   class IddCxBackend;
   class CursorProcessor;
   class SwapChainProcessor;
+  using FrameRingSnapshotProvider = std::function<vdd::FrameRingSnapshot(
+    std::uint64_t, std::uint64_t
+  )>;
 
   struct AdapterContext {
     IddCxBackend *backend {};
@@ -115,6 +123,7 @@ namespace {
     // load/store conversions keep the call sites unchanged.
     std::atomic<IddCxBackend *> backend {};
     std::uint64_t display_id {};
+    std::uint64_t display_generation {};
   };
 
   struct DeviceContext {
@@ -1403,7 +1412,8 @@ namespace {
   HRESULT create_dxgi_device_for_luid(
     const LUID &adapter_luid,
     Microsoft::WRL::ComPtr<ID3D11Device> &device,
-    Microsoft::WRL::ComPtr<IDXGIDevice> &dxgi_device
+    Microsoft::WRL::ComPtr<IDXGIDevice> &dxgi_device,
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> &device_context
   ) {
     static constexpr D3D_FEATURE_LEVEL kFeatureLevels[] {
       D3D_FEATURE_LEVEL_11_1,
@@ -1414,9 +1424,9 @@ namespace {
 
     const auto create_device = [&](IDXGIAdapter *adapter, const D3D_DRIVER_TYPE driver_type) {
       D3D_FEATURE_LEVEL selected_feature_level {};
-      Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
       device.Reset();
       dxgi_device.Reset();
+      device_context.Reset();
       const HRESULT hr = D3D11CreateDevice(
         adapter,
         driver_type,
@@ -1427,10 +1437,11 @@ namespace {
         D3D11_SDK_VERSION,
         &device,
         &selected_feature_level,
-        &context
+        &device_context
       );
       if (FAILED(hr)) {
         device.Reset();
+        device_context.Reset();
         return hr;
       }
 
@@ -1438,6 +1449,7 @@ namespace {
       if (FAILED(as_hr)) {
         dxgi_device.Reset();
         device.Reset();
+        device_context.Reset();
       }
       return as_hr;
     };
@@ -1820,11 +1832,164 @@ namespace {
     return false;
   }
 
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+  struct FrameRingProducerResources {
+    vdd::FrameRingSnapshot snapshot {};
+    std::shared_ptr<vdd::WindowsImportedFrameRing> imported {};
+    std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, vdd::kFrameRingSlotCount> textures {};
+    std::array<Microsoft::WRL::ComPtr<IDXGIKeyedMutex>, vdd::kFrameRingSlotCount> mutexes {};
+  };
+
+  enum class FramePublishResult {
+    PublishedOrDropped,
+    ModeMismatch,
+    Failed,
+  };
+
+  struct FrameTransportSurfaceMode {
+    std::uint32_t width {};
+    std::uint32_t height {};
+    vdd::AdapterLuid adapter_luid {};
+    std::uint32_t format {};
+    std::uint32_t color_space {};
+  };
+
+  std::shared_ptr<FrameRingProducerResources> open_frame_ring_for_producer(
+    const vdd::FrameRingSnapshot &snapshot,
+    ID3D11Device1 *device,
+    const LUID &render_adapter_luid,
+    const std::uint64_t display_id,
+    const std::uint64_t display_generation
+  ) {
+    if (!snapshot.can_publish() || !snapshot.resources || !device ||
+        snapshot.display_generation != display_generation || !snapshot.ring_generation) return {};
+    const auto imported = std::dynamic_pointer_cast<vdd::WindowsImportedFrameRing>(snapshot.resources);
+    if (!imported) return {};
+    const auto &request = imported->request();
+    if (request.display_id != display_id || request.display_generation != display_generation ||
+        request.adapter_luid != vdd::from_windows_luid(render_adapter_luid)) return {};
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC adapter_desc {};
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetDesc(&adapter_desc)) || adapter_desc.AdapterLuid.LowPart != render_adapter_luid.LowPart ||
+        adapter_desc.AdapterLuid.HighPart != render_adapter_luid.HighPart) return {};
+
+    auto result = std::make_shared<FrameRingProducerResources>();
+    result->snapshot = snapshot;
+    result->imported = imported;
+    for (std::size_t slot = 0; slot < vdd::kFrameRingSlotCount; ++slot) {
+      if (FAILED(device->OpenSharedResource1(imported->texture_handle(slot), IID_PPV_ARGS(&result->textures[slot]))) ||
+          FAILED(result->textures[slot].As(&result->mutexes[slot]))) return {};
+      D3D11_TEXTURE2D_DESC desc {};
+      result->textures[slot]->GetDesc(&desc);
+      if (desc.Width != request.width || desc.Height != request.height || desc.Format != request.format ||
+          desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0) return {};
+    }
+    return result;
+  }
+
+  FramePublishResult publish_frame_to_ring(
+    FrameRingProducerResources &ring,
+    IDXGIResource *surface,
+    ID3D11Device *device,
+    ID3D11DeviceContext *context
+  ) {
+    if (!surface || !device || !context || !ring.snapshot.can_publish() || !ring.imported) {
+      return FramePublishResult::PublishedOrDropped;
+    }
+    const auto &request = ring.imported->request();
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (FAILED(surface->QueryInterface(IID_PPV_ARGS(&source)))) return FramePublishResult::Failed;
+    D3D11_TEXTURE2D_DESC source_desc {};
+    source->GetDesc(&source_desc);
+    if (source_desc.Width != request.width || source_desc.Height != request.height ||
+        source_desc.Format != request.format || source_desc.MipLevels != 1 || source_desc.ArraySize != 1 ||
+        source_desc.SampleDesc.Count != 1 || source_desc.SampleDesc.Quality != 0) {
+      return FramePublishResult::ModeMismatch;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Device> source_device;
+    source->GetDevice(&source_device);
+    Microsoft::WRL::ComPtr<IUnknown> source_identity, target_identity;
+    if (!source_device || FAILED(source_device.As(&source_identity)) || FAILED(device->QueryInterface(IID_PPV_ARGS(&target_identity))) ||
+        source_identity.Get() != target_identity.Get()) return FramePublishResult::Failed;
+
+    for (std::size_t slot = 0; slot < vdd::kFrameRingSlotCount; ++slot) {
+      if (!ring.snapshot.can_publish()) return FramePublishResult::PublishedOrDropped;
+      auto acquired_key = std::uint64_t {0};
+      HRESULT acquire = ring.mutexes[slot]->AcquireSync(0, 0);
+      if (acquire == WAIT_TIMEOUT) {
+        acquire = ring.mutexes[slot]->AcquireSync(1, 0);
+        acquired_key = 1;
+      }
+      if (acquire == WAIT_TIMEOUT) continue;
+      if (acquire != S_OK) return FramePublishResult::Failed;
+      const auto release_unpublished = [&]() {
+        return vdd::release_unpublished_slot(ring.snapshot, acquired_key, [&](const std::uint64_t key) {
+          return ring.mutexes[slot]->ReleaseSync(key) == S_OK;
+        });
+      };
+
+      if (!ring.snapshot.can_publish()) {
+        (void) release_unpublished();
+        return FramePublishResult::PublishedOrDropped;
+      }
+      LARGE_INTEGER captured_qpc {};
+      if (!QueryPerformanceCounter(&captured_qpc) || captured_qpc.QuadPart <= 0) {
+        (void) release_unpublished();
+        return FramePublishResult::Failed;
+      }
+      context->CopyResource(ring.textures[slot].Get(), source.Get());
+      context->Flush();
+      if (FAILED(device->GetDeviceRemovedReason())) {
+        (void) release_unpublished();
+        return FramePublishResult::Failed;
+      }
+      // Retirement takes this same lock. It can invalidate the snapshot while
+      // the GPU copy is in flight, but after it returns no producer can publish
+      // metadata, release key 1, or signal the consumer event. Aborted slot
+      // cleanup uses release_unpublished_slot() to return retired slots to key 0.
+      std::unique_lock publication_lock {ring.snapshot.publication->mutex};
+      if (!ring.snapshot.can_publish()) {
+        // Retirement has already disabled the ring under this lock. Return an
+        // acquired client key as producer-owned so stale pixels cannot remain
+        // visible as a completed frame after clear/replacement.
+        (void) ring.mutexes[slot]->ReleaseSync(0);
+        return FramePublishResult::PublishedOrDropped;
+      }
+      std::uint64_t sequence {};
+      if (!ring.snapshot.next_sequence(sequence)) {
+        (void) ring.mutexes[slot]->ReleaseSync(acquired_key);
+        return FramePublishResult::Failed;
+      }
+      auto &metadata = ring.imported->metadata_view()->slots[slot];
+      metadata.client_cookie = request.client_cookie;
+      metadata.display_generation = ring.snapshot.display_generation;
+      metadata.ring_generation = ring.snapshot.ring_generation;
+      metadata.sequence = sequence;
+      metadata.acquired_qpc = static_cast<std::uint64_t>(captured_qpc.QuadPart);
+      metadata.reserved = 0;
+      MemoryBarrier();
+      if (ring.mutexes[slot]->ReleaseSync(1) != S_OK) return FramePublishResult::Failed;
+      (void) SetEvent(ring.imported->event_handle());
+      return FramePublishResult::PublishedOrDropped;
+    }
+    // All four slots are unavailable at a zero-timeout acquire. The producer
+    // drops this frame instead of introducing backpressure into IddCx.
+    return FramePublishResult::PublishedOrDropped;
+  }
+#endif
+
   class SwapChainProcessor {
   public:
-    SwapChainProcessor(IDDCX_SWAPCHAIN swapchain, HANDLE next_surface_available):
+    SwapChainProcessor(IDDCX_SWAPCHAIN swapchain, HANDLE next_surface_available,
+                       const std::uint64_t display_id, const std::uint64_t display_generation,
+                       FrameRingSnapshotProvider frame_ring_snapshot_provider):
         swapchain_ {swapchain},
         next_surface_available_ {next_surface_available},
+        display_id_ {display_id},
+        display_generation_ {display_generation},
+        frame_ring_snapshot_provider_ {std::move(frame_ring_snapshot_provider)},
         referenced_swapchain_ {reinterpret_cast<WDFOBJECT>(swapchain)} {
       if (referenced_swapchain_) {
         WdfObjectReference(referenced_swapchain_);
@@ -1880,15 +2045,13 @@ namespace {
       if (worker_.joinable()) {
         worker_.join();
       }
-      dxgi_device_.Reset();
-      device_.Reset();
+      reset_devices();
     }
 
     bool stop_for_teardown(const std::chrono::milliseconds timeout) {
       request_stop();
       if (!worker_.joinable()) {
-        dxgi_device_.Reset();
-        device_.Reset();
+        reset_devices();
         return true;
       }
 
@@ -1899,8 +2062,7 @@ namespace {
       const DWORD wait_result = WaitForSingleObject(worker_.native_handle(), wait_ms);
       if (wait_result == WAIT_OBJECT_0) {
         worker_.join();
-        dxgi_device_.Reset();
-        device_.Reset();
+        reset_devices();
         return true;
       }
 
@@ -1927,6 +2089,27 @@ namespace {
         worker_.detach();
       }
     }
+
+    Microsoft::WRL::ComPtr<ID3D11Device1> frame_import_device(const LUID &requested_luid) {
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      std::lock_guard lock {device_mutex_};
+      if (!device_ready_ || requested_luid.LowPart != render_adapter_luid_.LowPart ||
+          requested_luid.HighPart != render_adapter_luid_.HighPart) return {};
+      Microsoft::WRL::ComPtr<ID3D11Device1> result;
+      if (FAILED(device_.As(&result))) return {};
+      return result;
+#else
+      (void) requested_luid;
+      return {};
+#endif
+    }
+
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+    std::optional<FrameTransportSurfaceMode> frame_transport_surface_mode() {
+      std::lock_guard lock {frame_mode_mutex_};
+      return frame_surface_mode_;
+    }
+#endif
 
     void request_stop() {
       stop_requested_.store(true, std::memory_order_release);
@@ -2083,10 +2266,9 @@ namespace {
     }
 
     HRESULT reset_render_device(const LUID &render_adapter_luid) {
-      dxgi_device_.Reset();
-      device_.Reset();
+      reset_devices();
 
-      HRESULT hr = create_dxgi_device_for_luid(render_adapter_luid, device_, dxgi_device_);
+      HRESULT hr = create_dxgi_device_for_luid(render_adapter_luid, device_, dxgi_device_, device_context_);
       if (FAILED(hr)) {
         TraceLoggingWrite(
           g_trace_provider,
@@ -2104,7 +2286,42 @@ namespace {
           TraceLoggingUInt32(static_cast<std::uint32_t>(hr), "HResult")
         );
       }
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      if (SUCCEEDED(hr)) {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC desc {};
+        const bool is_assigned_hardware_device = device_ && SUCCEEDED(device_.As(&dxgi)) &&
+          SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)) &&
+          desc.AdapterLuid.LowPart == render_adapter_luid.LowPart &&
+          desc.AdapterLuid.HighPart == render_adapter_luid.HighPart && device_context_;
+        std::lock_guard lock {device_mutex_};
+        render_adapter_luid_ = is_assigned_hardware_device ? render_adapter_luid : LUID {};
+        device_ready_ = is_assigned_hardware_device;
+      }
+#endif
       return hr;
+    }
+
+    void reset_devices() {
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      if (frame_ring_producer_) {
+        frame_ring_producer_->snapshot.retire_publication();
+      }
+      {
+        std::lock_guard lock {device_mutex_};
+        device_ready_ = false;
+        render_adapter_luid_ = {};
+        frame_ring_producer_.reset();
+      }
+      {
+        std::lock_guard lock {frame_mode_mutex_};
+        frame_surface_mode_.reset();
+      }
+#endif
+      device_context_.Reset();
+      dxgi_device_.Reset();
+      device_.Reset();
     }
 
     void process_frames(const LUID render_adapter_luid) {
@@ -2205,6 +2422,49 @@ namespace {
 
           Microsoft::WRL::ComPtr<IDXGIResource> surface;
           surface.Attach(surface_ptr);
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+          record_frame_transport_surface_mode(surface.Get(), render_adapter_luid);
+          if (frame_ring_snapshot_provider_ && display_generation_) {
+            auto snapshot = frame_ring_snapshot_provider_(display_id_, display_generation_);
+            if (snapshot.can_publish()) {
+              Microsoft::WRL::ComPtr<ID3D11Device1> producer_device;
+              if (FAILED(device_.As(&producer_device))) {
+                delete_swapchain();
+                return;
+              }
+              if (!frame_ring_producer_ || frame_ring_producer_->snapshot.ring_generation != snapshot.ring_generation ||
+                  frame_ring_producer_->snapshot.display_generation != snapshot.display_generation) {
+                frame_ring_producer_ = open_frame_ring_for_producer(
+                  snapshot, producer_device.Get(), render_adapter_luid, display_id_, display_generation_
+                );
+              } else {
+                frame_ring_producer_->snapshot = snapshot;
+                frame_ring_producer_->imported = std::dynamic_pointer_cast<vdd::WindowsImportedFrameRing>(snapshot.resources);
+              }
+              const auto publish_result = frame_ring_producer_ ? publish_frame_to_ring(
+                *frame_ring_producer_, surface.Get(), device_.Get(), device_context_.Get()
+              ) : FramePublishResult::PublishedOrDropped;
+              if (publish_result == FramePublishResult::ModeMismatch) {
+                // Keep servicing the IddCx swapchain, but retire this ring. The
+                // host's bounded first-frame/stall probe will reopen it against
+                // the newly reported mode (or fall back to WGC).
+                frame_ring_producer_->snapshot.retire_publication();
+                frame_ring_producer_.reset();
+                TraceLoggingWrite(g_trace_provider, "FrameRingProducerModeChanged", TraceLoggingUInt64(display_id_, "DisplayId"));
+              } else if (publish_result == FramePublishResult::Failed) {
+                TraceLoggingWrite(g_trace_provider, "FrameRingProducerFrameRejected", TraceLoggingUInt64(display_id_, "DisplayId"));
+                if (frame_ring_producer_) {
+                  frame_ring_producer_->snapshot.retire_publication();
+                  frame_ring_producer_.reset();
+                }
+                delete_swapchain();
+                return;
+              }
+            } else {
+              frame_ring_producer_.reset();
+            }
+          }
+#endif
           // Drop the acquired surface before reporting the frame complete so
           // IddCx can reclaim the buffer during unassign/departure.
           surface.Reset();
@@ -2248,8 +2508,47 @@ namespace {
 
     }
 
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+    void record_frame_transport_surface_mode(IDXGIResource *surface, const LUID &render_adapter_luid) {
+      // Clear the last known mode before inspecting this acquired surface.
+      // A transient unsupported descriptor must never leave an old target
+      // available to an owner query while the swapchain has changed mode.
+      {
+        std::lock_guard lock {frame_mode_mutex_};
+        frame_surface_mode_.reset();
+      }
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+      if (!surface || FAILED(surface->QueryInterface(IID_PPV_ARGS(&texture)))) return;
+      D3D11_TEXTURE2D_DESC desc {};
+      texture->GetDesc(&desc);
+      FrameTransportSurfaceMode mode {};
+      if (desc.Width < vdd::kMinWidth || desc.Width > vdd::kMaxWidth ||
+          desc.Height < vdd::kMinHeight || desc.Height > vdd::kMaxHeight ||
+          desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0) {
+        return;
+      }
+      if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        mode.format = static_cast<std::uint32_t>(desc.Format);
+        mode.color_space = 0;
+      } else if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        mode.format = static_cast<std::uint32_t>(desc.Format);
+        mode.color_space = 1;
+      } else {
+        return;
+      }
+      mode.width = desc.Width;
+      mode.height = desc.Height;
+      mode.adapter_luid = vdd::from_windows_luid(render_adapter_luid);
+      std::lock_guard lock {frame_mode_mutex_};
+      frame_surface_mode_ = mode;
+    }
+#endif
+
     IDDCX_SWAPCHAIN swapchain_ {};
     HANDLE next_surface_available_ {};
+    std::uint64_t display_id_ {};
+    std::uint64_t display_generation_ {};
+    FrameRingSnapshotProvider frame_ring_snapshot_provider_ {};
     HANDLE stop_event_ {};
     std::atomic<bool> stop_requested_ {false};
     std::thread worker_ {};
@@ -2260,6 +2559,15 @@ namespace {
     WDFOBJECT referenced_swapchain_ {};
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> device_context_;
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+    std::mutex device_mutex_ {};
+    bool device_ready_ {};
+    LUID render_adapter_luid_ {};
+    std::shared_ptr<FrameRingProducerResources> frame_ring_producer_ {};
+    std::mutex frame_mode_mutex_ {};
+    std::optional<FrameTransportSurfaceMode> frame_surface_mode_ {};
+#endif
   };
 
   enum class DeferredSwapChainCleanup {
@@ -2502,6 +2810,56 @@ namespace {
     IddCxBackend(WDFDRIVER driver, WDFDEVICE device):
         driver_ {driver},
         device_ {device} {
+    }
+
+    void set_frame_ring_snapshot_provider(FrameRingSnapshotProvider provider) {
+      frame_ring_snapshot_provider_ = std::move(provider);
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device1> frame_import_device_for(
+      const std::uint64_t display_id,
+      const std::uint64_t display_generation,
+      const LUID &adapter_luid
+    ) {
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      std::lock_guard lock {mutex_};
+      const auto record = monitors_.find(display_id);
+      if (record == monitors_.end() || record->second.departing || record->second.permanent ||
+          record->second.descriptor.generation != display_generation || !record->second.swapchain_processor) return {};
+      return record->second.swapchain_processor->frame_import_device(adapter_luid);
+#else
+      (void) display_id;
+      (void) display_generation;
+      (void) adapter_luid;
+      return {};
+#endif
+    }
+
+    std::optional<vdd::FrameTransportTarget> frame_transport_target(
+      const std::uint64_t display_id, const std::uint64_t display_generation
+    ) {
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      std::lock_guard lock {mutex_};
+      const auto record = monitors_.find(display_id);
+      if (record == monitors_.end() || record->second.departing || record->second.permanent ||
+          record->second.descriptor.generation != display_generation || !record->second.swapchain_processor) return {};
+      const auto mode = record->second.swapchain_processor->frame_transport_surface_mode();
+      if (!mode) return {};
+      vdd::FrameTransportTarget target {};
+      target.lease_id = record->second.descriptor.lease_id;
+      target.display_id = display_id;
+      target.display_generation = display_generation;
+      target.width = mode->width;
+      target.height = mode->height;
+      target.adapter_luid = mode->adapter_luid;
+      target.format = mode->format;
+      target.color_space = mode->color_space;
+      return target;
+#else
+      (void) display_id;
+      (void) display_generation;
+      return {};
+#endif
     }
 
     NTSTATUS initialize_adapter(WDFDEVICE device) {
@@ -3423,6 +3781,7 @@ namespace {
       auto *monitor_context = GetMonitorContext(record.monitor);
       monitor_context->backend = this;
       monitor_context->display_id = descriptor.display_id;
+      monitor_context->display_generation = descriptor.generation;
 
       {
         try {
@@ -3815,7 +4174,10 @@ namespace {
 
       std::unique_ptr<SwapChainProcessor> processor;
       try {
-        processor = std::make_unique<SwapChainProcessor>(args->hSwapChain, args->hNextSurfaceAvailable);
+        processor = std::make_unique<SwapChainProcessor>(
+          args->hSwapChain, args->hNextSurfaceAvailable, context->display_id,
+          context->display_generation, frame_ring_snapshot_provider_
+        );
       } catch (...) {
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
       }
@@ -4120,6 +4482,7 @@ namespace {
     WDFDEVICE device_ {};
     IDDCX_ADAPTER adapter_ {};
     LUID preferred_render_adapter_luid_ {};
+    FrameRingSnapshotProvider frame_ring_snapshot_provider_ {};
     bool adapter_ready_ {};
     bool shutting_down_ {};
     std::uint32_t monitor_arrivals_in_flight_ {};
@@ -4143,7 +4506,18 @@ namespace {
           },
           backend
         },
-        dispatcher {controller} {
+        dispatcher {controller}
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+        , frame_ring_lifetime {controller.store()}
+        , frame_ring_server {controller.store(), frame_ring_lifetime, frame_importer}
+#endif
+    {
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      backend.set_frame_ring_snapshot_provider([this](const std::uint64_t display_id,
+                                                       const std::uint64_t generation) {
+        return frame_ring_snapshot(display_id, generation);
+      });
+#endif
       start_reaper();
     }
 
@@ -4160,6 +4534,14 @@ namespace {
         return false;
       }
 
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      {
+        std::lock_guard lock {controller_mutex};
+        frame_ring_server.reset();
+        frame_ring_lifetime.reset();
+      }
+#endif
+
       if (!backend.shutdown()) {
         return false;
       }
@@ -4173,6 +4555,7 @@ namespace {
       const std::size_t input_buffer_length,
       void *output,
       const std::size_t output_buffer_length,
+      const std::uint32_t requestor_pid,
       const std::chrono::steady_clock::time_point now
     ) {
       if (backend.lifecycle_unhealthy() && !can_dispatch_while_backend_unhealthy(io_control_code)) {
@@ -4184,6 +4567,13 @@ namespace {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "DeviceIoControlRejectedForUnhealthyBackend");
         return {vdd::IoctlStatus::BackendFailed, 0, {}};
       }
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      if (backend.lifecycle_unhealthy() &&
+          (io_control_code == vdd::kIoctlQueryFrameTransportTarget ||
+           io_control_code == vdd::kIoctlRegisterFrameRing)) {
+        return {vdd::IoctlStatus::BackendFailed, 0, {}};
+      }
+#endif
 
       std::unique_lock lock {controller_mutex, std::defer_lock};
       if (!lock.try_lock_for(kControllerLockTimeout)) {
@@ -4195,6 +4585,18 @@ namespace {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DRIVER, "DeviceIoControlControllerBusy");
         return {vdd::IoctlStatus::BackendFailed, 0, {}};
       }
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+      if (io_control_code == vdd::kIoctlQueryFrameTransportTarget ||
+          io_control_code == vdd::kIoctlRegisterFrameRing ||
+          io_control_code == vdd::kIoctlClearFrameRing) {
+        const auto peer = vdd::capture_frame_request_peer(requestor_pid);
+        if (!peer) return {vdd::IoctlStatus::InvalidRequest, 0, {}};
+        return dispatch_frame_transport(io_control_code, input, input_buffer_length, output,
+                                        output_buffer_length, *peer, now);
+      }
+#else
+      (void) requestor_pid;
+#endif
       return dispatcher.dispatch(
         io_control_code,
         input,
@@ -4209,14 +4611,117 @@ namespace {
     IddCxBackend backend;
     vdd::DriverController controller;
     vdd::IoctlDispatcher dispatcher;
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+    vdd::WindowsFrameImporter frame_importer;
+    vdd::FrameRingLifetime frame_ring_lifetime;
+    vdd::FrameRingServer frame_ring_server;
+#endif
 
   private:
     static constexpr auto kReaperInterval = std::chrono::seconds(1);
     static constexpr auto kReaperTeardownTimeout = std::chrono::milliseconds(500);
     static constexpr auto kControllerLockTimeout = std::chrono::seconds(30);
 
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+    vdd::FrameRingSnapshot frame_ring_snapshot(
+      const std::uint64_t display_id, const std::uint64_t generation
+    ) {
+      std::unique_lock lock {controller_mutex, std::try_to_lock};
+      if (!lock.owns_lock()) return {};
+      return frame_ring_lifetime.snapshot(display_id, generation, lease_clock_now());
+    }
+
+    vdd::IoctlDispatchResult dispatch_frame_transport(
+      const ULONG code, const void *input, const std::size_t input_size, void *output,
+      const std::size_t output_size, const vdd::FrameRequestPeer &peer,
+      const std::chrono::steady_clock::time_point now
+    ) {
+      if (code == vdd::kIoctlQueryFrameTransportTarget) {
+        if (!input || input_size != sizeof(vdd::FrameTransportTargetRequest)) {
+          return {vdd::IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+        if (!output || output_size < sizeof(vdd::FrameTransportTarget)) {
+          return {vdd::IoctlStatus::InvalidOutputBuffer, 0, {}};
+        }
+        vdd::FrameTransportTargetRequest request {};
+        std::memcpy(&request, input, sizeof(request));
+        auto target = frame_ring_server.query_target(peer, request, now);
+        if (!target) return {vdd::IoctlStatus::InvalidRequest, 0, {}};
+        const auto active_mode = backend.frame_transport_target(target->display_id, target->display_generation);
+        if (!active_mode) return {vdd::IoctlStatus::BackendFailed, 0, {}};
+        target->width = active_mode->width;
+        target->height = active_mode->height;
+        target->adapter_luid = active_mode->adapter_luid;
+        target->format = active_mode->format;
+        target->color_space = active_mode->color_space;
+        if (!vdd::valid_frame_transport_target(*target, request)) {
+          return {vdd::IoctlStatus::BackendFailed, 0, {}};
+        }
+        std::memcpy(output, &*target, sizeof(*target));
+        return {vdd::IoctlStatus::Success, sizeof(*target), {}};
+      }
+      if (code == vdd::kIoctlRegisterFrameRing) {
+        if (!input || input_size != sizeof(vdd::FrameRingRegisterRequest)) {
+          return {vdd::IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+        if (!output || output_size < sizeof(vdd::FrameRingReply)) {
+          return {vdd::IoctlStatus::InvalidOutputBuffer, 0, {}};
+        }
+        vdd::FrameRingRegisterRequest request {};
+        std::memcpy(&request, input, sizeof(request));
+        vdd::FrameTransportTargetRequest target_request {};
+        target_request.lease_id = request.lease_id;
+        target_request.display_id = request.display_id;
+        target_request.owner_capability = request.owner_capability;
+        const auto authorized_target = frame_ring_server.query_target(peer, target_request, now);
+        if (!authorized_target) return {vdd::IoctlStatus::InvalidRequest, 0, {}};
+        const auto active_mode = backend.frame_transport_target(
+          authorized_target->display_id, authorized_target->display_generation
+        );
+        if (!active_mode || request.display_generation != active_mode->display_generation ||
+            request.width != active_mode->width || request.height != active_mode->height ||
+            request.adapter_luid != active_mode->adapter_luid || request.format != active_mode->format ||
+            request.color_space != active_mode->color_space) {
+          return {vdd::IoctlStatus::NotFound, 0, {}};
+        }
+        const auto import_device = backend.frame_import_device_for(
+          request.display_id, request.display_generation, vdd::to_windows_luid(request.adapter_luid)
+        );
+        if (!import_device) return {vdd::IoctlStatus::BackendFailed, 0, {}};
+        vdd::WindowsFrameImporter importer {import_device.Get()};
+        const auto result = frame_ring_server.register_ring(peer, request, now, importer);
+        if (result.status != vdd::FrameWireStatus::Success) {
+          return {result.status == vdd::FrameWireStatus::InvalidInput ? vdd::IoctlStatus::InvalidRequest :
+                  result.status == vdd::FrameWireStatus::StaleGeneration ? vdd::IoctlStatus::NotFound :
+                  result.status == vdd::FrameWireStatus::ImportFailed ? vdd::IoctlStatus::BackendFailed :
+                  vdd::IoctlStatus::InvalidRequest, 0, {}};
+        }
+        std::memcpy(output, &result.reply, sizeof(result.reply));
+        return {vdd::IoctlStatus::Success, sizeof(result.reply), {}};
+      }
+      if (code == vdd::kIoctlClearFrameRing) {
+        if (!input || input_size != sizeof(vdd::FrameRingClearRequest)) {
+          return {vdd::IoctlStatus::InvalidInputBuffer, 0, {}};
+        }
+        if (output_size != 0) return {vdd::IoctlStatus::InvalidOutputBuffer, 0, {}};
+        vdd::FrameRingClearRequest request {};
+        std::memcpy(&request, input, sizeof(request));
+        const auto result = frame_ring_server.clear_ring(peer, request, now);
+        if (result != vdd::FrameWireStatus::Success) {
+          return {result == vdd::FrameWireStatus::StaleGeneration ? vdd::IoctlStatus::NotFound :
+                  result == vdd::FrameWireStatus::ImportFailed ? vdd::IoctlStatus::BackendFailed :
+                  vdd::IoctlStatus::InvalidRequest, 0, {}};
+        }
+        return {vdd::IoctlStatus::Success, 0, {}};
+      }
+      return {vdd::IoctlStatus::InvalidIoctl, 0, {}};
+    }
+#endif
+
     static bool can_dispatch_while_backend_unhealthy(const ULONG io_control_code) {
       switch (io_control_code) {
+        case vdd::kIoctlQueryFrameTransportCapabilities:
+        case vdd::kIoctlClearFrameRing:
         case vdd::kIoctlGetProtocolVersion:
         case vdd::kIoctlRemoveTemporaryDisplay:
         case vdd::kIoctlFeedLease:
@@ -4287,6 +4792,10 @@ namespace {
           continue;
         }
         (void) controller.reap_expired(lease_clock_now(), &controller_lock);
+#if defined(VDD_ENABLE_FRAME_TRANSPORT)
+        (void) frame_ring_server.reap(lease_clock_now());
+        (void) frame_ring_lifetime.retire_unavailable(lease_clock_now());
+#endif
         controller_lock.unlock();
         backend.cleanup_finished_retired_swapchains();
       }
@@ -4710,6 +5219,7 @@ void SunshineEvtIddCxDeviceIoControl(
     input_buffer_length,
     output,
     output_buffer_length,
+    WdfRequestGetRequestorProcessId(request),
     lease_clock_now()
   );
   const auto completion_status = ntstatus_from_ioctl_status(result.status);
