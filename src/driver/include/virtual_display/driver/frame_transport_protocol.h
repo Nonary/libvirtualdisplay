@@ -3,8 +3,8 @@
 #include "virtual_display/driver/control_protocol.h"
 
 namespace virtual_display::driver {
-  // Experimental wire contract. Production capabilities remain zero until both
-  // native endpoints and the WDF request identity adapter are qualified.
+  // Experimental wire contract. The capability bit reports opt-in build
+  // support; it does not imply live target readiness or Windows/WDK/GPU qualification.
   inline constexpr std::uint32_t kFrameRingWireVersion = 1;
   inline constexpr std::uint32_t kFrameRingMetadataBytes = 4096;
   inline constexpr std::uint32_t kIoctlRegisterFrameRing = ioctl_code(static_cast<IoctlFunction>(0x90f), IoctlAccess::ReadWrite);

@@ -29,8 +29,10 @@ namespace virtual_display::driver {
     FrameRingReply reply {};
   };
 
-  // Control-plane prerequisite, serialized with DisplayStore and FrameRingLifetime.
-  // Intentionally not connected to the native dispatcher; capabilities stay zero.
+  // Control-plane implementation, serialized with DisplayStore and FrameRingLifetime.
+  // Windows DeviceState connects it to target/register/clear IOCTLs only when frame
+  // transport is enabled. The capability query reports build support; callers must
+  // still obtain a live target and register a ring successfully before capture.
   class FrameRingServer {
   public:
     FrameRingServer(const DisplayStore &store, FrameRingLifetime &rings, FrameResourceImporter &importer);
