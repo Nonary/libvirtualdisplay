@@ -621,6 +621,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		struct drm_framebuffer *old_present_fb = NULL;
 		struct drm_plane_state *primary_state;
 		struct drm_crtc_state *crtc_state;
+		u64 presentation_timestamp_ns;
 		bool scanout_changed;
 
 		if (!vkms_commit_touches_crtc(state, crtc))
@@ -630,6 +631,8 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		output = drm_crtc_to_vkms_output(crtc);
 		primary_state = drm_atomic_get_new_plane_state(state, crtc->primary);
 		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+		presentation_timestamp_ns = vkms_crtc_take_present_timestamp(output,
+								     crtc_state);
 		if (primary_state && primary_state->fb && primary_state->visible) {
 			new_present_fb = primary_state->fb;
 			drm_framebuffer_get(new_present_fb);
@@ -644,7 +647,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 				output->present_fb = new_present_fb;
 				new_present_fb = NULL;
 			}
-			output->present_timestamp_ns = ktime_get_ns();
+			output->present_timestamp_ns = presentation_timestamp_ns;
 			completed_sequence = atomic64_inc_return(&output->present_sequence);
 			trace_event = &output->present_trace[(completed_sequence - 1) %
 							 VIBESHINE_DRM_TRACE_HISTORY_SIZE];

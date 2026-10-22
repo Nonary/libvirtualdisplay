@@ -73,6 +73,10 @@ struct vibeshine_drm_present_trace {
  * selected CRTC's scanout. A wait returns as soon as a newer sequence completes,
  * even if another commit is pending. Multiple consumers may wait independently
  * and can coalesce missed sequences by always importing the newest framebuffer.
+ * The timestamp is latched from this commit's completed flip/vblank event,
+ * not the publishing worker's wake time. Commits without a scheduled vblank
+ * use their immediate completion time; a flip timeout retains a publication-
+ * time fallback when no event timestamp was obtained.
  */
 struct vibeshine_drm_wait_present {
 	__u32 abi_version;

@@ -16,6 +16,7 @@
 #include <drm/drm_writeback.h>
 
 #include "vibeshine_drm_compat.h"
+#include "vibeshine_drm_present.h"
 #include "vibeshine_drm_uapi.h"
 
 #define DEFAULT_DEVICE_NAME "vkms"
@@ -194,6 +195,8 @@ struct vkms_color_lut {
  *		 of the composition process.
  * @frame_end: Protected by @vkms_output.composer_lock, saves the last requested frame number.
  *	       This is used to generate enough CRC entries when the composition worker is too slow.
+ * @present_timing: Protected by @vkms_output.lock, latches this commit's flip
+ *                  timestamp before the worker can publish the frame.
  */
 struct vkms_crtc_state {
 	struct drm_crtc_state base;
@@ -208,6 +211,7 @@ struct vkms_crtc_state {
 	bool wb_pending;
 	u64 frame_start;
 	u64 frame_end;
+	struct vibeshine_drm_present_timing present_timing;
 };
 
 /**
@@ -217,14 +221,19 @@ struct vkms_crtc_state {
  * @encoder: DRM encoder used for this output
  * @connector: DRM connector used for this output
  * @wb_connecter: DRM writeback connector used for this output
- * @vblank_hrtimer: Timer used to trigger vblank on kernels before Linux 7.0
- * @period_ns: vblank period used by @vblank_hrtimer on kernels before Linux 7.0
+ * @vblank_hrtimer: Driver-owned periodic vblank timer
+ * @vblank_timer_lock: Serializes timer start, stop and expiry forwarding;
+ *                     never held while acquiring DRM or composer locks
+ * @period_ns: Vblank period protected by @vblank_timer_lock
+ * @vblank_timer_enabled: Periodic timer armed, protected by @vblank_timer_lock
  * @vrr_hrtimer: One-shot timer enforcing the mode's maximum VRR refresh rate
  * @composer_workq: Ordered workqueue for @composer_state.composer_work.
  * @lock: Lock used to protect concurrent access to the composer
  * @composer_enabled: Protected by @lock, true when the VKMS composer is active (crc needed or
  *		      writeback)
  * @composer_state: Protected by @lock, current state of this VKMS output
+ * @pending_present_state: Protected by @lock, exact commit awaiting its flip
+ *                         timestamp; cleared at completion or publication.
  * @composer_lock: Lock used internally to protect @composer_state members
  * @synthetic_vblank_counter: Raw 32-bit counter exposed to DRM so generated
  *                            VRR events never rely on nominal-period inference,
@@ -234,10 +243,10 @@ struct vkms_output {
 	struct drm_crtc crtc;
 	struct drm_writeback_connector wb_connector;
 	struct drm_encoder wb_encoder;
-#if !VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct hrtimer vblank_hrtimer;
+	spinlock_t vblank_timer_lock;
 	ktime_t period_ns;
-#endif
+	bool vblank_timer_enabled;
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct hrtimer vrr_hrtimer;
 #endif
@@ -246,6 +255,7 @@ struct vkms_output {
 
 	bool composer_enabled;
 	struct vkms_crtc_state *composer_state;
+	struct vkms_crtc_state *pending_present_state;
 
 	spinlock_t composer_lock;
 
@@ -340,6 +350,8 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev,
 				   struct drm_plane *primary,
 				   struct drm_plane *cursor);
 void vkms_crtc_release_presented_frame(struct vkms_output *output);
+u64 vkms_crtc_take_present_timestamp(struct vkms_output *output,
+				   struct drm_crtc_state *crtc_state);
 
 bool vkms_framebuffer_has_implicit_import(struct drm_framebuffer *fb);
 u64 vkms_framebuffer_modifier(struct drm_framebuffer *fb);

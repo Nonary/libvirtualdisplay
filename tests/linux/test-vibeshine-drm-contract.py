@@ -391,7 +391,7 @@ def validate_vrr_schedule(driver_root: Path) -> None:
     """Exercise the real nonblocking CRTC scheduler, the sole refresh limiter."""
     driver = (driver_root / "vkms_crtc.c").read_text(encoding="utf-8")
     start = driver.index("static void vkms_schedule_vrr_vblank(")
-    end = driver.index("\n#else", start)
+    end = driver.index("\n#endif", start)
     source = r"""
 #include <assert.h>
 #include <stdint.h>
@@ -463,6 +463,217 @@ int main(void) {
              "-I", str(driver_root), str(source_path), "-o", str(binary_path)], check=True,
         )
         subprocess.run([str(binary_path)], check=True)
+
+
+def validate_vblank_timer_overlap(driver_root: Path) -> None:
+    """Run the actual timer callbacks against controlled concurrent re-enables."""
+    driver = (driver_root / "vkms_crtc.c").read_text(encoding="utf-8")
+    start = driver.index("static enum hrtimer_restart vkms_vblank_simulate(")
+    end = driver.index("static struct drm_crtc_state *", start)
+    source = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+typedef uint64_t u64;
+typedef int64_t ktime_t;
+typedef pthread_mutex_t spinlock_t;
+enum hrtimer_restart { HRTIMER_NORESTART, HRTIMER_RESTART };
+struct hrtimer { bool queued, running; ktime_t expires; };
+struct drm_vblank_crtc { int framedur_ns; } vblank = {10};
+struct drm_crtc { int mode; };
+struct vkms_output {
+    struct drm_crtc crtc;
+    struct hrtimer vblank_hrtimer;
+    spinlock_t vblank_timer_lock;
+    ktime_t period_ns;
+    bool vblank_timer_enabled;
+} output;
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t core_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gate = PTHREAD_COND_INITIALIZER;
+static bool hold_forward, forward_entered, timer_contended, handle_entered;
+static bool forward_inside, stop_in_handler;
+static _Thread_local bool timer_lock_held;
+static int start_calls, forward_calls, delivered;
+static ktime_t now;
+static enum hrtimer_restart callback_result;
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#define HRTIMER_MODE_REL 1
+#define DRM_DEBUG_DRIVER(...) ((void)0)
+static void test_lock(spinlock_t *lock) {
+    int result = pthread_mutex_trylock(lock);
+    if (result == 0) { timer_lock_held = true; return; }
+    assert(lock == &output.vblank_timer_lock);
+    pthread_mutex_lock(&gate_lock);
+    timer_contended = true;
+    pthread_cond_broadcast(&gate);
+    pthread_mutex_unlock(&gate_lock);
+    assert(pthread_mutex_lock(lock) == 0);
+    timer_lock_held = true;
+}
+static void test_unlock(spinlock_t *lock) {
+    assert(timer_lock_held);
+    timer_lock_held = false;
+    assert(pthread_mutex_unlock(lock) == 0);
+}
+#define spin_lock_irqsave(lock, flags) ((flags) = 0, test_lock(lock))
+#define spin_unlock_irqrestore(lock, flags) ((void)(flags), test_unlock(lock))
+static struct drm_vblank_crtc *drm_crtc_vblank_crtc(struct drm_crtc *crtc) {
+    assert(crtc == &output.crtc); return &vblank;
+}
+static struct vkms_output *drm_crtc_to_vkms_output(struct drm_crtc *crtc) {
+    assert(crtc == &output.crtc); return &output;
+}
+static void drm_calc_timestamping_constants(struct drm_crtc *crtc, int *mode) {
+    assert(crtc == &output.crtc && mode == &crtc->mode);
+}
+static ktime_t ktime_set(int seconds, int nanos) { return (ktime_t)seconds * 1000000000 + nanos; }
+static bool hrtimer_is_queued(struct hrtimer *timer) { return timer->queued; }
+static void hrtimer_start(struct hrtimer *timer, ktime_t period, int mode) {
+    assert(timer == &output.vblank_hrtimer && mode == HRTIMER_MODE_REL);
+    assert(!forward_inside); /* Forwarding a queued timer corrupts its ordering. */
+    ++start_calls;
+    timer->expires = now + period;
+    timer->queued = true;
+}
+static int hrtimer_try_to_cancel(struct hrtimer *timer) {
+    if (timer->running) return -1;
+    int result = timer->queued;
+    timer->queued = false;
+    return result;
+}
+static u64 hrtimer_forward_now(struct hrtimer *timer, ktime_t period) {
+    assert(!timer->queued);
+    ++forward_calls;
+    pthread_mutex_lock(&gate_lock);
+    forward_inside = true;
+    forward_entered = true;
+    pthread_cond_broadcast(&gate);
+    while (hold_forward) pthread_cond_wait(&gate, &gate_lock);
+    forward_inside = false;
+    pthread_mutex_unlock(&gate_lock);
+    timer->expires += period;
+    return 1;
+}
+static void vkms_disable_vblank(struct drm_crtc *crtc);
+static bool vkms_crtc_handle_vblank(struct drm_crtc *crtc) {
+    /* Timer serialization must have ended before any driver/DRM lock. */
+    assert(!timer_lock_held);
+    pthread_mutex_lock(&gate_lock);
+    handle_entered = true;
+    pthread_cond_broadcast(&gate);
+    pthread_mutex_unlock(&gate_lock);
+    pthread_mutex_lock(&output_lock);
+    pthread_mutex_lock(&core_lock);
+    ++delivered;
+    if (stop_in_handler) vkms_disable_vblank(crtc);
+    pthread_mutex_unlock(&core_lock);
+    pthread_mutex_unlock(&output_lock);
+    return true;
+}
+""" + driver[start:end] + r"""
+static void *run_callback(void *unused) {
+    (void)unused;
+    callback_result = vkms_vblank_simulate(&output.vblank_hrtimer);
+    return NULL;
+}
+static void *run_enable(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&core_lock);
+    vkms_enable_vblank(&output.crtc);
+    pthread_mutex_unlock(&core_lock);
+    return NULL;
+}
+static void begin_expiry(void) {
+    output.vblank_hrtimer.queued = false;
+    output.vblank_hrtimer.running = true;
+    handle_entered = false;
+    forward_entered = false;
+    timer_contended = false;
+}
+static void wait_flag(bool *flag) {
+    pthread_mutex_lock(&gate_lock);
+    while (!*flag) pthread_cond_wait(&gate, &gate_lock);
+    pthread_mutex_unlock(&gate_lock);
+}
+int main(void) {
+    alarm(5); /* A regression must fail instead of hanging the test suite. */
+    pthread_t callback, enable;
+    assert(pthread_mutex_init(&output.vblank_timer_lock, NULL) == 0);
+    assert(vkms_enable_vblank(&output.crtc) == 0);
+    begin_expiry();
+    pthread_mutex_lock(&output_lock);
+    assert(pthread_create(&callback, NULL, run_callback, NULL) == 0);
+    wait_flag(&handle_entered);
+    /* The callback cannot finish while output_lock is held. Both core
+     * callbacks must still finish without waiting for the running timer. */
+    pthread_mutex_lock(&core_lock);
+    vkms_disable_vblank(&output.crtc);
+    vblank.framedur_ns = 20;
+    now = 100;
+    assert(vkms_enable_vblank(&output.crtc) == 0);
+    pthread_mutex_unlock(&core_lock);
+    assert(output.vblank_hrtimer.queued && output.vblank_hrtimer.expires == 120);
+    pthread_mutex_unlock(&output_lock);
+    assert(pthread_join(callback, NULL) == 0);
+    assert(callback_result == HRTIMER_NORESTART);
+    assert(output.vblank_hrtimer.queued && output.vblank_hrtimer.expires == 120);
+
+    /* A replacement already queued before callback entry owns its expiry. */
+    int previous_delivered = delivered, previous_forward = forward_calls;
+    assert(vkms_vblank_simulate(&output.vblank_hrtimer) == HRTIMER_NORESTART);
+    assert(delivered == previous_delivered && forward_calls == previous_forward);
+
+    /* Enabling cannot alter expiry while the callback is forwarding it. */
+    begin_expiry();
+    hold_forward = true;
+    assert(pthread_create(&callback, NULL, run_callback, NULL) == 0);
+    wait_flag(&forward_entered);
+    int previous_starts = start_calls;
+    assert(pthread_create(&enable, NULL, run_enable, NULL) == 0);
+    wait_flag(&timer_contended);
+    assert(start_calls == previous_starts);
+    pthread_mutex_lock(&gate_lock);
+    hold_forward = false;
+    pthread_cond_broadcast(&gate);
+    pthread_mutex_unlock(&gate_lock);
+    assert(pthread_join(enable, NULL) == 0);
+    assert(pthread_join(callback, NULL) == 0);
+    assert(output.vblank_hrtimer.queued && output.vblank_hrtimer.expires == 120);
+
+    /* The DRM callback can itself disable vblank without waiting on itself. */
+    begin_expiry();
+    stop_in_handler = true;
+    assert(vkms_vblank_simulate(&output.vblank_hrtimer) == HRTIMER_NORESTART);
+    assert(!output.vblank_timer_enabled && !output.vblank_hrtimer.queued);
+    stop_in_handler = false;
+
+    /* A disable after the restart decision may leave exactly one inert tick. */
+    vkms_enable_vblank(&output.crtc);
+    begin_expiry();
+    assert(vkms_vblank_simulate(&output.vblank_hrtimer) == HRTIMER_RESTART);
+    vkms_disable_vblank(&output.crtc);
+    output.vblank_hrtimer.queued = true; /* Kernel consumes the earlier return. */
+    begin_expiry();
+    previous_delivered = delivered;
+    assert(vkms_vblank_simulate(&output.vblank_hrtimer) == HRTIMER_NORESTART);
+    assert(delivered == previous_delivered);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="vibeshine-drm-timer-overlap-") as temporary_dir:
+        source_path = Path(temporary_dir) / "timer-overlap.c"
+        binary_path = Path(temporary_dir) / "timer-overlap"
+        source_path.write_text(source, encoding="utf-8")
+        subprocess.run(
+            [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+             "-pthread", str(source_path), "-o", str(binary_path)], check=True, timeout=30,
+        )
+        subprocess.run([str(binary_path)], check=True, timeout=10)
 
 
 def validate_reboot_notifier(driver_root: Path) -> None:
@@ -638,10 +849,12 @@ def validate_source_contract(driver_root: Path) -> None:
     require_source(driver_header, "struct notifier_block reboot_notifier", driver_header_path.name)
     for needle in (
         "if (crtc->state->vrr_enabled)",
-        "drm_crtc_vblank_cancel_timer(crtc)",
+        "vkms_disable_vblank(crtc)",
         "vkms_crtc_get_vblank_timestamp",
         "vkms_crtc_get_vblank_counter",
         ".get_vblank_counter     = vkms_crtc_get_vblank_counter",
+        ".enable_vblank          = vkms_enable_vblank",
+        ".disable_vblank         = vkms_disable_vblank",
         "atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns())",
         "atomic64_inc(&output->synthetic_vblank_counter)",
         "atomic64_set(&vkms_output->vrr_vblank_timestamp_ns",
@@ -649,12 +862,15 @@ def validate_source_contract(driver_root: Path) -> None:
         "return vkms_crtc_handle_vblank(crtc)",
         "HRTIMER_RESTART : HRTIMER_NORESTART",
         "vkms_crtc_atomic_enable",
-        "drm_crtc_vblank_start_timer(crtc)",
+        "vkms_enable_vblank(crtc)",
         "vkms_schedule_vrr_vblank(crtc)",
         "hrtimer_start(&output->vrr_hrtimer, ns_to_ktime(deadline_ns)",
         "hrtimer_cancel(&output->vrr_hrtimer)",
     ):
         require_source(crtc, needle, crtc_path.name)
+    require("drm_crtc_vblank_start_timer(" not in crtc and
+            "drm_crtc_vblank_helper_enable_vblank_timer" not in crtc,
+            "periodic vblank still waits for its callback under DRM locks")
     require("if (in_vblank_irq)\n\t\treturn false" not in crtc,
             "VRR timestamping still disables precise timestamps in interrupt context")
     require(
@@ -780,6 +996,7 @@ def main() -> int:
     validate_implicit_frame_layout(driver_root)
     validate_scanout_negotiation(driver_root)
     validate_vrr_schedule(driver_root)
+    validate_vblank_timer_overlap(driver_root)
     print("Vibeshine DRM source and HDR EDID contract: PASS")
     return 0
 

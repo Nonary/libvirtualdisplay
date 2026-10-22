@@ -11,6 +11,39 @@
 
 #define VIBESHINE_DRM_PRESENT_MAX_WAITERS 64U
 
+/* Per-commit timing, never the output's mutable last-vblank timestamp. */
+struct vibeshine_drm_present_timing {
+	__u64 timestamp_ns;
+	bool pending;
+};
+
+static inline void
+vibeshine_drm_present_timing_arm(struct vibeshine_drm_present_timing *timing)
+{
+	timing->timestamp_ns = 0;
+	timing->pending = true;
+}
+
+static inline bool
+vibeshine_drm_present_timing_complete(struct vibeshine_drm_present_timing *timing,
+				    bool flip_complete, __u64 event_timestamp_ns)
+{
+	if (!timing->pending || !flip_complete || !event_timestamp_ns)
+		return false;
+	timing->timestamp_ns = event_timestamp_ns;
+	timing->pending = false;
+	return true;
+}
+
+static inline __u64
+vibeshine_drm_present_timing_finish(struct vibeshine_drm_present_timing *timing,
+				  __u64 fallback_timestamp_ns)
+{
+	/* Disarm even on a flip timeout; a later event must not alter this frame. */
+	timing->pending = false;
+	return timing->timestamp_ns ? timing->timestamp_ns : fallback_timestamp_ns;
+}
+
 enum vibeshine_drm_present_wait_decision_e {
 	VIBESHINE_DRM_PRESENT_RETURN_CURRENT,
 	VIBESHINE_DRM_PRESENT_REGISTER_WAITER,

@@ -50,6 +50,12 @@ Otherwise worker scheduling delays accumulate in a second clock and stall
 subsequent commits near maximum refresh. Capture independently selects the
 newest completed frame at the stream's delivery rate.
 
+Presentation timestamps are latched per commit from the DRM vblank which
+completes that commit's flip. Publication still waits for flip completion,
+but worker wakeup delays and later periodic vblanks do not rewrite the source
+timestamp. Immediate/no-event commits retain their completion time; if a flip
+wait times out without a recorded event, publication time is the fallback.
+
 The response also reports when a newer atomic state has been submitted but is
 not presented yet. Capture waits until that pending count reaches zero before
 dequeueing a frame.

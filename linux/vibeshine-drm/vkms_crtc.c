@@ -24,22 +24,46 @@ static bool vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 {
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
 	struct vkms_crtc_state *state;
+	struct vkms_crtc_state *present_state;
+	unsigned long flags;
 	bool ret, fence_cookie;
 
 	fence_cookie = dma_fence_begin_signalling();
 
-	spin_lock(&output->lock);
+	/* VRR may also generate a vblank directly from commit process context. */
+	spin_lock_irqsave(&output->lock, flags);
 	atomic64_set(&output->vrr_vblank_timestamp_ns, ktime_get_ns());
 	atomic64_inc(&output->synthetic_vblank_counter);
 	ret = drm_crtc_handle_vblank(crtc);
 	if (!ret) {
-		spin_unlock(&output->lock);
+		spin_unlock_irqrestore(&output->lock, flags);
 		dma_fence_end_signalling(fence_cookie);
 		return false;
 	}
 
+	/*
+	 * DRM has now delivered this commit's event and completed flip_done.
+	 * Latch its DRM timestamp while holding the same lock as atomic_flush
+	 * and publication. A waking worker cannot read before this write, and
+	 * subsequent periodic vblanks cannot replace this frame's timestamp.
+	 */
+	present_state = output->pending_present_state;
+	if (present_state && present_state->base.commit &&
+	    completion_done(&present_state->base.commit->flip_done)) {
+		ktime_t vblank_time;
+		u64 timestamp_ns;
+
+		drm_crtc_vblank_count_and_time(crtc, &vblank_time);
+		timestamp_ns = ktime_to_ns(vblank_time);
+		if (!timestamp_ns)
+			timestamp_ns = ktime_get_ns();
+		vibeshine_drm_present_timing_complete(&present_state->present_timing,
+						    true, timestamp_ns);
+		output->pending_present_state = NULL;
+	}
+
 	state = output->composer_state;
-	spin_unlock(&output->lock);
+	spin_unlock_irqrestore(&output->lock, flags);
 
 	if (state && output->composer_enabled) {
 		u64 frame = drm_crtc_accurate_vblank_count(crtc);
@@ -47,7 +71,7 @@ static bool vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 		/* update frame_start only if a queued vkms_composer_worker()
 		 * has read the data
 		 */
-		spin_lock(&output->composer_lock);
+		spin_lock_irqsave(&output->composer_lock, flags);
 		if (!state->crc_pending)
 			state->frame_start = frame;
 		else
@@ -55,7 +79,7 @@ static bool vkms_crtc_handle_vblank(struct drm_crtc *crtc)
 					 state->frame_start, frame);
 		state->frame_end = frame;
 		state->crc_pending = true;
-		spin_unlock(&output->composer_lock);
+		spin_unlock_irqrestore(&output->composer_lock, flags);
 
 		ret = queue_work(output->composer_workq, &state->composer_work);
 		if (!ret)
@@ -101,32 +125,52 @@ static void vkms_schedule_vrr_vblank(struct drm_crtc *crtc)
 	hrtimer_start(&output->vrr_hrtimer, ns_to_ktime(deadline_ns),
 		      HRTIMER_MODE_ABS);
 }
-#else
+#endif
+
 static enum hrtimer_restart vkms_vblank_simulate(struct hrtimer *timer)
 {
 	struct vkms_output *output = container_of(timer, struct vkms_output,
 						  vblank_hrtimer);
+	unsigned long flags;
+	bool restart;
 	u64 ret_overrun;
 
+	spin_lock_irqsave(&output->vblank_timer_lock, flags);
+	/* A concurrent enable may already have queued the replacement expiry. */
+	if (!output->vblank_timer_enabled || hrtimer_is_queued(timer)) {
+		spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
+		return HRTIMER_NORESTART;
+	}
 	ret_overrun = hrtimer_forward_now(&output->vblank_hrtimer,
 					  output->period_ns);
+	spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
 	if (ret_overrun != 1)
-		pr_warn("%s: vblank timer overrun\n", __func__);
+		DRM_DEBUG_DRIVER("vblank timer overrun\n");
 
-	return vkms_crtc_handle_vblank(&output->crtc) ?
-		HRTIMER_RESTART : HRTIMER_NORESTART;
+	restart = vkms_crtc_handle_vblank(&output->crtc);
+	spin_lock_irqsave(&output->vblank_timer_lock, flags);
+	restart = restart && output->vblank_timer_enabled &&
+		  !hrtimer_is_queued(timer);
+	spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
+	/* A stop after this check can leave one inert tick, which exits above. */
+	return restart ? HRTIMER_RESTART : HRTIMER_NORESTART;
 }
 
 static int vkms_enable_vblank(struct drm_crtc *crtc)
 {
 	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+	unsigned long flags;
 
 	drm_calc_timestamping_constants(crtc, &crtc->mode);
-	hrtimer_setup(&output->vblank_hrtimer, &vkms_vblank_simulate,
-		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	/* DRM holds vblank_time_lock here. The callback can need that lock,
+	 * event_lock, and output->lock, so enabling must never wait for it.
+	 */
+	spin_lock_irqsave(&output->vblank_timer_lock, flags);
 	output->period_ns = ktime_set(0, vblank->framedur_ns);
+	output->vblank_timer_enabled = true;
 	hrtimer_start(&output->vblank_hrtimer, output->period_ns, HRTIMER_MODE_REL);
+	spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
 
 	return 0;
 }
@@ -134,10 +178,14 @@ static int vkms_enable_vblank(struct drm_crtc *crtc)
 static void vkms_disable_vblank(struct drm_crtc *crtc)
 {
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+	unsigned long flags;
 
-	hrtimer_cancel(&output->vblank_hrtimer);
+	/* DRM's locks also exclude a synchronous timer drain during disable. */
+	spin_lock_irqsave(&output->vblank_timer_lock, flags);
+	output->vblank_timer_enabled = false;
+	hrtimer_try_to_cancel(&output->vblank_hrtimer);
+	spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
 }
-#endif
 
 static struct drm_crtc_state *
 vkms_atomic_crtc_duplicate_state(struct drm_crtc *crtc)
@@ -151,6 +199,7 @@ vkms_atomic_crtc_duplicate_state(struct drm_crtc *crtc)
 	if (!vkms_state)
 		return NULL;
 
+	/* Copy only the base: presentation timing belongs to the new commit. */
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &vkms_state->base);
 
 	INIT_WORK(&vkms_state->composer_work, vkms_composer_worker);
@@ -196,13 +245,14 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 					   ktime_t *vblank_time,
 					   bool in_vblank_irq)
 {
-#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	unsigned long flags;
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	u64 timestamp_ns;
 
 	if (!READ_ONCE(crtc->state->vrr_enabled))
-		return drm_crtc_vblank_helper_get_vblank_timestamp_from_timer(
-			crtc, max_error, vblank_time, in_vblank_irq);
+		goto periodic;
 
 	/* The explicit synthetic counter advances exactly once per generated
 	 * event attempt, so the real immediate timestamp cannot make DRM infer zero or
@@ -216,10 +266,9 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 	*vblank_time = ns_to_ktime(timestamp_ns);
 
 	return true;
-#else
-	struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
-	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
 
+periodic:
+#endif
 	(void)max_error;
 	(void)in_vblank_irq;
 
@@ -228,15 +277,18 @@ static bool vkms_crtc_get_vblank_timestamp(struct drm_crtc *crtc,
 		return true;
 	}
 
+	spin_lock_irqsave(&output->vblank_timer_lock, flags);
 	*vblank_time = READ_ONCE(output->vblank_hrtimer.node.expires);
-	if (WARN_ON(*vblank_time == vblank->time))
+	if (WARN_ON(*vblank_time == vblank->time)) {
+		spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
 		return true;
+	}
 
 	/* The timer is advanced before drm_crtc_handle_vblank() runs. */
 	*vblank_time -= output->period_ns;
+	spin_unlock_irqrestore(&output->vblank_timer_lock, flags);
 
 	return true;
-#endif
 }
 
 static const struct drm_crtc_funcs vkms_crtc_funcs = {
@@ -246,13 +298,8 @@ static const struct drm_crtc_funcs vkms_crtc_funcs = {
 	.atomic_duplicate_state = vkms_atomic_crtc_duplicate_state,
 	.atomic_destroy_state   = vkms_atomic_crtc_destroy_state,
 	.get_vblank_counter     = vkms_crtc_get_vblank_counter,
-#if VIBESHINE_DRM_HAS_VBLANK_HELPER
-	.enable_vblank          = drm_crtc_vblank_helper_enable_vblank_timer,
-	.disable_vblank         = drm_crtc_vblank_helper_disable_vblank_timer,
-#else
 	.enable_vblank          = vkms_enable_vblank,
 	.disable_vblank         = vkms_disable_vblank,
-#endif
 	.get_vblank_timestamp   = vkms_crtc_get_vblank_timestamp,
 };
 
@@ -319,6 +366,7 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	__releases(&vkms_output->lock)
 {
 	struct vkms_output *vkms_output = drm_crtc_to_vkms_output(crtc);
+	struct vkms_crtc_state *vkms_state = to_vkms_crtc_state(crtc->state);
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	struct drm_crtc_state *old_crtc_state;
 	bool vrr_flip = false;
@@ -330,12 +378,27 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 			       !crtc->state->vrr_enabled;
 #endif
 
+	vibeshine_drm_present_timing_arm(&vkms_state->present_timing);
 	if (crtc->state->event) {
 		spin_lock(&crtc->dev->event_lock);
 
-		if (drm_crtc_vblank_get(crtc) != 0)
+		if (drm_crtc_vblank_get(crtc) != 0) {
+			/* No scheduled vblank: timestamp the immediate completion. */
+			vibeshine_drm_present_timing_complete(&vkms_state->present_timing,
+							    true, ktime_get_ns());
 			drm_crtc_send_vblank_event(crtc, crtc->state->event);
-		else {
+		} else {
+			/* Only track an event wired to this commit's flip completion. */
+			if (vkms_state->base.commit &&
+			    crtc->state->event->base.completion ==
+			    &vkms_state->base.commit->flip_done) {
+				/* hw_done follows publication, serializing this slot. */
+				WARN_ON_ONCE(vkms_output->pending_present_state);
+				vkms_output->pending_present_state = vkms_state;
+			} else {
+				vibeshine_drm_present_timing_complete(&vkms_state->present_timing,
+								    true, ktime_get_ns());
+			}
 			drm_crtc_arm_vblank_event(crtc, crtc->state->event);
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 			vrr_flip = crtc->state->vrr_enabled;
@@ -345,6 +408,10 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 		spin_unlock(&crtc->dev->event_lock);
 
 		crtc->state->event = NULL;
+	} else {
+		/* Unsynchronized/no-event commits complete at the state update. */
+		vibeshine_drm_present_timing_complete(&vkms_state->present_timing,
+						    true, ktime_get_ns());
 	}
 
 	vkms_output->composer_state = to_vkms_crtc_state(crtc->state);
@@ -359,14 +426,16 @@ static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
 	 * still complete immediately. Restore the periodic timer when VRR is off.
 	 */
 	if (crtc->state->vrr_enabled && old_crtc_state &&
-	    old_crtc_state->active)
-		drm_crtc_vblank_cancel_timer(crtc);
+	    old_crtc_state->active) {
+		vkms_disable_vblank(crtc);
+		hrtimer_cancel(&vkms_output->vblank_hrtimer);
+	}
 	if (vrr_flip) {
 		vkms_schedule_vrr_vblank(crtc);
 	} else if (vrr_disabled) {
 		hrtimer_cancel(&vkms_output->vrr_hrtimer);
 		atomic64_set(&vkms_output->vrr_vblank_timestamp_ns, 0);
-		drm_crtc_vblank_start_timer(crtc);
+		vkms_enable_vblank(crtc);
 	}
 #endif
 }
@@ -381,7 +450,8 @@ static void vkms_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (crtc->state->vrr_enabled) {
 		atomic64_set(&drm_crtc_to_vkms_output(crtc)->vrr_vblank_timestamp_ns,
 			     ktime_get_ns());
-		drm_crtc_vblank_cancel_timer(crtc);
+		vkms_disable_vblank(crtc);
+		hrtimer_cancel(&drm_crtc_to_vkms_output(crtc)->vblank_hrtimer);
 	}
 #else
 	(void)state;
@@ -402,6 +472,8 @@ static void vkms_crtc_atomic_disable(struct drm_crtc *crtc,
 	(void)state;
 	drm_crtc_vblank_off(crtc);
 #endif
+	/* The core has dropped its spinlocks; now fully drain the old mode. */
+	hrtimer_cancel(&drm_crtc_to_vkms_output(crtc)->vblank_hrtimer);
 }
 
 static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
@@ -410,10 +482,26 @@ static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
 	.atomic_flush	= vkms_crtc_atomic_flush,
 	.atomic_enable	= vkms_crtc_atomic_enable,
 	.atomic_disable	= vkms_crtc_atomic_disable,
-#if VIBESHINE_DRM_HAS_VBLANK_HELPER
-	.handle_vblank_timeout = vkms_crtc_handle_vblank_timeout,
-#endif
 };
+
+u64 vkms_crtc_take_present_timestamp(struct vkms_output *output,
+				   struct drm_crtc_state *crtc_state)
+{
+	struct vkms_crtc_state *vkms_state;
+	u64 timestamp_ns;
+
+	if (!crtc_state)
+		return ktime_get_ns();
+	vkms_state = to_vkms_crtc_state(crtc_state);
+	spin_lock_irq(&output->lock);
+	/* Also detach on timeout, before the atomic state can be destroyed. */
+	if (output->pending_present_state == vkms_state)
+		output->pending_present_state = NULL;
+	timestamp_ns = vibeshine_drm_present_timing_finish(&vkms_state->present_timing,
+							 ktime_get_ns());
+	spin_unlock_irq(&output->lock);
+	return timestamp_ns;
+}
 
 void vkms_crtc_release_presented_frame(struct vkms_output *output)
 {
@@ -439,15 +527,17 @@ static void vkms_present_trace_cleanup(struct drm_device *dev, void *data)
 	kvfree(data);
 }
 
-#if VIBESHINE_DRM_HAS_VBLANK_HELPER
-static void vkms_vrr_timer_cleanup(struct drm_device *dev, void *data)
+static void vkms_vblank_timer_cleanup(struct drm_device *dev, void *data)
 {
 	struct vkms_output *output = data;
 
 	(void)dev;
+	vkms_disable_vblank(&output->crtc);
+	hrtimer_cancel(&output->vblank_hrtimer);
+#if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	hrtimer_cancel(&output->vrr_hrtimer);
-}
 #endif
+}
 
 struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *primary,
 				   struct drm_plane *cursor)
@@ -490,13 +580,16 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 
 	spin_lock_init(&vkms_out->lock);
 	spin_lock_init(&vkms_out->composer_lock);
+	spin_lock_init(&vkms_out->vblank_timer_lock);
+	hrtimer_setup(&vkms_out->vblank_hrtimer, &vkms_vblank_simulate,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 #if VIBESHINE_DRM_HAS_VBLANK_HELPER
 	hrtimer_setup(&vkms_out->vrr_hrtimer, &vkms_vrr_vblank_simulate,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-	ret = drmm_add_action_or_reset(dev, vkms_vrr_timer_cleanup, vkms_out);
+#endif
+	ret = drmm_add_action_or_reset(dev, vkms_vblank_timer_cleanup, vkms_out);
 	if (ret)
 		return ERR_PTR(ret);
-#endif
 	atomic64_set(&vkms_out->synthetic_vblank_counter, 0);
 	atomic64_set(&vkms_out->vrr_vblank_timestamp_ns, 0);
 	atomic64_set(&vkms_out->present_sequence, 0);
