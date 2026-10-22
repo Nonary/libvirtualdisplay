@@ -695,6 +695,7 @@ namespace virtual_display::driver {
     descriptor.edid = create_edid(edid_options_for_temporary_display(record));
     descriptor.retain_identity = record.retain_identity;
     descriptor.generation = record.generation;
+    descriptor.requested_resolution_only = record.requested_resolution_only;
     return descriptor;
   }
 
@@ -704,6 +705,9 @@ namespace virtual_display::driver {
     entry.flags = kDisplayStateFlagHdrSupported;
     if (record.retain_identity) {
       entry.flags |= kDisplayStateFlagRetainIdentity;
+    }
+    if (record.requested_resolution_only) {
+      entry.flags |= kDisplayStateFlagRequestedResolutionOnly;
     }
     entry.display_id = record.display_id;
     const auto identity_display_id = record.identity_display_id == 0 ?

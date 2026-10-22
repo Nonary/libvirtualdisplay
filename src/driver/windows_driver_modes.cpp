@@ -140,7 +140,8 @@ namespace virtual_display::driver {
 
   bool WindowsDriverRegisteredModeStore::register_mode(
     const std::span<const std::byte, kEdidSize> edid,
-    const WindowsDriverModeShape &mode
+    const WindowsDriverModeShape &mode,
+    const bool requested_resolution_only
   ) {
     if (mode.width == 0 || mode.height == 0 || mode.refresh_rate_millihz == 0) {
       return false;
@@ -149,7 +150,12 @@ namespace virtual_display::driver {
     std::array<std::byte, kEdidSize> key {};
     std::copy(edid.begin(), edid.end(), key.begin());
     auto &entry = entries_[key];
-    entry.mode = mode;
+    if (entry.references != 0 &&
+        (entry.mode.preferred != mode ||
+         entry.mode.requested_resolution_only != requested_resolution_only)) {
+      return false;
+    }
+    entry.mode = {mode, requested_resolution_only};
     ++entry.references;
     return true;
   }
@@ -174,6 +180,13 @@ namespace virtual_display::driver {
   }
 
   std::optional<WindowsDriverModeShape> WindowsDriverRegisteredModeStore::registered_mode(
+    const std::span<const std::byte, kEdidSize> edid
+  ) const {
+    const auto registered = registered_monitor_mode(edid);
+    return registered ? std::optional {registered->preferred} : std::nullopt;
+  }
+
+  std::optional<WindowsDriverMonitorMode> WindowsDriverRegisteredModeStore::registered_monitor_mode(
     const std::span<const std::byte, kEdidSize> edid
   ) const {
     std::array<std::byte, kEdidSize> key {};
@@ -241,8 +254,16 @@ namespace virtual_display::driver {
   }
 
   std::pair<std::vector<WindowsDriverModeShape>, std::uint32_t> build_windows_driver_mode_shapes(
-    const std::optional<WindowsDriverModeShape> &preferred
+    const std::optional<WindowsDriverModeShape> &preferred,
+    const bool requested_resolution_only
   ) {
+    if (requested_resolution_only &&
+        (!preferred || preferred->width < kMinWidth || preferred->width > kMaxWidth ||
+         preferred->height < kMinHeight || preferred->height > kMaxHeight ||
+         preferred->refresh_rate_millihz < kMinRefreshRateMilliHz)) {
+      return build_windows_driver_mode_shapes(std::nullopt);
+    }
+
     std::vector<WindowsDriverModeShape> modes;
     modes.reserve(kDefaultWindowsDriverModes.size() + (preferred ? kPreferredModeScalePercent.size() * 3u : 0u));
 
@@ -255,15 +276,27 @@ namespace virtual_display::driver {
       preferred_index = append_preferred_mode_variants(modes, *preferred);
     }
 
+    // Filter the existing list, preserving nominal and fractional timings and
+    // refresh multipliers. Invalid/missing descriptors retain a usable default
+    // catalog instead of publishing an empty restricted list.
+    if (requested_resolution_only) {
+      std::erase_if(modes, [&](const auto &mode) {
+        return mode.width != preferred->width || mode.height != preferred->height;
+      });
+      preferred_index = append_unique_windows_driver_mode(modes, *preferred);
+    }
+
     return {std::move(modes), preferred_index};
   }
 
   std::pair<std::vector<WindowsDriverModeShape>, std::uint32_t> build_windows_driver_target_mode_shapes(
     const std::optional<WindowsDriverModeShape> &monitor_description,
-    const WindowsDriverModeShape *requested_shape
+    const WindowsDriverModeShape *requested_shape,
+    const bool requested_resolution_only
   ) {
     return build_windows_driver_mode_shapes(
-      requested_shape ? std::optional<WindowsDriverModeShape> {*requested_shape} : monitor_description
+      requested_shape ? std::optional<WindowsDriverModeShape> {*requested_shape} : monitor_description,
+      requested_resolution_only
     );
   }
 

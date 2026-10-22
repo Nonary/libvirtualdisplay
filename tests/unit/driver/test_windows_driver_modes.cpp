@@ -266,3 +266,119 @@ TEST(VirtualDisplayWindowsDriverModes, SignalFrequenciesUseReducedVerticalAndHor
   EXPECT_EQ(frequencies.horizontal.numerator, 134865u);
   EXPECT_EQ(frequencies.horizontal.denominator, 2u);
 }
+
+TEST(VirtualDisplayWindowsDriverModes, OptInCatalogKeepsOnlyRequestedDimensionsAndAllMatchingRates) {
+  for (const auto requested: {
+         vdd::active_windows_driver_mode_shape(2420, 1668, 60'000),
+         vdd::active_windows_driver_mode_shape(1920, 1080, 59'940),
+         vdd::active_windows_driver_mode_shape(2560, 1440, 144'500),
+         vdd::active_windows_driver_mode_shape(3840, 2160, 120'000)
+       }) {
+    const auto [full, full_preferred] = vdd::build_windows_driver_mode_shapes(requested);
+    const auto [restricted, preferred] = vdd::build_windows_driver_mode_shapes(requested, true);
+    ASSERT_LT(preferred, restricted.size());
+    EXPECT_EQ(restricted[preferred].width, requested.width);
+    EXPECT_EQ(restricted[preferred].height, requested.height);
+    EXPECT_EQ(restricted[preferred].refresh_rate_millihz, requested.refresh_rate_millihz);
+    EXPECT_TRUE(has_mode(restricted, requested.width, requested.height, requested.refresh_rate_millihz * 2));
+    EXPECT_TRUE(has_mode(restricted, requested.width, requested.height, requested.refresh_rate_millihz * 4));
+    ASSERT_LT(restricted.size(), full.size());
+    std::size_t expected_count = 0;
+    for (const auto &mode: full) {
+      if (mode.width == requested.width && mode.height == requested.height) {
+        ++expected_count;
+        EXPECT_TRUE(has_mode(restricted, mode.width, mode.height, mode.refresh_rate_millihz));
+      }
+    }
+    EXPECT_EQ(restricted.size(), expected_count);
+    for (const auto &mode: restricted) {
+      EXPECT_EQ(mode.width, requested.width);
+      EXPECT_EQ(mode.height, requested.height);
+    }
+    // Disabling the policy retains the unwanted mode from the issue.
+    EXPECT_TRUE(has_mode(full, 5120, 1440, 60'000));
+    if (requested.width != 5120 || requested.height != 1440) {
+      EXPECT_FALSE(has_mode(restricted, 5120, 1440, 60'000));
+    }
+  }
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RestrictedTargetCatalogRetainsOwnedDescriptorOverDescription) {
+  const auto description = vdd::active_windows_driver_mode_shape(1920, 1080, 60'000);
+  const auto requested = vdd::active_windows_driver_mode_shape(2420, 1668, 59'940);
+  const auto [modes, preferred] = vdd::build_windows_driver_target_mode_shapes(description, &requested, true);
+  ASSERT_LT(preferred, modes.size());
+  EXPECT_EQ(modes[preferred].refresh_rate_millihz, 59'940u);
+  EXPECT_TRUE(has_mode(modes, 2420, 1668, 239'760));
+  EXPECT_FALSE(has_mode(modes, 1920, 1080, 60'000));
+  EXPECT_FALSE(has_mode(modes, 5120, 1440, 60'000));
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RestrictedCatalogFallsBackSafelyWithoutValidPreferredTiming) {
+  const auto [normal, normal_preferred] = vdd::build_windows_driver_mode_shapes(std::nullopt);
+  for (const auto preferred: {
+         std::optional<vdd::WindowsDriverModeShape> {},
+         std::optional {vdd::active_windows_driver_mode_shape(0, 1668, 60'000)},
+         std::optional {vdd::active_windows_driver_mode_shape(2420, 0, 60'000)},
+         std::optional {vdd::active_windows_driver_mode_shape(2420, 1668, 0)},
+         std::optional {vdd::active_windows_driver_mode_shape(7681, 1668, 60'000)}
+       }) {
+    const auto [modes, index] = vdd::build_windows_driver_mode_shapes(preferred, true);
+    EXPECT_EQ(modes.size(), normal.size());
+    ASSERT_LT(index, modes.size());
+    EXPECT_EQ(modes[index].width, 1920u);
+    EXPECT_EQ(modes[index].height, 1080u);
+    EXPECT_EQ(modes[index].refresh_rate_millihz, 60'000u);
+  }
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RegisteredCatalogsStayPerMonitorAndRejectLivePolicyReplacement) {
+  vdd::WindowsDriverRegisteredModeStore store;
+  std::array<std::byte, vdd::kEdidSize> first {};
+  std::array<std::byte, vdd::kEdidSize> second {};
+  first[0] = std::byte {1};
+  second[0] = std::byte {2};
+  const auto requested = vdd::active_windows_driver_mode_shape(2420, 1668, 60'000);
+  ASSERT_TRUE(store.register_mode(first, requested, true));
+  ASSERT_TRUE(store.register_mode(second, requested));
+  ASSERT_TRUE(store.register_mode(first, requested, true));
+  EXPECT_FALSE(store.register_mode(first, requested, false));
+  EXPECT_FALSE(store.register_mode(first, vdd::active_windows_driver_mode_shape(1920, 1080, 60'000), true));
+  ASSERT_TRUE(store.registered_monitor_mode(first));
+  EXPECT_TRUE(store.registered_monitor_mode(first)->requested_resolution_only);
+  ASSERT_TRUE(store.registered_monitor_mode(second));
+  EXPECT_FALSE(store.registered_monitor_mode(second)->requested_resolution_only);
+  store.unregister_mode(first);
+  EXPECT_TRUE(store.registered_monitor_mode(first));
+  store.unregister_mode(first);
+  EXPECT_FALSE(store.registered_monitor_mode(first));
+  EXPECT_TRUE(store.registered_monitor_mode(second));
+  // The next lifetime may deliberately use the default full catalog.
+  ASSERT_TRUE(store.register_mode(first, requested));
+  EXPECT_FALSE(store.registered_monitor_mode(first)->requested_resolution_only);
+}
+
+TEST(VirtualDisplayWindowsDriverModes, RestrictedCatalogIsExactStableProjectionOfFullCatalogAcrossBoundaries) {
+  for (const auto dimensions: {std::pair {320u, 200u}, {321u, 201u}, {1920u, 1080u}, {2420u, 1668u}, {5120u, 1440u}, {7680u, 4320u}}) {
+    for (const auto refresh: {1u, 23'976u, 59'940u, 60'000u, 144'500u, 480'000u}) {
+      const auto requested = vdd::active_windows_driver_mode_shape(dimensions.first, dimensions.second, refresh);
+      const auto [full, full_preferred] = vdd::build_windows_driver_mode_shapes(requested);
+      const auto [restricted, preferred] = vdd::build_windows_driver_mode_shapes(requested, true);
+      ASSERT_LT(full_preferred, full.size());
+      ASSERT_LT(preferred, restricted.size());
+      EXPECT_EQ(restricted[preferred], requested);
+      std::vector<vdd::WindowsDriverModeShape> expected;
+      for (const auto &mode: full) {
+        if (mode.width == requested.width && mode.height == requested.height) expected.push_back(mode);
+      }
+      EXPECT_EQ(restricted, expected);
+      EXPECT_TRUE(has_mode(restricted, requested.width, requested.height, refresh));
+      EXPECT_TRUE(has_mode(restricted, requested.width, requested.height, refresh * 2));
+      EXPECT_TRUE(has_mode(restricted, requested.width, requested.height, refresh * 4));
+      // Exact shape equality covers total sizes/pixel clocks, not just dimensions.
+      const auto [again, again_preferred] = vdd::build_windows_driver_mode_shapes(requested, true);
+      EXPECT_EQ(again, restricted);
+      EXPECT_EQ(again_preferred, preferred);
+    }
+  }
+}

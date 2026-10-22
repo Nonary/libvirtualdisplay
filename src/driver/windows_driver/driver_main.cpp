@@ -1114,14 +1114,16 @@ namespace {
     return key;
   }
 
-  void register_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
+  bool register_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
     const auto mode = mode_shape_from_descriptor(descriptor);
     if (mode.width == 0 || mode.height == 0 || mode.refresh_rate_millihz == 0) {
-      return;
+      return false;
     }
 
     std::lock_guard lock {g_monitor_description_modes_mutex};
-    (void) g_monitor_description_modes.register_mode(descriptor.edid, mode);
+    return g_monitor_description_modes.register_mode(
+      descriptor.edid, mode, descriptor.requested_resolution_only
+    );
   }
 
   void unregister_monitor_description_mode(const vdd::DisplayDescriptor &descriptor) {
@@ -1129,7 +1131,7 @@ namespace {
     g_monitor_description_modes.unregister_mode(descriptor.edid);
   }
 
-  std::optional<ModeShape> registered_mode_shape_from_description(
+  std::optional<vdd::WindowsDriverMonitorMode> registered_mode_shape_from_description(
     const IDDCX_MONITOR_DESCRIPTION &description
   ) {
     const auto key = monitor_description_key(description);
@@ -1138,15 +1140,16 @@ namespace {
     }
 
     std::lock_guard lock {g_monitor_description_modes_mutex};
-    return g_monitor_description_modes.registered_mode(*key);
+    return g_monitor_description_modes.registered_monitor_mode(*key);
   }
 
-  std::optional<ModeShape> preferred_mode_shape_from_description(const IDDCX_MONITOR_DESCRIPTION &description) {
+  std::optional<vdd::WindowsDriverMonitorMode> preferred_mode_shape_from_description(const IDDCX_MONITOR_DESCRIPTION &description) {
     if (const auto registered = registered_mode_shape_from_description(description)) {
       return registered;
     }
 
-    return mode_shape_from_description(description);
+    const auto preferred = mode_shape_from_description(description);
+    return preferred ? std::optional {vdd::WindowsDriverMonitorMode {*preferred, false}} : std::nullopt;
   }
 
   IDDCX_BITS_PER_COMPONENT preferred_rgb_bits_per_component() {
@@ -1258,8 +1261,11 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] =
-      vdd::build_windows_driver_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
+    const auto registered = preferred_mode_shape_from_description(input->MonitorDescription);
+    const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(
+      registered ? std::optional {registered->preferred} : std::nullopt,
+      registered && registered->requested_resolution_only
+    );
     output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->MonitorModeBufferInputCount == 0) {
@@ -1283,8 +1289,11 @@ namespace {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] =
-      vdd::build_windows_driver_mode_shapes(preferred_mode_shape_from_description(input->MonitorDescription));
+    const auto registered = preferred_mode_shape_from_description(input->MonitorDescription);
+    const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(
+      registered ? std::optional {registered->preferred} : std::nullopt,
+      registered && registered->requested_resolution_only
+    );
     output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->MonitorModeBufferInputCount == 0) {
@@ -1302,13 +1311,18 @@ namespace {
 
   NTSTATUS fill_default_monitor_modes(
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES *input,
-    IDARG_OUT_GETDEFAULTDESCRIPTIONMODES *output
+    IDARG_OUT_GETDEFAULTDESCRIPTIONMODES *output,
+    const vdd::WindowsDriverMonitorMode *requested_shape = nullptr
   ) {
     if (!input || !output) {
       return STATUS_INVALID_PARAMETER;
     }
 
-    const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(std::nullopt);
+    const auto [modes, preferred_index] = vdd::build_windows_driver_mode_shapes(
+      requested_shape && requested_shape->requested_resolution_only ?
+        std::optional {requested_shape->preferred} : std::nullopt,
+      requested_shape && requested_shape->requested_resolution_only
+    );
     output->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     output->PreferredMonitorModeIdx = preferred_index;
     if (input->DefaultMonitorModeBufferInputCount == 0) {
@@ -1327,15 +1341,18 @@ namespace {
   NTSTATUS fill_target_modes(
     const IDARG_IN_QUERYTARGETMODES *input,
     IDARG_OUT_QUERYTARGETMODES *output,
-    const ModeShape *requested_shape = nullptr
+    const vdd::WindowsDriverMonitorMode *requested_shape = nullptr
   ) {
     if (!input || !output) {
       return STATUS_INVALID_PARAMETER;
     }
 
+    const auto registered = preferred_mode_shape_from_description(input->MonitorDescription);
     const auto [modes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
-      mode_shape_from_description(input->MonitorDescription),
-      requested_shape
+      registered ? std::optional {registered->preferred} : std::nullopt,
+      requested_shape ? &requested_shape->preferred : nullptr,
+      requested_shape ? requested_shape->requested_resolution_only :
+                        registered && registered->requested_resolution_only
     );
     (void) preferred_index;
     output->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
@@ -1355,15 +1372,18 @@ namespace {
   NTSTATUS fill_target_modes2(
     const IDARG_IN_QUERYTARGETMODES2 *input,
     IDARG_OUT_QUERYTARGETMODES *output,
-    const ModeShape *requested_shape = nullptr
+    const vdd::WindowsDriverMonitorMode *requested_shape = nullptr
   ) {
     if (!input || !output) {
       return STATUS_INVALID_PARAMETER;
     }
 
+    const auto registered = preferred_mode_shape_from_description(input->MonitorDescription);
     const auto [modes, preferred_index] = vdd::build_windows_driver_target_mode_shapes(
-      mode_shape_from_description(input->MonitorDescription),
-      requested_shape
+      registered ? std::optional {registered->preferred} : std::nullopt,
+      requested_shape ? &requested_shape->preferred : nullptr,
+      requested_shape ? requested_shape->requested_resolution_only :
+                        registered && registered->requested_resolution_only
     );
     (void) preferred_index;
     output->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
@@ -3371,7 +3391,10 @@ namespace {
       create_args.pMonitorInfo = &monitor_info;
 
       try {
-        register_monitor_description_mode(descriptor);
+        if (!register_monitor_description_mode(descriptor)) {
+          // Never change the catalog of an already-registered live EDID.
+          return {vdd::BackendError::Failed, {}, 0};
+        }
       } catch (...) {
         TraceLoggingWrite(
           g_trace_provider,
@@ -4028,6 +4051,15 @@ namespace {
       return STATUS_SUCCESS;
     }
 
+    NTSTATUS get_default_description_modes(
+      IDDCX_MONITOR monitor,
+      const IDARG_IN_GETDEFAULTDESCRIPTIONMODES *input,
+      IDARG_OUT_GETDEFAULTDESCRIPTIONMODES *output
+    ) {
+      const auto requested = requested_mode_shape(monitor);
+      return fill_default_monitor_modes(input, output, requested ? &*requested : nullptr);
+    }
+
     NTSTATUS query_target_modes(
       IDDCX_MONITOR monitor,
       const IDARG_IN_QUERYTARGETMODES *input,
@@ -4060,7 +4092,7 @@ namespace {
     }
 
   private:
-    std::optional<ModeShape> requested_mode_shape(IDDCX_MONITOR monitor) {
+    std::optional<vdd::WindowsDriverMonitorMode> requested_mode_shape(IDDCX_MONITOR monitor) {
       if (!monitor) {
         return std::nullopt;
       }
@@ -4076,7 +4108,10 @@ namespace {
         return std::nullopt;
       }
 
-      return mode_shape_from_descriptor(record->second.descriptor);
+      return vdd::WindowsDriverMonitorMode {
+        mode_shape_from_descriptor(record->second.descriptor),
+        record->second.descriptor.requested_resolution_only
+      };
     }
 
     std::mutex mutex_ {};
@@ -4491,10 +4526,16 @@ NTSTATUS SunshineEvtParseMonitorDescription(
 }
 
 NTSTATUS SunshineEvtGetDefaultDescriptionModes(
-  IDDCX_MONITOR,
+  IDDCX_MONITOR monitor,
   const IDARG_IN_GETDEFAULTDESCRIPTIONMODES *input,
   IDARG_OUT_GETDEFAULTDESCRIPTIONMODES *output
 ) {
+  if (monitor) {
+    auto *context = GetMonitorContext(monitor);
+    if (context && context->backend) {
+      return context->backend.load()->get_default_description_modes(monitor, input, output);
+    }
+  }
   return fill_default_monitor_modes(input, output);
 }
 

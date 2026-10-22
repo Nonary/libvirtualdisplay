@@ -41,6 +41,7 @@ namespace virtual_display::driver {
     // the arrived monitor so departures can be fenced against the exact record
     // lineage they were issued for.
     std::uint64_t generation {};
+    bool requested_resolution_only {};
   };
 
   class DisplayDriverBackend {

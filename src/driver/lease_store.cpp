@@ -235,7 +235,8 @@ namespace virtual_display::driver {
         identity_display_id,
         next_temporary_display_generation_++,
         false,
-        validated.request.hdr_max_luminance_nits
+        validated.request.hdr_max_luminance_nits,
+        (validated.request.flags & kCreateTemporaryDisplayFlagRequestedResolutionOnly) != 0
       }
     );
 

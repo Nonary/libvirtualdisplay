@@ -19,6 +19,8 @@ namespace virtual_display::driver {
     std::uint32_t total_height {1125};
     std::uint64_t pixel_rate {148'500'000ull};
     std::uint32_t refresh_rate_millihz {60'000};
+
+    friend constexpr bool operator==(const WindowsDriverModeShape &, const WindowsDriverModeShape &) = default;
   };
 
   struct WindowsDriverFrequencyRational {
@@ -31,20 +33,30 @@ namespace virtual_display::driver {
     WindowsDriverFrequencyRational horizontal;
   };
 
+  struct WindowsDriverMonitorMode {
+    WindowsDriverModeShape preferred;
+    bool requested_resolution_only {};
+  };
+
   class WindowsDriverRegisteredModeStore {
   public:
     bool register_mode(
       std::span<const std::byte, kEdidSize> edid,
-      const WindowsDriverModeShape &mode
+      const WindowsDriverModeShape &mode,
+      bool requested_resolution_only = false
     );
     void unregister_mode(std::span<const std::byte, kEdidSize> edid);
     std::optional<WindowsDriverModeShape> registered_mode(
       std::span<const std::byte, kEdidSize> edid
     ) const;
 
+    std::optional<WindowsDriverMonitorMode> registered_monitor_mode(
+      std::span<const std::byte, kEdidSize> edid
+    ) const;
+
   private:
     struct Entry {
-      WindowsDriverModeShape mode;
+      WindowsDriverMonitorMode mode;
       std::uint32_t references {};
     };
 
@@ -63,11 +75,13 @@ namespace virtual_display::driver {
   );
   std::uint32_t default_windows_driver_preferred_mode_index(const std::vector<WindowsDriverModeShape> &modes);
   std::pair<std::vector<WindowsDriverModeShape>, std::uint32_t> build_windows_driver_mode_shapes(
-    const std::optional<WindowsDriverModeShape> &preferred
+    const std::optional<WindowsDriverModeShape> &preferred,
+    bool requested_resolution_only = false
   );
   std::pair<std::vector<WindowsDriverModeShape>, std::uint32_t> build_windows_driver_target_mode_shapes(
     const std::optional<WindowsDriverModeShape> &monitor_description,
-    const WindowsDriverModeShape *requested_shape
+    const WindowsDriverModeShape *requested_shape,
+    bool requested_resolution_only = false
   );
   WindowsDriverFrequencyRational make_windows_driver_frequency_rational(
     std::uint64_t numerator,

@@ -33,7 +33,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 7;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 8;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
   inline constexpr std::uint16_t kMinimumCompatibleProtocolVersionMinor = 6;
 
@@ -58,14 +58,19 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kMinHdrMaxLuminanceNits = 400;
   inline constexpr std::uint32_t kMaxHdrMaxLuminanceNits = 2000;
   inline constexpr std::uint32_t kCreateTemporaryDisplayFlagEphemeralIdentity = 0x00000001u;
+  // Windows producer 3.8+: keep only the requested width/height in the catalog.
+  // This is immutable for the temporary display lifetime; zero preserves defaults.
+  inline constexpr std::uint32_t kCreateTemporaryDisplayFlagRequestedResolutionOnly = 0x00000002u;
   inline constexpr std::uint32_t kCreateTemporaryDisplayKnownFlags =
-    kCreateTemporaryDisplayFlagEphemeralIdentity;
+    kCreateTemporaryDisplayFlagEphemeralIdentity |
+    kCreateTemporaryDisplayFlagRequestedResolutionOnly;
   inline constexpr std::uint32_t kPermanentDisplayCountKnownFlags = 0;
   inline constexpr std::uint32_t kMaxDisplayStateEntries = 16;
   inline constexpr std::uint32_t kDisplayStateKindPermanent = 1;
   inline constexpr std::uint32_t kDisplayStateKindTemporary = 2;
   inline constexpr std::uint32_t kDisplayStateFlagHdrSupported = 0x00000001u;
   inline constexpr std::uint32_t kDisplayStateFlagRetainIdentity = 0x00000002u;
+  inline constexpr std::uint32_t kDisplayStateFlagRequestedResolutionOnly = 0x00000004u;
   inline constexpr std::uint32_t kDisplayManifestVersion = 3;
   inline constexpr std::uint32_t kMaxPermanentDisplayProfiles = 8;
   inline constexpr std::uint32_t kMaxAllowedModesPerProfile = 4;
@@ -150,6 +155,12 @@ namespace virtual_display::driver {
     std::uint16_t patch {kProtocolVersionPatch};
     std::uint16_t reserved {};
   };
+
+  // Version-gate the additive Windows create flag against the actual producer.
+  inline constexpr bool supports_requested_resolution_catalog(const ProtocolVersion &version) {
+    return version.api_namespace == kApiNamespaceGuid &&
+           version.major == kProtocolVersionMajor && version.minor >= 8;
+  }
 
   struct AdapterLuid {
     std::uint32_t low_part {};

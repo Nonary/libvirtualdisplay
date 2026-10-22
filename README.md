@@ -402,7 +402,7 @@ if (!released.ok()) {
 
 ### Protocol notes
 
-- The current protocol version is `3.7.0`. Protocol 3.7 adds owned temporary
+- The current protocol version is `3.8.0`. Protocol 3.7 adds owned temporary
   display creation and capability-based lease reclaim without exposing lease IDs
   through global display-state queries.
 - Reclaim rotates only lease ownership and expiry. Connector assignment and the
@@ -425,3 +425,38 @@ if (!released.ok()) {
 - Permanent-display settings are shared by the active permanent pool; setting
   the same count with new mode/name settings refreshes existing permanent
   monitors.
+
+### Requested-resolution Windows catalogs (protocol 3.8)
+
+`kCreateTemporaryDisplayFlagRequestedResolutionOnly` opts one temporary monitor
+into advertising only its requested width and height. The default flag value is
+zero and preserves the complete catalog. The restricted catalog retains existing
+same-resolution nominal rates and the descriptor's exact base, 2x and 4x rates;
+it does not impose a single refresh rate. A missing or invalid unbound description
+retains a nonempty default catalog.
+Accepted explicit creates first validate their requested dimensions and refresh,
+then carry that exact timing and policy through the temporary record and backend
+descriptor. They do not retry as a full-catalog create. The malformed-description
+helper fallback is not evidence that Windows will retain the restriction after
+unexpected native descriptor loss; that path remains a qualification gate.
+
+Check the actual opened Windows producer with
+`supports_requested_resolution_catalog(query_protocol_version().value)` after
+checking that the query succeeded. Protocol 3.7 does not support the new bit;
+never silently retry an explicit restricted request with the bit removed and
+report it as success. Existing request/result sizes and IOCTL values are unchanged.
+`QueryDisplayState` reports the effective policy with
+`kDisplayStateFlagRequestedResolutionOnly`.
+
+The policy belongs to the temporary display record and is immutable until removal.
+Secure reclaim changes its lease, not its mode catalog. Changing policy or requested
+dimensions requires a new monitor lifetime, using the existing proven-owner removal
+path at a session boundary. Never mutate a peer, shared or permanent display's
+catalog to satisfy a per-client setting. Producer source support alone does not
+expose a host setting: consumers must carry a per-client opt-in, verify capability
+and queried state, and ship a reviewed, trust-qualified Windows producer first.
+
+Both monitor-description callback versions, target-mode callback versions, and the
+per-monitor default-description callback use the same policy. Portable mode and
+controller tests do not establish Windows/DXGI enumeration, installed driver trust,
+or a game's resolution-selection behavior; those need native qualification.

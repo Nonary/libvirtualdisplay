@@ -105,7 +105,7 @@ TEST(VirtualDisplayDriverControlProtocol, ProtocolVersionStringFormatsConstants)
   // Behavioral replacement for the test that scraped README.md for the version prose: it
   // asserts the formatter that is the single source of truth for the dotted version, rather
   // than that a string happens to appear in a checked-in document.
-  EXPECT_EQ(vdd::protocol_version_string(), "3.7.0");
+  EXPECT_EQ(vdd::protocol_version_string(), "3.8.0");
 }
 
 TEST(VirtualDisplayDriverControlProtocol, WindowsGuidAdapterPreservesProtocolGuid) {
@@ -575,4 +575,33 @@ TEST(VirtualDisplayDriverControlProtocol, ValidationErrorNamesAreExhaustiveAndDi
     EXPECT_STRNE(name, "unknown") << "missing to_string arm for ValidationError " << value;
     EXPECT_TRUE(seen.insert(name).second) << "duplicate ValidationError name: " << name;
   }
+}
+
+TEST(VirtualDisplayDriverControlProtocol, RequestedResolutionCatalogFlagKeepsExistingWireLayout) {
+  auto request = valid_create_request();
+  // The additive wire bit is understood by the proposed 3.8 Windows producer.
+  request.flags = 0x00000002u;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
+  EXPECT_EQ(sizeof(request), 96u);
+  EXPECT_EQ(sizeof(vdd::CreateTemporaryDisplayOwnedRequest), 128u);
+  request.flags |= vdd::kCreateTemporaryDisplayFlagEphemeralIdentity;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::None);
+  request.flags |= 0x80000000u;
+  EXPECT_EQ(vdd::validate_create_temporary_display(request), vdd::ValidationError::InvalidFlags);
+}
+
+TEST(VirtualDisplayDriverControlProtocol, CatalogCapabilityRequiresCompatibleActualProducerVersion) {
+  vdd::ProtocolVersion version {};
+  EXPECT_TRUE(vdd::supports_requested_resolution_catalog(version));
+  version.minor = 7;
+  EXPECT_FALSE(vdd::supports_requested_resolution_catalog(version));
+  version.minor = 8;
+  EXPECT_TRUE(vdd::supports_requested_resolution_catalog(version));
+  version.minor = 9;
+  EXPECT_TRUE(vdd::supports_requested_resolution_catalog(version));
+  version.major += 1;
+  EXPECT_FALSE(vdd::supports_requested_resolution_catalog(version));
+  version.major = vdd::kProtocolVersionMajor;
+  version.api_namespace = {};
+  EXPECT_FALSE(vdd::supports_requested_resolution_catalog(version));
 }

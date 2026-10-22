@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "virtual_display/driver/driver_controller.h"
+#include "virtual_display/driver/windows_driver_modes.h"
 
 #include <algorithm>
 #include <atomic>
@@ -942,4 +943,236 @@ TEST(VirtualDisplayDriverController, BusyBackendLockDoesNotPoisonLiveDisplayWith
   backend.block_depart = false;
   EXPECT_TRUE(controller.remove_temporary_display(remove_busy).ok());
   EXPECT_FALSE(controller.store().find_temporary_display(0x222));
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicySurvivesOwnedReclaimAndDoesNotLeakToPeersOrNextLifetime) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request();
+  owned.display.width = 2420;
+  owned.display.height = 1668;
+  owned.display.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+  ASSERT_EQ(backend.arrived.size(), 1u);
+  EXPECT_TRUE(backend.arrived[0].requested_resolution_only);
+  EXPECT_EQ(backend.arrived[0].width, 2420u);
+  EXPECT_EQ(backend.arrived[0].height, 1668u);
+  // Image area and EDID generation are independent of advertised-mode policy.
+  EXPECT_EQ(backend.arrived[0].physical_width_mm, 590u);
+  EXPECT_EQ(backend.arrived[0].physical_height_mm, 330u);
+  const auto filtered_edid = backend.arrived[0].edid;
+  const auto &descriptor = backend.arrived[0];
+  const auto [catalog, preferred] = vdd::build_windows_driver_mode_shapes(
+    vdd::active_windows_driver_mode_shape(descriptor.width, descriptor.height, descriptor.refresh_rate_millihz),
+    descriptor.requested_resolution_only
+  );
+  ASSERT_LT(preferred, catalog.size());
+  for (const auto &mode: catalog) {
+    EXPECT_EQ(mode.width, 2420u);
+    EXPECT_EQ(mode.height, 1668u);
+  }
+
+  auto peer = make_create_request(lease_id(200), 0x12345679);
+  ASSERT_TRUE(controller.create_temporary_display(peer, now).status.ok());
+  EXPECT_FALSE(backend.arrived[1].requested_resolution_only);
+  auto state = controller.query_display_state();
+  ASSERT_EQ(state.entry_count, 2u);
+  for (std::uint32_t i = 0; i < state.entry_count; ++i) {
+    EXPECT_EQ((state.entries[i].flags & vdd::kDisplayStateFlagRequestedResolutionOnly) != 0,
+              state.entries[i].display_id == owned.display.display_id);
+  }
+
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.owner_capability = owned.owner_capability;
+  reclaim.owner_capability.bytes[0] ^= 1;
+  EXPECT_FALSE(controller.reclaim_temporary_display(reclaim, now).status.ok());
+  reclaim.owner_capability = owned.owner_capability;
+  ASSERT_TRUE(controller.reclaim_temporary_display(reclaim, now).status.ok());
+  ASSERT_TRUE(controller.store().find_temporary_display(owned.display.display_id));
+  EXPECT_TRUE(controller.store().find_temporary_display(owned.display.display_id)->requested_resolution_only);
+  EXPECT_EQ(backend.arrived.size(), 2u);
+  EXPECT_TRUE(backend.departed.empty());
+
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = reclaim.new_lease_id;
+  remove.display_id = owned.display.display_id;
+  ASSERT_TRUE(controller.remove_temporary_display(remove).ok());
+  owned.display.flags = 0;
+  owned.display.lease_id = lease_id(102);
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+  ASSERT_EQ(backend.arrived.size(), 3u);
+  EXPECT_FALSE(backend.arrived.back().requested_resolution_only);
+  EXPECT_EQ(backend.arrived.back().edid, filtered_edid);
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicyRejectsMalformedCreateBeforeAnyBackendOrStateChange) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  auto peer = make_create_request(lease_id(200), 0x326);
+  ASSERT_TRUE(controller.create_temporary_display(peer, now).status.ok());
+  const auto peer_before = controller.store().find_temporary_display(peer.display_id);
+  ASSERT_TRUE(peer_before);
+  for (const auto dimensions: {std::pair {0u, 1668u}, {2420u, 0u}, {7681u, 1668u}, {2420u, 4321u}}) {
+    auto invalid = make_create_request(lease_id(100), 0x325);
+    invalid.width = dimensions.first;
+    invalid.height = dimensions.second;
+    invalid.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+    EXPECT_EQ(controller.create_temporary_display(invalid, now).status.store_error, vdd::StoreError::ValidationFailed);
+    EXPECT_FALSE(controller.store().find_temporary_display(invalid.display_id));
+    EXPECT_EQ(backend.arrived.size(), 1u);
+    EXPECT_EQ(backend.reserved.size(), 1u);
+    EXPECT_TRUE(backend.departed.empty());
+    const auto state = controller.query_display_state();
+    ASSERT_EQ(state.entry_count, 1u);
+    EXPECT_EQ(state.entries[0].display_id, peer.display_id);
+    EXPECT_EQ(state.entries[0].flags & vdd::kDisplayStateFlagRequestedResolutionOnly, 0u);
+  }
+  EXPECT_EQ(controller.store().find_temporary_display(peer.display_id)->generation, peer_before->generation);
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicyCannotChangeByDuplicateCreateOrLeaseFeed) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  auto restricted = make_create_request(lease_id(100), 0x325);
+  restricted.width = 2420;
+  restricted.height = 1668;
+  restricted.refresh_rate_millihz = 59'940;
+  restricted.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+  ASSERT_TRUE(controller.create_temporary_display(restricted, now).status.ok());
+  const auto before = controller.store().find_temporary_display(restricted.display_id);
+  ASSERT_TRUE(before);
+  auto replacement = restricted;
+  replacement.flags = 0;
+  replacement.width = 1920;
+  replacement.height = 1080;
+  EXPECT_EQ(controller.create_temporary_display(replacement, now).status.store_error, vdd::StoreError::DisplayAlreadyExists);
+  vdd::LeaseRequest feed {};
+  feed.lease_id = restricted.lease_id;
+  feed.requested_timeout_ms = 60'000;
+  ASSERT_TRUE(controller.feed_lease(feed, now + std::chrono::seconds(1)).ok());
+  const auto after = controller.store().find_temporary_display(restricted.display_id);
+  ASSERT_TRUE(after);
+  EXPECT_TRUE(after->requested_resolution_only);
+  EXPECT_EQ(after->width, 2420u);
+  EXPECT_EQ(after->height, 1668u);
+  EXPECT_EQ(after->refresh_rate_millihz, 59'940u);
+  EXPECT_EQ(after->generation, before->generation);
+  EXPECT_EQ(backend.arrived.size(), 1u);
+  EXPECT_TRUE(backend.departed.empty());
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicyFailedArrivalDoesNotLeakIntoReplacementLifetime) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  auto requested = make_create_request(lease_id(100), 0x325);
+  requested.width = 2420;
+  requested.height = 1668;
+  requested.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+  backend.fail_arrive = true;
+  EXPECT_EQ(controller.create_temporary_display(requested, now).status.backend_error, vdd::BackendError::Failed);
+  EXPECT_FALSE(controller.store().find_temporary_display(requested.display_id));
+  EXPECT_EQ(controller.query_display_state().entry_count, 0u);
+  ASSERT_EQ(backend.arrived.size(), 1u);
+  EXPECT_TRUE(backend.arrived[0].requested_resolution_only);
+  const auto failed_generation = backend.arrived[0].generation;
+  backend.fail_arrive = false;
+  requested.lease_id = lease_id(101);
+  requested.flags = 0;
+  ASSERT_TRUE(controller.create_temporary_display(requested, now).status.ok());
+  ASSERT_EQ(backend.arrived.size(), 2u);
+  EXPECT_FALSE(backend.arrived[1].requested_resolution_only);
+  EXPECT_NE(backend.arrived[1].generation, failed_generation);
+  EXPECT_EQ(controller.query_display_state().entries[0].flags & vdd::kDisplayStateFlagRequestedResolutionOnly, 0u);
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicyPendingRecoveryUsesNewOwnedLifetimeAndPreservesPeer) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest owned {};
+  owned.display = make_create_request(lease_id(100), 0x325);
+  owned.display.width = 2420;
+  owned.display.height = 1668;
+  owned.display.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+  owned.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(owned, now).status.ok());
+  auto peer = make_create_request(lease_id(200), 0x326);
+  ASSERT_TRUE(controller.create_temporary_display(peer, now).status.ok());
+  const auto old = controller.store().find_temporary_display(owned.display.display_id);
+  const auto peer_before = controller.store().find_temporary_display(peer.display_id);
+  ASSERT_TRUE(old);
+  ASSERT_TRUE(peer_before);
+  backend.fail_depart = true;
+  vdd::LeaseDisplayRequest remove {};
+  remove.lease_id = owned.display.lease_id;
+  remove.display_id = owned.display.display_id;
+  ASSERT_EQ(controller.remove_temporary_display(remove).backend_error, vdd::BackendError::Failed);
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = owned.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.owner_capability = owned.owner_capability;
+  EXPECT_EQ(controller.reclaim_temporary_display(reclaim, now).status.store_error, vdd::StoreError::LeaseNotFound);
+  auto retry = owned;
+  retry.display.lease_id = lease_id(102);
+  retry.display.flags = 0;
+  retry.owner_capability.bytes[0] ^= 1;
+  EXPECT_EQ(controller.create_temporary_display_owned(retry, now).status.backend_error, vdd::BackendError::Failed);
+  EXPECT_TRUE(controller.store().find_temporary_display(owned.display.display_id)->requested_resolution_only);
+  EXPECT_EQ(backend.arrived.size(), 2u);
+  retry.owner_capability = owned.owner_capability;
+  ASSERT_TRUE(controller.create_temporary_display_owned(retry, now).status.ok());
+  const auto replacement = controller.store().find_temporary_display(owned.display.display_id);
+  ASSERT_TRUE(replacement);
+  EXPECT_FALSE(replacement->requested_resolution_only);
+  EXPECT_NE(replacement->generation, old->generation);
+  EXPECT_NE(replacement->connector_index, old->connector_index);
+  EXPECT_EQ(controller.store().find_temporary_display(peer.display_id)->generation, peer_before->generation);
+  EXPECT_FALSE(controller.store().find_temporary_display(peer.display_id)->requested_resolution_only);
+  ASSERT_EQ(backend.arrived.size(), 3u);
+  EXPECT_FALSE(backend.arrived.back().requested_resolution_only);
+  for (const auto departed: backend.departed) EXPECT_EQ(departed, owned.display.display_id);
+}
+
+TEST(VirtualDisplayDriverController, CatalogPolicySharedLeaseReclaimDoesNotCopyPolicyToFullSibling) {
+  FakeBackend backend;
+  auto controller = make_controller(backend);
+  const auto now = std::chrono::steady_clock::now();
+  vdd::CreateTemporaryDisplayOwnedRequest first {};
+  first.display = make_create_request(lease_id(100), 0x325);
+  first.display.flags = vdd::kCreateTemporaryDisplayFlagRequestedResolutionOnly;
+  first.owner_capability = owner_capability();
+  ASSERT_TRUE(controller.create_temporary_display_owned(first, now).status.ok());
+  auto sibling = first;
+  sibling.display.display_id = 0x326;
+  sibling.display.flags = 0;
+  ASSERT_TRUE(controller.create_temporary_display_owned(sibling, now).status.ok());
+  vdd::ReclaimTemporaryDisplayRequest reclaim {};
+  reclaim.display_id = first.display.display_id;
+  reclaim.new_lease_id = lease_id(101);
+  reclaim.owner_capability = first.owner_capability;
+  const auto reclaimed = controller.reclaim_temporary_display(reclaim, now);
+  ASSERT_TRUE(reclaimed.status.ok());
+  EXPECT_EQ(reclaimed.result.temporary_display_count, 2u);
+  EXPECT_EQ(backend.arrived.size(), 2u);
+  EXPECT_TRUE(backend.departed.empty());
+  const auto state = controller.query_display_state();
+  ASSERT_EQ(state.entry_count, 2u);
+  for (std::uint32_t index = 0; index < state.entry_count; ++index) {
+    const auto &entry = state.entries[index];
+    EXPECT_EQ(entry.lease_id, 0u);
+    EXPECT_EQ((entry.flags & vdd::kDisplayStateFlagRequestedResolutionOnly) != 0,
+              entry.display_id == first.display.display_id);
+    const auto record = controller.store().find_temporary_display(entry.display_id);
+    ASSERT_TRUE(record);
+    EXPECT_EQ(record->lease_id, reclaim.new_lease_id);
+    EXPECT_EQ(record->requested_resolution_only, entry.display_id == first.display.display_id);
+  }
 }
