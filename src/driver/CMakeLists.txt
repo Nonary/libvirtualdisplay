@@ -17,7 +17,13 @@ if(LIBVIRTUALDISPLAY_ENABLE_FRAME_TRANSPORT)
 endif()
 
 if(WIN32)
-    target_link_libraries(${MODULE} PRIVATE setupapi d3d11 dxgi kernelbase)
+    target_link_libraries(${MODULE} PRIVATE setupapi d3d11 dxgi)
+    if(MINGW)
+        # MinGW ships CompareObjectHandles in libonecore.a, not libkernelbase.a.
+        target_link_libraries(${MODULE} PRIVATE onecore)
+    else()
+        target_link_libraries(${MODULE} PRIVATE kernelbase)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
