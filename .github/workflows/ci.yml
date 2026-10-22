@@ -24,6 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libdrm-dev
+
       - name: Configure
         run: cmake -S . -B build-linux -G Ninja -DBUILD_TESTS=ON
 

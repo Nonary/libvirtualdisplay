@@ -94,6 +94,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     find_program(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE NAMES python3)
     if(LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE)
+        # The CTest command invokes this helper by its target-file path. Ensure
+        # it is included when CI builds only test_libvirtualdisplay.
+        if(TARGET vibeshine_vkms_peercred)
+            add_dependencies(test_libvirtualdisplay vibeshine_vkms_peercred)
+        endif()
+
         add_test(NAME linux_drm_native_allocation
                 COMMAND "${LIBVIRTUALDISPLAY_PYTHON_EXECUTABLE}"
                     "${PROJECT_SOURCE_DIR}/tests/linux/test-native-dumb-allocation.py"
