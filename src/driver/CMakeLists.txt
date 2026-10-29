@@ -18,12 +18,9 @@ endif()
 
 if(WIN32)
     target_link_libraries(${MODULE} PRIVATE setupapi d3d11 dxgi)
-    if(MINGW)
-        # MinGW ships CompareObjectHandles in libonecore.a, not libkernelbase.a.
-        target_link_libraries(${MODULE} PRIVATE onecore)
-    else()
-        target_link_libraries(${MODULE} PRIVATE kernelbase)
-    endif()
+    # Both the Windows SDK and MinGW provide the umbrella import library;
+    # kernelbase.lib is absent on some MSVC/SDK installations.
+    target_link_libraries(${MODULE} PRIVATE onecore)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
