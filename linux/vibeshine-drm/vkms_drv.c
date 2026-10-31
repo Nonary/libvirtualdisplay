@@ -11,6 +11,7 @@
 
 #include <linux/module.h>
 #include <linux/capability.h>
+#include <linux/compat.h>
 #include <linux/device/faux.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
@@ -23,6 +24,7 @@
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
+#include <linux/uaccess.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_gem.h>
@@ -44,6 +46,8 @@
 #include "vkms_config.h"
 #include "vkms_configfs.h"
 #include "vkms_drv.h"
+#include "vkms_capture.h"
+#include "vkms_frame_fds.h"
 #include "vibeshine_drm_change.h"
 #include "vibeshine_drm_dumb.h"
 #include "vibeshine_drm_present.h"
@@ -78,7 +82,28 @@ static bool create_default_dev = true;
 module_param_named(create_default_dev, create_default_dev, bool, 0444);
 MODULE_PARM_DESC(create_default_dev, "Create or not the default VKMS device");
 
-DEFINE_DRM_GEM_FOPS(vkms_driver_fops);
+static long vkms_ioctl(struct file *file, unsigned int command, unsigned long argument);
+#ifdef CONFIG_COMPAT
+static long vkms_compat_ioctl(struct file *file, unsigned int command, unsigned long argument);
+#endif
+
+static const struct file_operations vkms_driver_fops = {
+	.owner = THIS_MODULE,
+	.open = drm_open,
+	.release = drm_release,
+	.unlocked_ioctl = vkms_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = vkms_compat_ioctl,
+#endif
+	.poll = drm_poll,
+	.read = drm_read,
+	.llseek = noop_llseek,
+	.mmap = drm_gem_mmap,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	.get_unmapped_area = drm_gem_get_unmapped_area,
+#endif
+	.fop_flags = FOP_UNSIGNED_OFFSET,
+};
 
 #define DRM_IOCTL_VIBESHINE_WAIT_PRESENT \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_WAIT_PRESENT, \
@@ -231,50 +256,32 @@ static int vkms_get_present_trace_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
-static void vkms_close_frame_fds(struct vibeshine_drm_frame *frame)
-{
-	unsigned int i;
+/* The first member is the stable UAPI reply; the remaining state is kernel-only. */
+struct vkms_frame_export {
+	struct vibeshine_drm_frame frame;
+	struct vkms_frame_fds descriptors;
+	bool include_color;
+};
 
-	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
-		if (frame->dma_buf_fds[i] >= 0) {
-			close_fd(frame->dma_buf_fds[i]);
-			frame->dma_buf_fds[i] = -1;
-		}
-	}
-	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
-		if (frame->sync_file_fds[i] >= 0) {
-			close_fd(frame->sync_file_fds[i]);
-			frame->sync_file_fds[i] = -1;
-		}
-	}
-}
-
-static int vkms_export_read_fence(struct dma_buf *dma_buf)
+static int vkms_export_read_fence(struct dma_buf *dma_buf, struct vkms_frame_fds *fds)
 {
 	struct dma_fence *fence;
 	struct sync_file *sync_file;
-	int fd;
+	int number;
 	int ret;
 
-	ret = dma_resv_get_singleton(dma_buf->resv, DMA_RESV_USAGE_WRITE,
-				     &fence);
+	ret = dma_resv_get_singleton(dma_buf->resv, DMA_RESV_USAGE_WRITE, &fence);
 	if (ret)
 		return ret;
 	if (!fence)
 		return -1;
-
 	sync_file = sync_file_create(fence);
 	dma_fence_put(fence);
 	if (!sync_file)
 		return -ENOMEM;
-
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0) {
-		fput(sync_file->file);
-		return fd;
-	}
-	fd_install(fd, sync_file->file);
-	return fd;
+	number = vkms_frame_reserve_fd(fds, sync_file->file);
+	fput(sync_file->file);
+	return number;
 }
 
 static struct dma_buf *vkms_get_frame_dmabuf(struct drm_file *file_priv,
@@ -334,11 +341,13 @@ u64 vkms_framebuffer_modifier(struct drm_framebuffer *fb)
 		DRM_FORMAT_MOD_INVALID : fb->modifier;
 }
 
-static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
-				struct drm_file *file_priv)
+static int vkms_get_frame(struct drm_device *dev, void *data,
+			  struct drm_file *file_priv, bool leased)
 {
-	struct vibeshine_drm_frame *request = data;
+	struct vkms_frame_export *export = data;
+	struct vibeshine_drm_frame *request = &export->frame;
 	struct drm_framebuffer *fb = NULL;
+	struct vkms_capture_lease *lease = NULL;
 	struct vkms_output *output;
 	struct drm_crtc *crtc;
 	unsigned int plane_count;
@@ -355,26 +364,54 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 		return -ENOENT;
 
 	output = drm_crtc_to_vkms_output(crtc);
+	if (leased) {
+		lease = vkms_capture_lease_alloc();
+		if (!lease)
+			return -ENOMEM;
+	}
 	for (i = 0; i < VIBESHINE_DRM_FRAME_MAX_PLANES; ++i) {
 		request->dma_buf_fds[i] = -1;
 		request->sync_file_fds[i] = -1;
 	}
 
 	spin_lock_irq(&output->present_lock);
+	if (leased && !vibeshine_capture_acquire(&output->capture,
+		READ_ONCE(drm_device_to_vkms_device(dev)->capture_stopping) ||
+		!READ_ONCE(drm_device_to_vkms_device(dev)->accepting_commits))) {
+		spin_unlock_irq(&output->present_lock);
+		vkms_capture_lease_put(lease);
+		return -EBUSY;
+	}
 	request->sequence = atomic64_read(&output->present_sequence);
 	request->timestamp_ns = output->present_timestamp_ns;
+	if (export->include_color) {
+		request->reserved_u32 = output->present_color;
+		memcpy(request->reserved, output->present_hdr_metadata, sizeof(request->reserved));
+	}
 	if (output->present_fb) {
 		fb = output->present_fb;
 		drm_framebuffer_get(fb);
+		if (leased)
+			vkms_capture_lease_begin(lease, output);
 	}
 	spin_unlock_irq(&output->present_lock);
 
 	if (!fb) {
+		if (leased) {
+			spin_lock_irq(&output->present_lock);
+			vibeshine_capture_release(&output->capture);
+			spin_unlock_irq(&output->present_lock);
+			wake_up_all(&output->capture_waitq);
+		}
 		request->flags = VIBESHINE_DRM_FRAME_EMPTY;
+		request->reserved_u32 = 0;
+		memset(request->reserved, 0, sizeof(request->reserved));
+		vkms_capture_lease_put(lease);
 		return 0;
 	}
 
-	request->flags = VIBESHINE_DRM_FRAME_READY;
+	request->flags = VIBESHINE_DRM_FRAME_READY |
+		(leased ? VIBESHINE_DRM_FRAME_LEASED : 0);
 	request->width = fb->width;
 	request->height = fb->height;
 	request->fourcc = fb->format->format;
@@ -396,10 +433,18 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 			goto out;
 		}
 
-		request->dma_buf_fds[i] = dma_buf_fd(dma_buf, O_CLOEXEC);
+		if (leased) {
+			dma_buf = vkms_capture_wrap(dma_buf, lease);
+			if (IS_ERR(dma_buf)) {
+				ret = PTR_ERR(dma_buf);
+				goto out;
+			}
+		}
+		request->dma_buf_fds[i] = vkms_frame_reserve_fd(&export->descriptors,
+							    dma_buf->file);
 		if (request->dma_buf_fds[i] < 0) {
-			dma_buf_put(dma_buf);
 			ret = request->dma_buf_fds[i];
+			dma_buf_put(dma_buf);
 			goto out;
 		}
 		request->pitches[i] = fb->pitches[i];
@@ -411,7 +456,8 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 		 * remaining implicit write fence for explicit-sync importers; -1 means
 		 * no wait is required.
 		 */
-		request->sync_file_fds[i] = vkms_export_read_fence(dma_buf);
+		request->sync_file_fds[i] = vkms_export_read_fence(dma_buf, &export->descriptors);
+		dma_buf_put(dma_buf);
 		if (request->sync_file_fds[i] < -1) {
 			ret = request->sync_file_fds[i];
 			request->sync_file_fds[i] = -1;
@@ -421,14 +467,97 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 
 out:
 	drm_framebuffer_put(fb);
-	if (ret)
-		vkms_close_frame_fds(request);
+	vkms_capture_lease_put(lease);
 	return ret;
 }
 
+static int vkms_get_frame_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	return vkms_get_frame(dev, data, file_priv, false);
+}
+
+#define DRM_IOCTL_VIBESHINE_GET_FRAME_LEASED \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_GET_FRAME_LEASED, struct vibeshine_drm_frame)
+static int vkms_get_frame_leased_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	return vkms_get_frame(dev, data, file_priv, true);
+}
+
+#define DRM_IOCTL_VIBESHINE_GET_FRAME_COLOR \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_VIBESHINE_GET_FRAME_COLOR, struct vibeshine_drm_frame)
+static int vkms_get_frame_color_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	struct vkms_frame_export *export = data;
+	int ret;
+
+	if (export->frame.abi_version != VIBESHINE_DRM_FRAME_COLOR_ABI_VERSION)
+		return -EINVAL;
+	export->frame.abi_version = VIBESHINE_DRM_FRAME_ABI_VERSION;
+	export->include_color = true;
+	ret = vkms_get_frame(dev, data, file_priv, true);
+	export->frame.abi_version = VIBESHINE_DRM_FRAME_COLOR_ABI_VERSION;
+	return ret;
+}
+
+/* Exported FDs must not be installed before copy_to_user succeeds. DRM's
+ * generic ioctl copyout happens after its callback, so these two commands need
+ * a transaction around their callback. All other commands use normal DRM dispatch.
+ * A malformed encoding of either command reaches drm_invalid_op, not this path.
+ */
+static long vkms_frame_ioctl(struct file *file, unsigned int command,
+			     unsigned long argument)
+{
+	struct vkms_frame_export export = {};
+	struct drm_file *client = file->private_data;
+	drm_ioctl_t *operation = command == DRM_IOCTL_VIBESHINE_GET_FRAME_COLOR ?
+		vkms_get_frame_color_ioctl : (command == DRM_IOCTL_VIBESHINE_GET_FRAME_LEASED ?
+		vkms_get_frame_leased_ioctl : vkms_get_frame_ioctl);
+	void __user *reply = (void __user *)argument;
+	int entered;
+	long result;
+
+	if (copy_from_user(&export.frame, reply, sizeof(export.frame)))
+		return -EFAULT;
+	if (!drm_dev_enter(client->minor->dev, &entered))
+		return -ENODEV;
+	result = drm_ioctl_kernel(file, operation, &export, 0);
+	if (!result && copy_to_user(reply, &export.frame, sizeof(export.frame)))
+		result = -EFAULT;
+	vkms_frame_finish_fds(&export.descriptors, result == 0);
+	drm_dev_exit(entered);
+	return result;
+}
+
+static bool vkms_is_frame_ioctl(unsigned int command)
+{
+	return command == DRM_IOCTL_VIBESHINE_GET_FRAME ||
+		command == DRM_IOCTL_VIBESHINE_GET_FRAME_LEASED ||
+		command == DRM_IOCTL_VIBESHINE_GET_FRAME_COLOR;
+}
+
+static long vkms_ioctl(struct file *file, unsigned int command, unsigned long argument)
+{
+	if (vkms_is_frame_ioctl(command))
+		return vkms_frame_ioctl(file, command, argument);
+	return drm_ioctl(file, command, argument);
+}
+
+#ifdef CONFIG_COMPAT
+static long vkms_compat_ioctl(struct file *file, unsigned int command,
+			      unsigned long argument)
+{
+	/* Both private structures use fixed-width fields and have identical layout. */
+	if (vkms_is_frame_ioctl(command))
+		return vkms_frame_ioctl(file, command, (unsigned long)compat_ptr(argument));
+	return drm_compat_ioctl(file, command, argument);
+}
+#endif
+
 static const struct drm_ioctl_desc vkms_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME_COLOR, drm_invalid_op, 0),
+	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME_LEASED, drm_invalid_op, 0),
 	DRM_IOCTL_DEF_DRV(VIBESHINE_WAIT_PRESENT, vkms_wait_present_ioctl, 0),
-	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0),
+	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, drm_invalid_op, 0),
 	DRM_IOCTL_DEF_DRV(VIBESHINE_GET_PRESENT_TRACE, vkms_get_present_trace_ioctl, 0),
 };
 
@@ -611,6 +740,41 @@ static bool vkms_commit_changes_crtc(struct drm_atomic_commit *state,
 	return false;
 }
 
+/* Connector colour belongs to the completed presentation, not to a later
+ * live connector state. The commit retains its blobs until this copy ends.
+ * Called under present_lock; never retain a pointer into the atomic state. */
+static void vkms_publish_color(struct drm_atomic_commit *state, struct drm_crtc *crtc,
+			       struct vkms_output *output)
+{
+	struct drm_connector *connector;
+	struct drm_connector_state *old_state, *new_state;
+	int i;
+
+	BUILD_BUG_ON(sizeof(struct hdr_output_metadata) != sizeof(output->present_hdr_metadata));
+	for_each_oldnew_connector_in_state(state, connector, old_state, new_state, i) {
+		const struct hdr_output_metadata *hdr;
+
+		if (!new_state || new_state->crtc != crtc)
+			continue;
+		output->present_color = VIBESHINE_DRM_COLOR_UNKNOWN;
+		memset(output->present_hdr_metadata, 0, sizeof(output->present_hdr_metadata));
+		if (!new_state->hdr_output_metadata) {
+			if (new_state->colorspace == DRM_MODE_COLORIMETRY_DEFAULT)
+				output->present_color = VIBESHINE_DRM_COLOR_SRGB;
+			continue;
+		}
+		if (new_state->hdr_output_metadata->length != sizeof(*hdr))
+			continue;
+		hdr = new_state->hdr_output_metadata->data;
+		if (hdr->metadata_type != 0 || hdr->hdmi_metadata_type1.metadata_type != 0 ||
+		    hdr->hdmi_metadata_type1.eotf != 2 ||
+		    new_state->colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB)
+			continue;
+		output->present_color = VIBESHINE_DRM_COLOR_BT2020_PQ;
+		memcpy(output->present_hdr_metadata, hdr, sizeof(*hdr));
+	}
+}
+
 static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
@@ -647,6 +811,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 				output->present_fb = new_present_fb;
 				new_present_fb = NULL;
 			}
+			vkms_publish_color(state, crtc, output);
 			output->present_timestamp_ns = presentation_timestamp_ns;
 			completed_sequence = atomic64_inc_return(&output->present_sequence);
 			trace_event = &output->present_trace[(completed_sequence - 1) %
@@ -654,6 +819,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 			trace_event->sequence = completed_sequence;
 			trace_event->timestamp_ns = output->present_timestamp_ns;
 		}
+		WARN_ON_ONCE(!vibeshine_capture_publish(&output->capture));
 		if (WARN_ON_ONCE(atomic_read(&output->pending_commits) <= 0))
 			atomic_set(&output->pending_commits, 0);
 		else
@@ -678,6 +844,7 @@ static void vkms_update_pending_crtcs(struct drm_atomic_commit *state, bool add)
 			continue;
 
 		output = drm_crtc_to_vkms_output(crtc);
+		spin_lock_irq(&output->present_lock);
 		if (add) {
 			atomic_inc(&output->pending_commits);
 		} else {
@@ -687,6 +854,7 @@ static void vkms_update_pending_crtcs(struct drm_atomic_commit *state, bool add)
 				atomic_dec(&output->pending_commits);
 			wake_up_interruptible(&output->present_waitq);
 		}
+		spin_unlock_irq(&output->present_lock);
 	}
 }
 
@@ -712,6 +880,13 @@ static void vkms_atomic_commit_tail(struct drm_atomic_commit *old_state)
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state;
 	int i;
+
+	/* Admission closed new lease acquisition before state swap. A synchronous
+	 * caller reaches this point only when no readers exist. */
+	drm_for_each_crtc(crtc, dev) {
+		if (vkms_commit_touches_crtc(old_state, crtc))
+			vkms_capture_wait(drm_crtc_to_vkms_output(crtc));
+	}
 
 	drm_atomic_helper_commit_modeset_disables(dev, old_state);
 
@@ -774,11 +949,73 @@ static int vkms_atomic_check(struct drm_device *dev, struct drm_atomic_commit *s
 	return drm_atomic_helper_check(dev, state);
 }
 
+/* Reserve every touched output before the helper swaps state. The commit lock
+ * serializes reservations and rollback; present_lock serializes each reservation
+ * with capture acquisition. Never wait for a lease held by the ioctl caller. */
+static int vkms_reserve_capture_outputs(struct drm_atomic_commit *state, bool nonblock)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc *failed = NULL;
+
+	drm_for_each_crtc(crtc, state->dev) {
+		struct vkms_output *output;
+		bool reserved;
+
+		if (!vkms_commit_touches_crtc(state, crtc))
+			continue;
+		output = drm_crtc_to_vkms_output(crtc);
+		spin_lock_irq(&output->present_lock);
+		reserved = vibeshine_capture_retire(&output->capture, nonblock);
+		spin_unlock_irq(&output->present_lock);
+		if (!reserved) {
+			failed = crtc;
+			break;
+		}
+	}
+	if (!failed)
+		return 0;
+
+	drm_for_each_crtc(crtc, state->dev) {
+		struct vkms_output *output;
+
+		if (crtc == failed)
+			break;
+		if (!vkms_commit_touches_crtc(state, crtc))
+			continue;
+		output = drm_crtc_to_vkms_output(crtc);
+		spin_lock_irq(&output->present_lock);
+		WARN_ON_ONCE(!vibeshine_capture_publish(&output->capture));
+		spin_unlock_irq(&output->present_lock);
+	}
+	return -EBUSY;
+}
+
+static void vkms_unreserve_capture_outputs(struct drm_atomic_commit *state)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, state->dev) {
+		struct vkms_output *output;
+
+		if (!vkms_commit_touches_crtc(state, crtc))
+			continue;
+		output = drm_crtc_to_vkms_output(crtc);
+		spin_lock_irq(&output->present_lock);
+		WARN_ON_ONCE(!vibeshine_capture_publish(&output->capture));
+		spin_unlock_irq(&output->present_lock);
+	}
+}
+
 static int vkms_atomic_commit(struct drm_device *dev,
 			      struct drm_atomic_commit *state, bool nonblock)
 {
 	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
 	int ret;
+
+	/* Async plane updates bypass commit_tail; this driver has no async
+	 * plane hooks and cannot enforce capture lifetime on that path. */
+	if (state->async_update)
+		return -EINVAL;
 
 	mutex_lock(&vkmsdev->commit_lock);
 	if (!vkmsdev->accepting_commits && current != vkmsdev->shutdown_owner) {
@@ -786,11 +1023,18 @@ static int vkms_atomic_commit(struct drm_device *dev,
 		return -ENODEV;
 	}
 
+	ret = vkms_reserve_capture_outputs(state, nonblock);
+	if (ret) {
+		mutex_unlock(&vkmsdev->commit_lock);
+		return ret;
+	}
 	vkms_update_pending_crtcs(state, true);
 	vkms_mark_presentation_content_updates(state);
 	ret = drm_atomic_helper_commit(dev, state, nonblock);
-	if (ret)
+	if (ret) {
 		vkms_update_pending_crtcs(state, false);
+		vkms_unreserve_capture_outputs(state);
+	}
 	mutex_unlock(&vkmsdev->commit_lock);
 
 	return ret;
@@ -848,26 +1092,60 @@ static void vkms_release_presented_frames(struct vkms_device *vkmsdev)
 			drm_crtc_to_vkms_output(crtc));
 }
 
-static void vkms_quiesce(struct vkms_device *vkmsdev)
+/* Stop new guards first, then wait without holding commit/presentation locks.
+ * A caller can retry a busy teardown; it must never free a live guard's output.
+ */
+static int vkms_drain_capture(struct vkms_device *vkmsdev)
 {
+	struct drm_crtc *crtc;
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+
+	WRITE_ONCE(vkmsdev->capture_stopping, true);
+	drm_for_each_crtc(crtc, &vkmsdev->drm) {
+		struct vkms_output *output = drm_crtc_to_vkms_output(crtc);
+		long result;
+		long remaining;
+		bool idle;
+
+		spin_lock_irq(&output->present_lock);
+		idle = !output->capture.readers;
+		spin_unlock_irq(&output->present_lock);
+		if (idle)
+			continue;
+		remaining = (long)(deadline - jiffies);
+		if (remaining <= 0)
+			return -EBUSY;
+		result = wait_event_interruptible_timeout(output->capture_waitq,
+			!READ_ONCE(output->capture.readers), remaining);
+		if (result < 0)
+			return result;
+		if (!result)
+			return -EBUSY;
+	}
+	return 0;
+}
+
+static int vkms_quiesce(struct vkms_device *vkmsdev)
+{
+	int ret;
+
 	mutex_lock(&vkmsdev->shutdown_lock);
+	if (!READ_ONCE(vkmsdev->accepting_commits)) {
+		mutex_unlock(&vkmsdev->shutdown_lock);
+		return 0;
+	}
+	ret = vkms_drain_capture(vkmsdev);
+	if (ret) {
+		mutex_unlock(&vkmsdev->shutdown_lock);
+		return ret;
+	}
 
 	mutex_lock(&vkmsdev->commit_lock);
-	if (!vkmsdev->accepting_commits) {
-		mutex_unlock(&vkmsdev->commit_lock);
-		mutex_unlock(&vkmsdev->shutdown_lock);
-		return;
-	}
-	vkmsdev->accepting_commits = false;
+	WRITE_ONCE(vkmsdev->accepting_commits, false);
 	vkmsdev->shutdown_owner = current;
 	mutex_unlock(&vkmsdev->commit_lock);
 
-	/*
-	 * First drain and disable KMS while all producer devices are still alive,
-	 * then drop the extra framebuffer references held for direct capture. The
-	 * latter may own imported NVIDIA DMA-BUFs and must not survive into the
-	 * physical GPU driver's device-shutdown phase.
-	 */
+	/* Guard admission remains sealed, so no reader can race this shutdown. */
 	drm_atomic_helper_shutdown(&vkmsdev->drm);
 	vkms_release_presented_frames(vkmsdev);
 
@@ -876,6 +1154,7 @@ static void vkms_quiesce(struct vkms_device *vkmsdev)
 	mutex_unlock(&vkmsdev->commit_lock);
 
 	mutex_unlock(&vkmsdev->shutdown_lock);
+	return 0;
 }
 
 /*
@@ -886,18 +1165,22 @@ static void vkms_quiesce(struct vkms_device *vkmsdev)
  *
  * Unplugging cannot happen from the userspace stop path, because the pool is
  * torn down concurrently with the graphical session and a compositor may still
- * own the modeset device. The reboot notifier has no such problem: it runs from
- * kernel_restart_prepare(), after every userspace process is gone and before
- * device_shutdown(), which makes it the one safe point to do the real release.
+ * own the modeset device. The reboot notifier runs before device_shutdown(),
+ * but a direct reboot syscall can leave userspace and its capture leases alive.
+ * In that case quiescing fails and the notifier cannot guarantee that GPU
+ * imports are released before physical device shutdown.
  */
-static void vkms_shutdown_release(struct vkms_device *vkmsdev)
+static int vkms_shutdown_release(struct vkms_device *vkmsdev)
 {
-	vkms_quiesce(vkmsdev);
+	if (vkms_quiesce(vkmsdev)) {
+		DRM_ERROR("cannot release virtual scanout while capture leases remain\n");
+		return -EBUSY;
+	}
 
 	mutex_lock(&vkmsdev->shutdown_lock);
 	if (vkmsdev->unplugged) {
 		mutex_unlock(&vkmsdev->shutdown_lock);
-		return;
+		return 0;
 	}
 	vkmsdev->unplugged = true;
 
@@ -911,13 +1194,13 @@ static void vkms_shutdown_release(struct vkms_device *vkmsdev)
 
 	/*
 	 * drm_dev_unplug() sleeps in synchronize_srcu(). That is safe here: the
-	 * reboot notifier chain is a blocking chain called from process context,
-	 * and no drm_dev_enter() reader can still be in flight once userspace is
-	 * gone. Unregistering also tears down the internal client, releasing the
-	 * framebuffers it holds.
+	 * reboot notifier chain is a blocking chain called from process context.
+	 * Unregistering also tears down the internal client, releasing the
+	 * framebuffers it holds; live DRM readers may delay synchronize_srcu().
 	 */
 	drm_dev_unplug(&vkmsdev->drm);
 	mutex_unlock(&vkmsdev->shutdown_lock);
+	return 0;
 }
 
 static ssize_t quiesce_store(struct device *dev,
@@ -938,8 +1221,8 @@ static ssize_t quiesce_store(struct device *dev,
 		return -EINVAL;
 
 	DRM_INFO("quiescing virtual scanout at userspace request\n");
-	vkms_quiesce(vkmsdev);
-	return count;
+	ret = vkms_quiesce(vkmsdev);
+	return ret ? ret : count;
 }
 
 static DEVICE_ATTR_WO(quiesce);
@@ -963,9 +1246,10 @@ static int vkms_reboot_notifier(struct notifier_block *notifier,
 	(void)action;
 	(void)data;
 
-	/* Release imported GPU buffers before the normal device shutdown walk. */
+	/* Best effort: reboot cannot force a live capture importer to release. */
 	DRM_INFO("releasing virtual scanout before system shutdown\n");
-	vkms_shutdown_release(vkmsdev);
+	if (vkms_shutdown_release(vkmsdev))
+		DRM_ERROR("GPU imports may remain active during device shutdown\n");
 
 	return NOTIFY_DONE;
 }
@@ -1094,23 +1378,25 @@ out_configfs:
 	return ret;
 }
 
-void vkms_destroy(struct vkms_config *config)
+int vkms_destroy(struct vkms_config *config)
 {
 	struct faux_device *fdev;
 	struct vkms_device *vkmsdev;
 
 	if (!config->dev) {
 		DRM_INFO("vkms_device is NULL.\n");
-		return;
+		return 0;
 	}
 
 	vkmsdev = config->dev;
 	fdev = vkmsdev->faux_dev;
 
-	vkms_shutdown_release(vkmsdev);
+	if (vkms_shutdown_release(vkmsdev))
+		return -EBUSY;
 	config->dev = NULL;
 	devres_release_group(&fdev->dev, NULL);
 	faux_device_destroy(fdev);
+	return 0;
 }
 
 static void __exit vkms_exit(void)
@@ -1118,8 +1404,8 @@ static void __exit vkms_exit(void)
 	vkms_configfs_unregister();
 
 	if (default_config) {
-		vkms_destroy(default_config);
-		vkms_config_destroy(default_config);
+		if (!WARN_ON(vkms_destroy(default_config)))
+			vkms_config_destroy(default_config);
 	}
 }
 

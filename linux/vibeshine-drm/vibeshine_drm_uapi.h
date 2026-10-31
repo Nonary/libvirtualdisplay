@@ -9,6 +9,17 @@
 #define DRM_VIBESHINE_WAIT_PRESENT 0x00
 #define DRM_VIBESHINE_GET_FRAME 0x01
 #define DRM_VIBESHINE_GET_PRESENT_TRACE 0x02
+#define DRM_VIBESHINE_GET_FRAME_LEASED 0x03
+#define DRM_VIBESHINE_GET_FRAME_COLOR 0x04
+
+/* GET_FRAME_COLOR is a leased export with ABI version 2. reserved_u32 is
+ * the colour interpretation below; reserved contains the 32-byte Linux
+ * hdr_output_metadata (metadata_type followed by the HDMI infoframe).
+ * All of these fields must still be zero on input. Older ioctls are unchanged. */
+#define VIBESHINE_DRM_FRAME_COLOR_ABI_VERSION 2
+#define VIBESHINE_DRM_COLOR_UNKNOWN 0
+#define VIBESHINE_DRM_COLOR_SRGB 1
+#define VIBESHINE_DRM_COLOR_BT2020_PQ 2
 
 #define VIBESHINE_DRM_PRESENT_ABI_VERSION 1
 #define VIBESHINE_DRM_PRESENT_MAX_TIMEOUT_MS 1000
@@ -22,6 +33,7 @@
 
 #define VIBESHINE_DRM_FRAME_READY (1U << 0)
 #define VIBESHINE_DRM_FRAME_EMPTY (1U << 1)
+#define VIBESHINE_DRM_FRAME_LEASED (1U << 2)
 
 #define VIBESHINE_DRM_TRACE_ABI_VERSION 1
 #define VIBESHINE_DRM_TRACE_MAX_EVENTS 64
@@ -115,6 +127,14 @@ struct vibeshine_drm_wait_present {
  * are intentionally coalesced; callers always receive the newest completed
  * frame. Imported PRIME objects are returned as their original DMA-BUFs. The
  * ioctl fails rather than copying a virtual-device shmem object.
+ *
+ * GET_FRAME_LEASED uses the same record and adds FRAME_LEASED to READY.
+ * Its DMA-BUF wrappers hold the current frame against replacement commits
+ * until all caller/importer references have ended. No pixel copy is made.
+ * Import the wrappers as GPU resources; direct CPU mappings are unsupported.
+ * This follows the DRM producer contract: displayed storage is not rewritten
+ * until the replacement flip completes. It cannot protect against a producer
+ * that writes an actively displayed buffer in violation of that contract.
  *
  * On input every field except @abi_version and @crtc_id must be zero. Returned
  * file descriptors belong to the calling process and must be closed.
