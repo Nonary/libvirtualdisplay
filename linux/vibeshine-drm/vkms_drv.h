@@ -3,6 +3,7 @@
 #ifndef _VKMS_DRV_H_
 #define _VKMS_DRV_H_
 
+#include "vibeshine_drm_capture.h"
 #include <linux/hrtimer.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
@@ -269,7 +270,11 @@ struct vkms_output {
 	atomic_t pending_commits;
 	u64 present_timestamp_ns;
 	struct drm_framebuffer *present_fb;
+	u32 present_color;
+	u64 present_hdr_metadata[4];
 	unsigned int present_waiters;
+	struct vibeshine_capture_state capture;
+	wait_queue_head_t capture_waitq;
 	spinlock_t present_lock;
 	wait_queue_head_t present_waitq;
 
@@ -298,6 +303,8 @@ struct vkms_device {
 	struct mutex commit_lock;
 	struct mutex shutdown_lock;
 	bool accepting_commits;
+	/* Sealed before draining existing capture guards during teardown. */
+	bool capture_stopping;
 	bool unplugged;
 	struct task_struct *shutdown_owner;
 	struct notifier_block reboot_notifier;
@@ -337,7 +344,7 @@ int vkms_create(struct vkms_config *config);
  * The device is completely removed, but the @config is not freed. It can be
  * reused or destroyed with vkms_config_destroy().
  */
-void vkms_destroy(struct vkms_config *config);
+int vkms_destroy(struct vkms_config *config);
 
 /**
  * vkms_crtc_init() - Initialize a CRTC for VKMS

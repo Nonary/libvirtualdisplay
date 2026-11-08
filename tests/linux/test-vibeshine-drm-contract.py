@@ -237,7 +237,7 @@ def validate_implicit_frame_layout(driver_root: Path) -> None:
     """Exercise layout provenance for native, explicit and implicit PRIME frames."""
     driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
     start = driver.index("bool vkms_framebuffer_has_implicit_import(")
-    end = driver.index("static int vkms_get_frame_ioctl(", start)
+    end = driver.index("static int vkms_get_frame(", start)
     source = r"""
 #include <assert.h>
 #include <stdbool.h>
@@ -689,14 +689,16 @@ def validate_reboot_notifier(driver_root: Path) -> None:
 #define SYS_POWER_OFF 3
 #define NOTIFY_DONE 0
 #define DRM_INFO(...) ((void)0)
+#define DRM_ERROR(...) ((void)0)
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
 struct notifier_block { int unused; };
 struct vkms_device { int unused; struct notifier_block reboot_notifier; };
 static struct vkms_device *released;
 static unsigned int release_count;
-static void vkms_shutdown_release(struct vkms_device *device) {
+static int vkms_shutdown_release(struct vkms_device *device) {
     released = device;
     ++release_count;
+    return 0;
 }
 """ + driver[start:end] + r"""
 int main(void) {
@@ -888,10 +890,10 @@ def validate_source_contract(driver_root: Path) -> None:
     require(failed_delivery < crtc.index("return false;", failed_delivery) < composer_read,
             "rejected vblank delivery can still queue composer work")
     for needle in (
-        "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, vkms_get_frame_ioctl, 0)",
+        "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME, drm_invalid_op, 0)",
         "DRM_IOCTL_DEF_DRV(VIBESHINE_GET_PRESENT_TRACE, vkms_get_present_trace_ioctl, 0)",
         "obj->import_attach->dmabuf",
-        "dma_buf_fd(dma_buf, O_CLOEXEC)",
+        "vkms_frame_reserve_fd(&export->descriptors,",
         "drm_framebuffer_get(new_present_fb)",
         "capable(CAP_SYS_ADMIN)",
         "static bool enable_cursor;",
@@ -939,7 +941,7 @@ def validate_source_contract(driver_root: Path) -> None:
     )
     require(
         re.search(
-            r"static void vkms_quiesce\(.*?"
+            r"static int vkms_quiesce\(.*?"
             r"drm_atomic_helper_shutdown\(&vkmsdev->drm\);.*?"
             r"vkms_release_presented_frames\(vkmsdev\);",
             drv,
@@ -988,6 +990,55 @@ def main() -> int:
         subprocess.run([sys.executable, str(generator), "--binary", str(binary)], check=True)
         validate_edid(binary.read_bytes())
 
+    # Capture admission must happen before DRM can swap state, including for
+    # nonblocking commits; synchronous commits reject an active reader.
+    driver = (driver_root / "vkms_drv.c").read_text(encoding="utf-8")
+    commit = driver[driver.index("static int vkms_atomic_commit("):]
+    commit = commit[:commit.index("static const struct drm_mode_config_funcs")]
+    require(commit.index("vkms_reserve_capture_outputs(state, nonblock)") <
+            commit.index("drm_atomic_helper_commit(dev, state, nonblock)"),
+            "capture admission is not before atomic state submission")
+    require("if (state->async_update)" in commit,
+            "async plane updates can bypass capture commit tail")
+    require("vkms_unreserve_capture_outputs(state)" in commit,
+            "failed commit does not roll back capture admission")
+    tail = driver[driver.index("static void vkms_atomic_commit_tail("):]
+    tail = tail[:tail.index("static const struct drm_driver")]
+    require(tail.index("vkms_capture_wait(") < tail.index("drm_atomic_helper_commit_modeset_disables("),
+            "commit tail must wait for capture before scanout replacement")
+    capture = (driver_root / "vibeshine_drm_capture.h").read_text(encoding="utf-8")
+    require("state->readers && !nonblock" in capture,
+            "blocking capture admission must reject existing readers")
+    configfs = (driver_root / "vkms_configfs.c").read_text(encoding="utf-8")
+    enabled = configfs[configfs.index("static ssize_t device_enabled_store("):]
+    enabled = enabled[:enabled.index("CONFIGFS_ATTR(device_, enabled)")]
+    require("configfs_depend_item_unlocked(&vkms_subsys, item)" in enabled,
+            "enabled device lacks configfs removal dependency")
+    require(re.search(r"ret = vkms_destroy\(dev->config\);\s*if \(ret\)\s*return ret;\s*configfs_undepend_item_unlocked\(item\);", enabled) is not None,
+            "failed device destruction releases configfs dependency")
+    destroy = driver[driver.index("int vkms_destroy("):]
+    destroy = destroy[:destroy.index("static void __exit")]
+    require(re.search(r"if \(vkms_shutdown_release\(vkmsdev\)\)\s*return -EBUSY;.*?devres_release_group", destroy, re.DOTALL) is not None,
+            "failed shutdown must preserve device resources")
+    require("DRM_IOCTL_DEF_DRV(VIBESHINE_GET_FRAME_LEASED" in driver,
+            "leased frame export is not registered")
+    wrapper = (driver_root / "vkms_capture.c").read_text(encoding="utf-8")
+    require(".mmap =" not in wrapper and ".vmap =" not in wrapper,
+            "forwarded mappings can escape the capture wrapper lifetime")
+    transaction = driver[driver.index("static long vkms_frame_ioctl("):]
+    transaction = transaction[:transaction.index("static bool vkms_is_frame_ioctl")]
+    require(transaction.index("copy_to_user(") < transaction.index("vkms_frame_finish_fds("),
+            "frame descriptors are published before userspace receives their numbers")
+    require("vkms_frame_finish_fds(&export.descriptors, result == 0)" in transaction,
+            "failed frame copyout does not discard reserved descriptors")
+    require("drm_dev_enter(" in transaction and "drm_dev_exit(" in transaction,
+            "frame transaction is not protected against device unplug")
+    drain = driver[driver.index("static int vkms_drain_capture("):driver.index("static int vkms_quiesce(")]
+    require(drain.index("capture_stopping, true") < drain.index("wait_event_interruptible_timeout("),
+            "shutdown waits without first closing capture admission")
+    require("capture_stopping, false" not in driver,
+            "shutdown reopens capture admission while draining old guards")
+    subprocess.run([sys.executable, str(Path(__file__).with_name("test-frame-fd-transaction.py")), str(driver_root)], check=True)
     validate_source_contract(driver_root)
     validate_reboot_notifier(driver_root)
     validate_uapi_layout(driver_root)

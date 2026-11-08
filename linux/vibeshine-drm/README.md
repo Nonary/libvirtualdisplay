@@ -69,16 +69,37 @@ cannot be mistaken for the presentation which generated an earlier
 notification. Sequence gaps are deliberately coalesced to the newest completed
 frame rather than growing an unbounded kernel queue.
 
+Frame-export descriptors are reserved privately and installed only after the
+complete ioctl reply has been copied to userspace. A failed copyout or partial
+export closes every staged file and returns every reserved descriptor number;
+this also prevents an invisible source guard from surviving an `EFAULT`.
+
+The additive `GET_FRAME_LEASED` operation gates scanout retirement while its
+read-only exported objects and GPU importer references remain alive. Consumers
+must follow the DRM producer rule and must not write through these objects.
+Amaterasu's required-lease profile uses this as a short source guard around a
+GPU snapshot. Its long-lived SDK leases own the private snapshot, so slow
+encoders do not retain the driver's scanout guard.
+
+Quiescing seals capture admission before draining guards. A busy or interrupted
+drain leaves the device and its resources intact and can be retried; it never
+revokes memory that a GPU might still read. Normal shutdown must stop consumers
+before device removal. Forcing a reboot while userspace retains imports still
+cannot guarantee that those imports have retired before physical GPU shutdown.
+
 An explicit configfs teardown disables scanout before unplugging the DRM
 device. During a global shutdown the service instead preserves the device while
-KWin closes its descriptors; a kernel reboot notifier then performs the same
-atomic quiesce after userspace has exited but before physical GPU devices shut
-down. This two-phase ordering prevents both a live-compositor unplug and stale
-imported DMA-BUF references crossing into NVIDIA teardown.
+KWin closes its descriptors; a kernel reboot notifier attempts the same atomic
+quiesce before physical GPU devices shut down. A direct reboot can reach the
+notifier while userspace is still running. If a capture lease remains open,
+quiesce fails and the notifier cannot guarantee that imported DMA-BUFs have
+been released before GPU shutdown.
 
 Restart, power-off, and halt all use this per-device cleanup before continuing
-the kernel's normal shutdown sequence. The driver does not force a kernel panic
-or impose a shutdown deadline.
+the kernel's normal shutdown sequence. The leased capture path is experimental:
+its outstanding-import shutdown behavior and real GPU importer lifetime have
+not been qualified. The driver does not force a kernel panic or impose a
+shutdown deadline.
 
 The managed configfs pool provisions exactly one primary plane per CRTC. It
 does not create cursor or overlay planes, forcing KWin to composite the cursor,
@@ -159,3 +180,14 @@ enforce trusted module signatures must boot through shim and complete the MOK
 requests, or use a custom kernel that embeds the local certificate. An `sbctl`
 owner key authorizes EFI programs; it is not imported into Linux's trusted
 module keyring and cannot by itself authorize an out-of-tree module.
+
+### Colour-aware guarded export
+
+`GET_FRAME_COLOR` uses the existing 152-byte frame record with ABI 2 and a
+read lease. On output, `reserved_u32` carries the colour interpretation and
+`reserved[4]` carries a copied Linux `hdr_output_metadata`. Inputs still zero
+these fields. The metadata is published under the same presentation lock as
+the framebuffer, sequence and timestamp, using the completed atomic commit.
+PQ is reported only for an HDR type-1 PQ blob with BT.2020 RGB colourspace;
+unknown states remain unknown. `GET_FRAME` and `GET_FRAME_LEASED` remain ABI 1
+and keep their original reserved fields and behaviour.

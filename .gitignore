@@ -4,3 +4,13 @@
 # Build outputs
 build/
 build-*/
+
+# Generated Linux DRM module build outputs.
+/linux/vibeshine-drm/*.o
+/linux/vibeshine-drm/.*.cmd
+/linux/vibeshine-drm/*.ko
+/linux/vibeshine-drm/*.mod
+/linux/vibeshine-drm/*.mod.c
+/linux/vibeshine-drm/Module.symvers
+/linux/vibeshine-drm/modules.order
+/linux/vibeshine-drm/vibeshine_drm_version.h

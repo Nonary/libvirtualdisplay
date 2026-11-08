@@ -12,6 +12,7 @@
 
 /* To avoid registering configfs more than once or unregistering on error */
 static bool is_configfs_registered;
+static struct configfs_subsystem vkms_subsys;
 
 /**
  * struct vkms_configfs_device - Configfs representation of a VKMS device
@@ -779,11 +780,19 @@ static ssize_t device_enabled_store(struct config_item *item, const char *page,
 			if (!vkms_config_is_valid(dev->config))
 				return -EINVAL;
 
-			ret = vkms_create(dev->config);
+			ret = configfs_depend_item_unlocked(&vkms_subsys, item);
 			if (ret)
 				return ret;
+			ret = vkms_create(dev->config);
+			if (ret) {
+				configfs_undepend_item_unlocked(item);
+				return ret;
+			}
 		} else if (dev->enabled && !enabled) {
-			vkms_destroy(dev->config);
+			ret = vkms_destroy(dev->config);
+			if (ret)
+				return ret;
+			configfs_undepend_item_unlocked(item);
 		}
 
 		dev->enabled = enabled;
@@ -805,8 +814,8 @@ static void device_release(struct config_item *item)
 
 	dev = device_item_to_vkms_configfs_device(item);
 
-	if (dev->enabled)
-		vkms_destroy(dev->config);
+	/* An enabled device holds a configfs dependency until destruction. */
+	WARN_ON(dev->enabled);
 
 	mutex_destroy(&dev->lock);
 	vkms_config_destroy(dev->config);

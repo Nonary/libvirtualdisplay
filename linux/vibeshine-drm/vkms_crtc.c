@@ -598,6 +598,7 @@ struct vkms_output *vkms_crtc_init(struct drm_device *dev, struct drm_plane *pri
 	vkms_out->present_fb = NULL;
 	vkms_out->present_waiters = 0;
 	spin_lock_init(&vkms_out->present_lock);
+	init_waitqueue_head(&vkms_out->capture_waitq);
 	init_waitqueue_head(&vkms_out->present_waitq);
 	ret = drmm_add_action_or_reset(dev, vkms_present_fb_cleanup, vkms_out);
 	if (ret)
