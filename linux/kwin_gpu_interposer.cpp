@@ -21,14 +21,10 @@
 #include <gbm.h>
 #include <xf86drm.h>
 
-#ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
-  #include <core/graphicsbufferallocator.h>
-#endif
 
 namespace {
   using gbm_create_device_fn = gbm_device *(*)(int);
   using gbm_device_destroy_fn = void (*)(gbm_device *);
-  using gbm_device_get_fd_fn = int (*)(gbm_device *);
   using drm_get_devices2_fn = int (*)(std::uint32_t, drmDevicePtr[], int);
   using drm_get_device2_fn = int (*)(int, std::uint32_t, drmDevicePtr *);
 
@@ -37,7 +33,6 @@ namespace {
 
   std::atomic<gbm_create_device_fn> real_gbm_create_device {nullptr};
   std::atomic<gbm_device_destroy_fn> real_gbm_device_destroy {nullptr};
-  std::atomic<gbm_device_get_fd_fn> real_gbm_device_get_fd {nullptr};
   std::atomic<drm_get_devices2_fn> real_drm_get_devices2 {nullptr};
   std::atomic<drm_get_device2_fn> real_drm_get_device2 {nullptr};
   std::atomic<bool> gpu_attachment_logged {false};
@@ -50,14 +45,11 @@ namespace {
   struct allocator_fds {
     int render;
     int kms;
+    gbm_device *hardware;
   };
   std::unordered_map<gbm_device *, allocator_fds> owned_render_fds;
-  thread_local bool software_allocation = false;
 
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
-  using native_allocate_fn = KWin::GraphicsBuffer *(*)(void *, const KWin::GraphicsBufferOptions &);
-  std::atomic<native_allocate_fn> real_native_allocate {nullptr};
-  constexpr char native_allocate_symbol[] = "_ZN4KWin26GbmGraphicsBufferAllocator8allocateERKNS_21GraphicsBufferOptionsE";
   using native_render_device_fn = void *(*)(const void *, drmDevicePtr);
   std::atomic<native_render_device_fn> real_native_render_device {nullptr};
   constexpr char native_render_device_symbol[] = "_ZNK4KWin10GpuManager26findCompatibleRenderDeviceEP10_drmDevice";
@@ -65,16 +57,15 @@ namespace {
 
   bool native_allocator_runtime_compatible() {
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
-    // GraphicsBufferOptions is a C++ ABI. Only read the layout of the exact
-    // KWin library whose public headers were used to build this bridge.
-    const auto allocate = dlsym(RTLD_NEXT, native_allocate_symbol);
-    Dl_info info {};
+    // Only an opaque manager pointer, a public libdrm pointer, and a pointer
+    // return cross this boundary. No KWin object layout or patch release is used.
+    Dl_info library {};
+    const auto callback = dlsym(RTLD_NEXT, native_render_device_symbol);
     std::array<char, 4096> resolved {};
-    if (allocate && dladdr(allocate, &info) && info.dli_fname &&
-        realpath(info.dli_fname, resolved.data())) {
-      const auto *name = std::strrchr(resolved.data(), '/');
-      return name && std::strcmp(name + 1, VIBESHINE_KWIN_NATIVE_LIBRARY_NAME) == 0;
-    }
+    if (!callback || !dladdr(callback, &library) || !library.dli_fname ||
+        !realpath(library.dli_fname, resolved.data())) return false;
+    const char *name = std::strrchr(resolved.data(), '/');
+    return name && std::string_view(name + 1).starts_with("libkwin.so.6.");
 #endif
     return false;
   }
@@ -241,12 +232,9 @@ namespace {
   /**
    * @brief Enable render-node substitution only for reviewed KWin allocators.
    *
-   * KWin 6.8 separates rendering from scanout and sends software scanout
-   * allocations through gbm_device_get_fd(). Replacing that KMS device with
-   * an NVIDIA render node makes CREATE_DUMB fail in drm_ioctl_permit().
-   * Detect the exported allocator ABI rather than a package/version string;
-   * The matching native shim scopes those software calls back to the KMS fd.
-   * Unknown ABIs retain the compositor's native allocation path.
+   * Modern KWin associates the renderer independently of the KMS device.
+   * Its software scanout allocations retain the actual virtual GBM device.
+   * Hardware BO allocation goes to NVIDIA through the public GBM entry points.
    *
    * @param lookup Dynamic symbol lookup, injectable for routing tests.
    */
@@ -312,18 +300,24 @@ extern "C" gbm_device *gbm_create_device(const int fd) {
     close(render_fd);
     return pass_through();
   }
-  // Route only the virtual node's allocator. KWin keeps the original KMS fd
-  // and seat primary, while GBM/EGL see an actual render GPU and use their
-  // normal per-output import path. Never spoof global libdrm PCI metadata.
-  auto *const allocator = function(render_fd);
+  auto *const hardware = function(render_fd);
+  if (!hardware) {
+    close(render_fd);
+    close(kms_fd);
+    return pass_through();
+  }
+  // Modern KWin uses the GBM device FD for dumb-buffer creation, mapping
+  // and destruction. Keep that descriptor on KMS for its whole lifetime.
+  auto *const allocator = native_hooks_enabled.load(std::memory_order_acquire) ? function(kms_fd) : hardware;
   if (!allocator) {
+    gbm_device_destroy(hardware);
     close(render_fd);
     close(kms_fd);
     return pass_through();
   }
   {
     std::lock_guard lock {render_fds_mutex};
-    owned_render_fds.emplace(allocator, allocator_fds {render_fd, kms_fd});
+    owned_render_fds.emplace(allocator, allocator_fds {render_fd, kms_fd, hardware});
   }
   log_gpu_attachment(identity);
   return allocator;
@@ -341,15 +335,20 @@ extern "C" void gbm_device_destroy(gbm_device *device) {
   }
   int render_fd = -1;
   int kms_fd = -1;
+  gbm_device *hardware = nullptr;
   {
     std::lock_guard lock {render_fds_mutex};
     if (const auto found = owned_render_fds.find(device); found != owned_render_fds.end()) {
       render_fd = found->second.render;
       kms_fd = found->second.kms;
+      hardware = found->second.hardware;
       owned_render_fds.erase(found);
     }
   }
   function(device);
+  if (hardware && hardware != device) {
+    function(hardware);
+  }
   // GBM does not own its input fd. Keep our render fd alive through destruction
   // and close only the fd opened by this bridge, never a caller's KMS fd.
   if (render_fd >= 0) {
@@ -360,22 +359,37 @@ extern "C" void gbm_device_destroy(gbm_device *device) {
   }
 }
 
-extern "C" int gbm_device_get_fd(gbm_device *device) {
-  // KWin 6.8 uses this accessor for every dumb-buffer ioctl and retains its
-  // result in DumbGraphicsBuffer. Keep that entire allocation on the real KMS
-  // device, while EGL and hardware allocations still see the NVIDIA render fd.
-  if (software_allocation) {
-    std::lock_guard lock {render_fds_mutex};
-    if (const auto found = owned_render_fds.find(device); found != owned_render_fds.end()) {
-      return found->second.kms;
+namespace {
+  gbm_device *hardware_allocator(gbm_device *device) {
+    if (native_hooks_enabled.load(std::memory_order_acquire)) {
+      std::lock_guard lock {render_fds_mutex};
+      if (const auto found = owned_render_fds.find(device); found != owned_render_fds.end()) {
+        return found->second.hardware;
+      }
     }
+    return device;
   }
-  const auto function = resolve_real_function(real_gbm_device_get_fd, "gbm_device_get_fd");
-  if (!function) {
-    errno = ENOSYS;
-    return -1;
-  }
-  return function(device);
+}
+
+extern "C" gbm_bo *gbm_bo_create(gbm_device *device, uint32_t width, uint32_t height,
+                                 uint32_t format, uint32_t flags) {
+  static const auto real = reinterpret_cast<decltype(&gbm_bo_create)>(dlsym(RTLD_NEXT, "gbm_bo_create"));
+  if (!real) { errno = ENOSYS; return nullptr; }
+  return real(hardware_allocator(device), width, height, format, flags);
+}
+
+extern "C" gbm_bo *gbm_bo_create_with_modifiers(gbm_device *device, uint32_t width, uint32_t height,
+                                                uint32_t format, const uint64_t *modifiers, unsigned count) {
+  static const auto real = reinterpret_cast<decltype(&gbm_bo_create_with_modifiers)>(dlsym(RTLD_NEXT, "gbm_bo_create_with_modifiers"));
+  if (!real) { errno = ENOSYS; return nullptr; }
+  return real(hardware_allocator(device), width, height, format, modifiers, count);
+}
+
+extern "C" gbm_bo *gbm_bo_create_with_modifiers2(gbm_device *device, uint32_t width, uint32_t height,
+                                                 uint32_t format, const uint64_t *modifiers, unsigned count, uint32_t flags) {
+  static const auto real = reinterpret_cast<decltype(&gbm_bo_create_with_modifiers2)>(dlsym(RTLD_NEXT, "gbm_bo_create_with_modifiers2"));
+  if (!real) { errno = ENOSYS; return nullptr; }
+  return real(hardware_allocator(device), width, height, format, modifiers, count, flags);
 }
 
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
@@ -412,28 +426,8 @@ extern "C" void *vibeshine_kwin_render_device(const void *manager, drmDevicePtr 
   return function(manager, device);
 }
 
-extern "C" KWin::GraphicsBuffer *vibeshine_kwin_allocate(void *, const KWin::GraphicsBufferOptions &)
-  asm("_ZN4KWin26GbmGraphicsBufferAllocator8allocateERKNS_21GraphicsBufferOptionsE");
-
-extern "C" KWin::GraphicsBuffer *vibeshine_kwin_allocate(void *allocator, const KWin::GraphicsBufferOptions &options) {
-  const auto function = resolve_real_function(real_native_allocate, native_allocate_symbol);
-  if (!function) {
-    errno = ENOSYS;
-    return nullptr;
-  }
-  if (!native_hooks_enabled.load(std::memory_order_acquire)) {
-    return function(allocator, options);
-  }
-  const bool previous = software_allocation;
-  software_allocation = options.software;
-  struct restore_scope {
-    bool previous;
-    ~restore_scope() { software_allocation = previous; }
-  } restore {previous};
-  return function(allocator, options);
-}
 #endif
 
 extern "C" unsigned int vibeshine_kwin_gpu_interposer_abi() {
-  return 7;
+  return 8;
 }

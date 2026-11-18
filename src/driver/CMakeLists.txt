@@ -53,25 +53,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
             PkgConfig::LIBVIRTUALDISPLAY_KWIN_GBM
             ${CMAKE_DL_LIBS})
 
-    # New KWin allocators need a software-allocation scope as well as GBM
-    # routing. Build that shim only against installed public KWin headers and
-    # bind it at runtime to the exact corresponding library, never a guessed ABI.
-    find_package(Qt6 COMPONENTS Core QUIET)
+    # GBM allocation uses a public ABI. The native renderer symbol additionally
+    # needs a signature check before each activation, including on KWin updates.
+    # Standalone builds enable it for validation; other packages retain legacy routing.
+    if(VIBESHINE_ARCH_KWIN_BRIDGE_REFRESH OR CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+        target_compile_definitions(vibeshine_kwin_gpu PRIVATE VIBESHINE_KWIN_NATIVE_ALLOCATOR=1)
+    endif()
     find_path(LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR core/graphicsbufferallocator.h PATH_SUFFIXES kwin)
     find_library(LIBVIRTUALDISPLAY_KWIN_LIBRARY kwin)
-    if(Qt6Core_FOUND AND LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR AND LIBVIRTUALDISPLAY_KWIN_LIBRARY)
-        get_filename_component(_kwin_library_real "${LIBVIRTUALDISPLAY_KWIN_LIBRARY}" REALPATH)
-        get_filename_component(_kwin_library_name "${_kwin_library_real}" NAME)
-        # This is the reviewed GraphicsBufferOptions layout. New minor versions
-        # remain on the native safe path until their allocator contract is reviewed.
-        if(_kwin_library_name MATCHES "^libkwin\\.so\\.6\\.8\\.[0-9]+$")
-            target_include_directories(vibeshine_kwin_gpu PRIVATE "${LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR}")
-            target_link_libraries(vibeshine_kwin_gpu PRIVATE Qt6::Core)
-            target_compile_definitions(vibeshine_kwin_gpu PRIVATE
-                    VIBESHINE_KWIN_NATIVE_ALLOCATOR=1
-                    VIBESHINE_KWIN_NATIVE_LIBRARY_NAME="${_kwin_library_name}")
-        endif()
-    endif()
 
     # The distro KWin binary carries cap_sys_nice, so the dynamic loader runs it
     # in secure-execution mode and ignores LD_PRELOAD paths. glibc's documented

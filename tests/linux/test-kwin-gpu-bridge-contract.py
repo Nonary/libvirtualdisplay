@@ -46,13 +46,13 @@ def main() -> int:
         "matches > 1",
         "VIBESHINE_KWIN_RENDER_PCI",
         "vibeshine_kwin_gpu_interposer_abi",
-        "return 7",
+        "return 8",
         "stop_kwin_preload_inheritance",
         "running_inside_kwin",
         "configure_allocator_routing(dlsym)",
         "native_allocator_runtime_compatible",
-        "VIBESHINE_KWIN_NATIVE_LIBRARY_NAME",
-        "software_allocation = options.software",
+        "gbm_bo_create_with_modifiers2",
+        "hardware_allocator(device)",
         "hooks_enabled.store((legacy_allocator && !native_allocator) || native_supported",
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EP10gbm_devicem",
         "_ZN4KWin26GbmGraphicsBufferAllocatorC1EPNS_9DrmDeviceE",
@@ -60,6 +60,8 @@ def main() -> int:
         '"/usr/bin/kwin_wayland"',
         'unsetenv("LD_PRELOAD")',
     ), interposer_path.name)
+    require("GraphicsBufferOptions" not in interposer and "VIBESHINE_KWIN_NATIVE_LIBRARY_NAME" not in interposer,
+            "bridge coupled to a private structure layout or patch release")
     require('extern "C" int drmGet' not in interposer,
             "bridge must not rewrite libdrm device identities")
     require("bustype = DRM_BUS_PCI" not in interposer,
@@ -68,7 +70,7 @@ def main() -> int:
         "hooks_enabled.load(std::memory_order_acquire)",
         "drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER",
         "pci_matches(*opened->businfo.pci, identity)",
-        "owned_render_fds.emplace(allocator, allocator_fds {render_fd, kms_fd})",
+        "owned_render_fds.emplace(allocator, allocator_fds {render_fd, kms_fd, hardware})",
     ), interposer_path.name)
     require("drmIoctl" not in interposer, "physical-connector DRM ioctl suppression returned")
     require("HEADLESS_HDR" not in interposer, "physical headless-HDR policy returned")

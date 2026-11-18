@@ -83,10 +83,6 @@ namespace {
   void *native_render_device(const void *manager, drmDevicePtr device) {
     return render_device_body(manager, device);
   }
-  std::function<KWin::GraphicsBuffer *(void *, const KWin::GraphicsBufferOptions &)> allocate_body;
-  KWin::GraphicsBuffer *native_allocate(void *allocator, const KWin::GraphicsBufferOptions &options) {
-    return allocate_body(allocator, options);
-  }
 #endif
 
   void *lookup_allocator(void *scope, const char *name) {
@@ -149,11 +145,8 @@ namespace {
     native_hooks_enabled = true;
     real_gbm_create_device = create_device;
     real_gbm_device_destroy = destroy_device;
-    real_gbm_device_get_fd = +[](gbm_device *device) { return device->fd; };
 #ifdef VIBESHINE_KWIN_NATIVE_ALLOCATOR
     real_native_render_device = native_render_device;
-    real_native_allocate = native_allocate;
-    software_allocation = false;
 #endif
     real_drm_get_devices2 = get_devices;
     real_drm_get_device2 = get_device;
@@ -183,10 +176,11 @@ namespace {
   }
 
   void require_routed(gbm_device *device, device_fixture &renderer) {
-    require(device && device->fd != virtual_device->fd && renderer.matches_fd(device->fd),
+    auto *hardware = hardware_allocator(device);
+    require(device && hardware && hardware->fd != virtual_device->fd && renderer.matches_fd(hardware->fd),
       "virtual allocator did not use the selected NVIDIA render node");
-    require((fcntl(device->fd, F_GETFD) & FD_CLOEXEC) != 0, "render fd can leak into children");
-    const int render_fd = device->fd;
+    require((fcntl(hardware->fd, F_GETFD) & FD_CLOEXEC) != 0, "render fd can leak into children");
+    const int render_fd = hardware->fd;
     const int kms_fd = owned_render_fds.at(device).kms;
     require(virtual_device->matches_fd(kms_fd) && (fcntl(kms_fd, F_GETFD) & FD_CLOEXEC),
       "software allocator lost its owned KMS descriptor");
@@ -440,73 +434,16 @@ int main() {
       configure_allocator_routing(lookup_allocator, true);
       require(hooks_enabled, "reviewed native allocator remained disabled");
       auto *device = gbm_create_device(virtual_kms.fd);
-      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &options) -> KWin::GraphicsBuffer * {
-        const int fd = gbm_device_get_fd(device);
-        require(options.software ? virtual_kms.matches_fd(fd) : nvidia_one.matches_fd(fd),
-          "hardware and software allocation fds were conflated");
-        return nullptr;
-      };
-      KWin::GraphicsBufferOptions options;
-      options.software = true;
-      vibeshine_kwin_allocate(nullptr, options);
-      require(!software_allocation && nvidia_one.matches_fd(gbm_device_get_fd(device)),
-        "software scope escaped into EGL rendering");
-      options.software = false;
-      vibeshine_kwin_allocate(nullptr, options);
-      require_routed(device, nvidia_one);
-    });
-    run("native software scope leaves physical seat and unrelated threads unchanged", [&] {
-      auto *device = gbm_create_device(virtual_kms.fd);
+      require(virtual_kms.matches_fd(device->fd), "KMS software allocations must retain the virtual device");
+      require(nvidia_one.matches_fd(hardware_allocator(device)->fd), "hardware allocations must go to NVIDIA");
       auto *physical = gbm_create_device(virtio.fd);
-      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &) -> KWin::GraphicsBuffer * {
-        require(gbm_device_get_fd(physical) == virtio.fd, "software scope changed physical seat fd");
-        bool other_thread_rendered = false;
-        std::thread other([&] { other_thread_rendered = nvidia_one.matches_fd(gbm_device_get_fd(device)); });
-        other.join();
-        require(other_thread_rendered, "software scope leaked into another rendering thread");
-        return nullptr;
-      };
-      KWin::GraphicsBufferOptions options;
-      options.software = true;
-      vibeshine_kwin_allocate(nullptr, options);
+      require(hardware_allocator(physical) == physical && physical->fd == virtio.fd,
+              "hardware allocation on a physical output was rerouted");
       gbm_device_destroy(physical);
       require_routed(device, nvidia_one);
     });
-    run("nested native hardware allocation restores outer software scope", [&] {
-      auto *device = gbm_create_device(virtual_kms.fd);
-      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &options) -> KWin::GraphicsBuffer * {
-        if (options.software) {
-          require(virtual_kms.matches_fd(gbm_device_get_fd(device)), "outer KMS scope missing");
-          KWin::GraphicsBufferOptions hardware;
-          hardware.software = false;
-          vibeshine_kwin_allocate(nullptr, hardware);
-          require(virtual_kms.matches_fd(gbm_device_get_fd(device)), "nested allocation lost outer KMS scope");
-        } else {
-          require(nvidia_one.matches_fd(gbm_device_get_fd(device)), "nested hardware allocation used KMS fd");
-        }
-        return nullptr;
-      };
-      KWin::GraphicsBufferOptions options;
-      options.software = true;
-      vibeshine_kwin_allocate(nullptr, options);
-      require(!software_allocation, "nested software scope leaked");
-      require_routed(device, nvidia_one);
-    });
-    run("native allocation exceptions restore rendering scope", [&] {
-      allocate_body = [&](void *, const KWin::GraphicsBufferOptions &) -> KWin::GraphicsBuffer * {
-        throw std::runtime_error("allocation failed");
-      };
-      KWin::GraphicsBufferOptions options;
-      options.software = true;
-      try {
-        vibeshine_kwin_allocate(nullptr, options);
-        require(false, "allocation unexpectedly succeeded");
-      } catch (const std::runtime_error &) {
-        require(!software_allocation, "failed allocation leaked software scope");
-      }
-    });
 #endif
-    require(vibeshine_kwin_gpu_interposer_abi() == 7, "unexpected bridge ABI");
+    require(vibeshine_kwin_gpu_interposer_abi() == 8, "unexpected bridge ABI");
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

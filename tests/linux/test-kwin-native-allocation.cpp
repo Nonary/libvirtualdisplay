@@ -10,6 +10,7 @@
 #include <core/gpumanager.h>
 #include <drm_fourcc.h>
 #include <xf86drmMode.h>
+#include <sys/stat.h>
 #include <opengl/eglswapchain.h>
 #include <iostream>
 #include <stdexcept>
@@ -22,7 +23,7 @@ int main(int argc, char **argv) {
   QCoreApplication app(argc, argv);
   try {
     if (!native_allocator_runtime_compatible()) {
-      std::cout << "SKIP: KWin library does not match build headers\n";
+      std::cout << "SKIP: KWin renderer interface unavailable\n";
       return 77;
     }
     configure_allocator_routing(dlsym);
@@ -84,8 +85,8 @@ int main(int argc, char **argv) {
                 software->dmabufAttributes()->modifier == DRM_FORMAT_MOD_LINEAR,
             "software allocation lost linear scanout");
     software->drop();
-    require(!software_allocation,
-            "software scope leaked after real KWin allocation");
+    require(gbm_device_get_fd(device->gbmDevice()) == fds.kms,
+            "virtual device no longer provides its KMS descriptor");
     opts.software = false;
     opts.render = true;
     opts.modifiers = {DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 6, 5),
@@ -141,8 +142,18 @@ int main(int argc, char **argv) {
       const int added = drmModeAddFB2WithModifiers(
           fds.kms, 64, 64, format, handles, pitches, offsets, modifiers,
           &framebuffer, DRM_MODE_FB_MODIFIERS);
-      drmCloseBufferHandle(fds.kms, handles[0]);
       require(added == 0, "virtual KMS rejected explicit tiled framebuffer");
+      // Re-export the registered scanout from the virtual card, just as the
+      // capture driver does, rather than testing the allocator's original FD.
+      int exported = -1;
+      require(drmPrimeHandleToFD(fds.kms, handles[0], DRM_CLOEXEC | DRM_RDWR, &exported) == 0,
+              "virtual KMS framebuffer DMA-BUF export failed");
+      struct stat produced {}, captured {};
+      require(fstat(attrs->fd[0].get(), &produced) == 0 && fstat(exported, &captured) == 0 &&
+                  produced.st_dev == captured.st_dev && produced.st_ino == captured.st_ino,
+              "virtual KMS export did not preserve the producer DMA-BUF");
+      KWin::FileDescriptor captureFd(exported);
+      drmCloseBufferHandle(fds.kms, handles[0]);
       require(drmModeRmFB(fds.kms, framebuffer) == 0,
               "private scanout framebuffer cleanup failed");
       const EGLAttrib image_attrs[] = {EGL_WIDTH,
@@ -152,7 +163,7 @@ int main(int argc, char **argv) {
                                        EGL_LINUX_DRM_FOURCC_EXT,
                                        format,
                                        EGL_DMA_BUF_PLANE0_FD_EXT,
-                                       attrs->fd[0].get(),
+                                       captureFd.get(),
                                        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
                                        attrs->offset[0],
                                        EGL_DMA_BUF_PLANE0_PITCH_EXT,
